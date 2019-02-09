@@ -2,6 +2,10 @@
 #include <X11/Xlib.h>
 #include <Python.h>
 #include <omp.h>
+#include <Python.h>
+#define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
+#include <numpy/arrayobject.h>
+
 
 int screenshot(const int origin_x,
                const int origin_y,
@@ -39,39 +43,54 @@ int screenshot(const int origin_x,
         }
     }
 
-    /* copy to the numpy buffer using memcpy */
-    //memcpy(numpy_data, img->data, width * height * sizeof(char) * 4);
-
-    /* copy to the numpy buffer using a loop and using double so that the
-     * compiler will use avx(2) instructions */
-    /*
-    double* from = (double *)img->data;
-    double* to = (double *)numpy_data;
-#pragma omp parallel for
-    for( int i = 0; i < width * height / 2; i++)
-    {
-        to[i] = from[i];
-    }
-    */
-
     XCloseDisplay(display);
 
     return 0;
 }
 
-// method definitions. setting the method names and argument types and description (docstrings)
-static PyMethodDef linux_x11_methods[] = {
-        //"PythonName"      C-function Name      argument presentation    description
-        {NULL,              NULL,                    0,                       NULL}  // sentinal
-};
-
-
-PyMODINIT_FUNC initlinux_x11(void)
+static
+PyObject* linux_x11_screenshot(PyObject *self, PyObject *args)
 {
-    PyObject *module;
-    module = Py_InitModule("linux_x11", linux_x11_methods);
-    if ( module == NULL )
-        return;
+    int x, y;
+    long int * shape;
+    PyObject *_img=NULL;
+    PyArrayObject *img=NULL;
+
+    if (!PyArg_ParseTuple(args, "iiO", &x, &y, &_img))
+        return NULL;
+
+    img = (PyArrayObject*)PyArray_FROM_OTF(_img, NPY_UINT8, NPY_ARRAY_IN_ARRAY);
+    if (img == NULL) goto fail;
+
+    shape = PyArray_SHAPE(img);
+    screenshot(x, y, shape[1], shape[0], PyArray_DATA(img));
+
+  fail:
+    Py_DECREF(img);
+    Py_RETURN_NONE;
 }
 
 
+// method function definitions
+static PyMethodDef linux_x11_methods[] = {
+    {"screenshot", linux_x11_screenshot, METH_VARARGS, "capture a screenshot using X11"},
+    {NULL, NULL, 0, NULL}
+};
+
+
+static struct PyModuleDef _linux_x11 = {
+    PyModuleDef_HEAD_INIT,
+    "_linux_x11",
+    "module with interface functions for capturing a screenshot",
+    -1,
+    linux_x11_methods
+};
+
+PyMODINIT_FUNC
+PyInit__linux_x11(void)
+{
+    PyObject *module;
+    module = PyModule_Create(&_linux_x11);
+    import_array();
+    return module;
+}
