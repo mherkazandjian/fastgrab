@@ -7,10 +7,11 @@ import numpy
 from fastgrab._linux_x11 import screenshot
 
 # a full HD screen
-x, y, width, height = 0, 0, 3840, 2160
+x, y, width, height = 0, 0, 1920, 1080
 img = numpy.zeros((height, width, 4), 'uint8')
 screenshot(x, y, img)
 
-import pylab
-pylab.imshow(img[:, :, 0:3], interpolation='none', cmap='Greys_r')
-pylab.show()
+# (optional) view the screenshot
+# import pylab
+# pylab.imshow(img[:, :, 0:3], interpolation='none', cmap='Greys_r')
+# pylab.show()
