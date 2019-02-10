@@ -29,7 +29,7 @@ resolution    | fps
 ## Getting Started
 
 ``Fastgrab`` was initially developed in 2016 as part of an aimbot (for quake
-live). ``Fastgrab`` is developed and tested on ``linux``. As far was the 
+live). ``Fastgrab`` is developed and tested on ``linux``. As far as the 
 pre-requisited listed below are satisfied, it should work as expected on
 ``windows`` and ``osx``. The low-level API of ``Fastgrab`` is implemented
 using the ``cpython``, ``Numpy`` and ``X11`` C APIs.
