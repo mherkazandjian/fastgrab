@@ -1,0 +1,16 @@
+sudo: false
+language: python
+
+cache:
+  directories:
+    - $HOME/.cache/pip
+
+python:
+  - 3.6
+  - 3.7
+install:
+  - pipenv install
+
+script:
+  - python setup.py install
+  - pytest -v tests/
