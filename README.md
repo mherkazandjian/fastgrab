@@ -11,12 +11,12 @@ flexible array, i.e a numpy array.
 
 capture frame rates
 
-    | resolution    | fps      |
-    | ------------- |:--------:|
-    | 360p          | > 300    |
-    | 720p          | 140      |
-    | 1080p         | 60       |
-    | 4K            | 10       |
+resolution    | fps
+------------- | -----
+360p          | > 300
+720p          | 140
+1080p         | 60
+4K            | 10
 
 # Usage example
 
