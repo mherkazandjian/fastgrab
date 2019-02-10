@@ -9,7 +9,7 @@ to provide the user with the image as a numpy array. Beyond that the user is
 free to manipulate the image since the pixel data is accessible via a fast and
 flexible array, i.e a numpy array.
 
-capture frame rates
+Typical capture frame rate on a modern machine
 
 resolution    | fps
 ------------- | -----
@@ -31,14 +31,22 @@ resolution    | fps
 ``Fastgrab`` was initially developed in 2016 as part of an aimbot (for quake
 live). ``Fastgrab`` is developed and tested on ``linux``. As far was the 
 pre-requisited listed below are satisfied, it should work as expected on
-``windows`` and ``osx``.
+``windows`` and ``osx``. The low-level API of ``Fastgrab`` is implemented
+using the ``cpython``, ``Numpy`` and ``X11`` C APIs.
 
 ## Comparison with other packages
 
 The following comparison has been done a Intel i7-4770K with 32 GB ram and a
-Nvidia GTX 960 at a 1080p resolution. 
+Nvidia GTX 960 at a 1080p resolution. ``Fastgrab`` is designed to be fast and
+does not provide any features beyond capturing the screen, unlike the other
+packages mentioned in  the comparison below that do many great things. 
 
-    package
+package       | fps
+------------- | -----
+fastgrab      | 60
+autopy        | 10 
+pyautogui     | 1
+pyscreennshot | 0.5
 
 ### Prerequisites
 
@@ -56,25 +64,35 @@ note that ``fastgrab`` could work with lower versions but I have not tested it
 ```bash
 pip install fastgrab
 ```
+
 ```bash
+pip install git+git://github.com/mherkazandjian/fastgrab.git
+```
+
+```bash
+git clone https://github.com/mherkazandjian/fastgrab.git
+cd fastgrab
 python setup.py install
 ```
 
 ## Running the tests
 
 ````bash
+cd fastgrab
 pytest tests
 ````
 
-or 
+or
 
 ````bash
+cd fastgrab
 tox
 ````
 
 ## Contributing
 
-submit a pull request or create an issue if you find any bugs.
+Submit a pull request or create an [issue](https://github.com/mherkazandjian/fastgrab/issues/new)
+if you find any bugs.
 
 Any help/pull requests for windows/osx support are welcome.
 
@@ -92,3 +110,4 @@ This project is licensed under GPLv3
 * autopy
 * pyautogui
 * reame template taken from: [PurpleBooth](https://gist.github.com/PurpleBooth/109311bb0361f32d87a2)
+* https://stackoverflow.com/questions/69645/take-a-screenshot-via-a-python-script-linux/16141058#16141058
