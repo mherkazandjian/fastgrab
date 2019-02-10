@@ -80,8 +80,9 @@ python setup.py install
 
 ## Running the tests
 
+Execute the following in the source root dir
+
 ````bash
-cd fastgrab
 pytest tests
 ````
 
@@ -89,7 +90,7 @@ or
 
 ````bash
 pip install tox-pipenv
-cd fastgrab
+pipenv install
 tox
 ````
 
@@ -106,7 +107,7 @@ Any help/pull requests for the following are welcome:
 
 ## Authors
 
-* **Mher Kazandjian** - *Initial work* - [Github](https://github.com/mherkazandjian)
+* **Mher Kazandjian** - [Github](https://github.com/mherkazandjian)
 
 ## License
 
