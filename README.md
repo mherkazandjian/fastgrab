@@ -42,6 +42,9 @@ pre-requisited listed below are satisfied, it should work as expected on
 ``windows`` and ``osx``. The low-level API of ``Fastgrab`` is implemented
 using the ``cpython``, ``Numpy`` and ``X11`` C APIs.
 
+``fastgrab`` is multi-threaded and it uses all the cores on the machine by
+default.
+
 ## Comparison with other packages
 
 The following comparison has been done a Intel i7-4770K with 32 GB ram and a
@@ -55,6 +58,8 @@ fastgrab      | 60
 autopy        | 10 
 pyautogui     | 1
 pyscreennshot | 0.5
+
+to benchmark ``fastgrab`` run the script [examples/benchmark.py](https://github.com/mherkazandjian/fastgrab/blob/master/examples/benchmark.py)
 
 ### Prerequisites
 
