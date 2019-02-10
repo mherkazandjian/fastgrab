@@ -9,6 +9,12 @@ to provide the user with the image as a numpy array. Beyond that the user is
 free to manipulate the image since the pixel data is accessible via a fast and
 flexible array, i.e a numpy array.
 
+capture frame rates
+
+     resolution   +   frame rate (fps)
+     -------------|-------------------
+          a       |     1
+          
 # Usage example
 
 ````python
@@ -23,6 +29,13 @@ flexible array, i.e a numpy array.
 live). ``Fastgrab`` is developed and tested on ``linux``. As far was the 
 pre-requisited listed below are satisfied, it should work as expected on
 ``windows`` and ``osx``.
+
+## Comparison with other packages
+
+The following comparison has been done a Intel i7-4770K with 32 GB ram and a
+Nvidia GTX 960 at a 1080p resolution. 
+
+    package
 
 ### Prerequisites
 
@@ -72,6 +85,7 @@ This project is licensed under GPLv3
 
 ## Acknowledgments
 
+* pyscreenshot
 * autopy
 * pyautogui
-* opencv
+* reame template taken from: [PurpleBooth](https://gist.github.com/PurpleBooth/109311bb0361f32d87a2)
