@@ -4,11 +4,19 @@
 capture frame rate at a resolution of 1080p on a modern machine is ~60 fps.
 There are several other such packages in the wild that are opensource as well, 
 but none of them is as fast or provides a simple way of obtaining the captures
-image as a numpy array. The default behavior of ``fastgrab`` is to provide the
-user with the image as a numpy array. Beyond that the user is free to manipulate
-the image since the pixel data is accessible via a fast and flexible array, i.e
-a numpy array.
+image as a numpy array out of the box. The default behavior of ``fastgrab`` is
+to provide the user with the image as a numpy array. Beyond that the user is
+free to manipulate the image since the pixel data is accessible via a fast and
+flexible array, i.e a numpy array.
 
+# Usage example
+
+````python
+  from fastgrab import screenshot
+  # take a full screen screenshot
+  grab = screenshot.Screenshot()
+  img = grab.capture()   # img is a numpy ndarray, do whatever you want with it
+````
 ## Getting Started
 
 ...
@@ -48,7 +56,7 @@ submit a pull request or create an issue if you find any bugs.
 
 ## Authors
 
-* **Mher Kazandjian** - *Initial work* - [PurpleBooth](https://github.com/PurpleBooth)
+* **Mher Kazandjian** - *Initial work* - [Github](https://github.com/mherkazandjian)
 
 ## License
 
