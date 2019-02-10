@@ -36,7 +36,7 @@ class Screenshot(object):
         Raise an exception of the bounding box is outside the screen bounds
         """
         x, y, w, h = bbox
-        if x + w < self.screensize[0] or y + h < self.screensize[1]:
+        if (x + w) > self.screensize[0] or (y + h) > self.screensize[1]:
             msg = (
                 'bbox is outside the screen boarders.\n'
                 'bbox={} screen size={}'
