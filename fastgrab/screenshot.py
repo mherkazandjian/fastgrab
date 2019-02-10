@@ -84,6 +84,12 @@ class Screenshot(object):
         # declare the img array only when the image size changes
         if self._img is None:
             self._img = numpy.zeros((height, width, 4), 'uint8')
+            # print('image buffer not allocated, allocating it')
+        else:
+            img_h, img_w = self._img.shape[0:2]
+            if img_h != height or img_w != width:
+                self._img = numpy.zeros((height, width, 4), 'uint8')
+                # print('image buffer size changed')
 
         screenshot(bbox[0], bbox[1], self._img)
 
