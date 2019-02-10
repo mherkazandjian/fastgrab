@@ -22,7 +22,7 @@ int screenshot(const int origin_x,
                const int origin_y,
                const int width,
                const int height,
-               unsigned char* numpy_data)
+               unsigned char* data)
 {
     XImage* img;
     Display* display;
@@ -45,15 +45,16 @@ int screenshot(const int origin_x,
         {
             const int pixel_data_index =  y_pixel_data_index_offset + x * bytes_per_pixel;
             const char *pixel_data = &img->data[pixel_data_index];
-            int linear_index = y * width + x;
+            const int linear_index = y * width + x;
 
-            numpy_data[bytes_per_pixel*linear_index + 0] = (unsigned int)pixel_data[2];
-            numpy_data[bytes_per_pixel*linear_index + 1] = (unsigned int)pixel_data[1];
-            numpy_data[bytes_per_pixel*linear_index + 2] = (unsigned int)pixel_data[0];
-            numpy_data[bytes_per_pixel*linear_index + 3] = (unsigned int)0;
+            data[bytes_per_pixel*linear_index + 0] = (unsigned int)pixel_data[2];
+            data[bytes_per_pixel*linear_index + 1] = (unsigned int)pixel_data[1];
+            data[bytes_per_pixel*linear_index + 2] = (unsigned int)pixel_data[0];
+            data[bytes_per_pixel*linear_index + 3] = (unsigned int)0;
         }
     }
 
+    free(&img->data[0]);
     XCloseDisplay(display);
 
     return 0;
@@ -84,7 +85,7 @@ PyObject* linux_x11_screenshot(PyObject *self, PyObject *args)
     if (!PyArg_ParseTuple(args, "iiO", &x, &y, &_img))
         return NULL;
 
-    img = (PyArrayObject*)PyArray_FROM_OTF(_img, NPY_UINT8, NPY_ARRAY_IN_ARRAY);
+    img = (PyArrayObject *)PyArray_FROM_OTF(_img, NPY_UINT8, NPY_ARRAY_OUT_ARRAY);
     if (img == NULL) goto fail;
 
     shape = PyArray_SHAPE(img);
