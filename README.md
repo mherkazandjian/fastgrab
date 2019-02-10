@@ -26,7 +26,13 @@ resolution    | fps
   from fastgrab import screenshot
   # take a full screen screenshot
   grab = screenshot.Screenshot()
-  img = grab.capture()   # img is a numpy ndarray, do whatever you want with it
+  img = grab.capture()
+  # >> img is a numpy ndarray, do whatever you want with it
+  # (optional)
+  # e.g it can be displayed with matplotlib (install matplotlib first) 
+  from matplotlib import pyplot as plt
+  plt.imshow(img[:, :, 0:3], interpolation='none', cmap='Greys_r')
+  plt.show()
 ````
 ## Getting Started
 
