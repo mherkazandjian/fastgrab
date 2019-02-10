@@ -18,7 +18,7 @@ setup(
     name=metadata.package,
     version=metadata.version,
     description=metadata.description,
-    authors=metadata.authors,
+    author=metadata.authors,
     url=metadata.url,
     packages=[metadata.package],
     ext_modules=[module_info]
