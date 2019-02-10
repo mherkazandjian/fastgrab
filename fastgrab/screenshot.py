@@ -2,6 +2,8 @@
 Module that implements the object for taking screenshots
 """
 import numpy
+from fastgrab._linux_x11 import screenshot, resolution
+
 
 class Screenshot(object):
     """
@@ -16,20 +18,7 @@ class Screenshot(object):
         """tuple, (width, height), backing variable for self.screensize"""
 
         self._img = None
-
-    def _find_screensize_using_tk(self):
-        """
-
-        :return:
-        """
-        pass
-
-    def _find_screensize_using_xrandr(self):
-        """
-
-        :return:
-        """
-        pass
+        """The buffer where the captured image is stored"""
 
     @property
     def screensize(self) -> tuple:
@@ -37,31 +26,65 @@ class Screenshot(object):
         return the screensize/resolution
         """
         if self._screensize is None:
-            try:
-                self._screensize = None  # fetch the screensize from tk
-            except:
-                pass
-        return None, None
+            self._screensize = resolution()
+            return self._screensize
+        else:
+            return self._screensize
 
-    def capture(self, bbox: tuple=None, save: bool=False) -> numpy.zeros:
+    def check_bbox(self, bbox):
+        """
+        Raise an exception of the bounding box is outside the screen bounds
+        """
+        x, y, w, h = bbox
+        if x + w < self.screensize[0] or y + h < self.screensize[1]:
+            msg = (
+                'bbox is outside the screen boarders.\n'
+                'bbox={} screen size={}'
+            ).format(bbox, self.screensize)
+            raise ValueError(msg)
+
+    def capture(self, bbox: tuple=None) -> numpy.zeros:
         """
         Take a screenshot and return the image
 
-        :param bbox:
-        :param save:
-        :return:
-        :return:
+        The captured image is a height x width for each R, G, B cannel, the
+        alpha channel is zeroed out.
+
+        # in this example, a full screen screenshot is taken and displayed with
+        # matplotlib. Matplotlib is not required and is used for demonstration
+        # porposes. Once the image is captured in img that is a numpy array
+        # other third party libraries such as opencv can be used to display it
+        # quickly with high refresh rates
+        .. code-block:: python
+
+            from fastgrab import screenshot
+            grab = screenshot.Screenshot()
+            img = grab.capture()
+
+            from matplotlib import pyplot as plt
+            plt.imshow(img[:, :, 0:3], interpolation='none', cmap='Greys_r')
+            plt.show()
+
+
+        :param bbox: the upper left corner of the screenshot and the width
+         and heigh (x0, y0, width, height).
+        :return: The image as a numpy array of share (height, width, 4). The
+         last layer is zeros out.
         """
 
         # check/set the dimensions of the image that will be captured
         if bbox is None:
             width, height = self.screensize
+            bbox = (0, 0, width, height)
         else:
             _, _, width, height = bbox
+
+        self.check_bbox(bbox)
 
         # declare the img array only when the image size changes
         if self._img is None:
             self._img = numpy.zeros((height, width, 4), 'uint8')
 
-        # interface(x, y, img.shape[1], img.shape[0], img_data_ptr)
-        # return img[:, :, 0:3]
+        screenshot(bbox[0], bbox[1], self._img)
+
+        return self._img
