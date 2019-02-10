@@ -6,6 +6,17 @@
 #define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
 #include <numpy/arrayobject.h>
 
+void screen_resolution(int *resolution)
+{
+    Display *display;
+    Screen *screen;
+
+    display = XOpenDisplay(NULL);
+    screen = ScreenOfDisplay(display, 0);
+    resolution[0] = screen->width;
+    resolution[1] = screen->height;
+    XCloseDisplay(display);
+}
 
 int screenshot(const int origin_x,
                const int origin_y,
@@ -49,6 +60,20 @@ int screenshot(const int origin_x,
 }
 
 static
+PyObject* linux_x11_screen_resolution(PyObject *self, PyObject *args)
+{
+    int resolution[2];
+    PyObject *res_tuple = PyTuple_New(2);
+
+    screen_resolution(&resolution[0]);
+
+    PyTuple_SetItem(res_tuple, 0, PyLong_FromLong(resolution[0]));
+    PyTuple_SetItem(res_tuple, 1, PyLong_FromLong(resolution[1]));
+
+    return res_tuple;
+}
+
+static
 PyObject* linux_x11_screenshot(PyObject *self, PyObject *args)
 {
     int x, y;
@@ -73,6 +98,7 @@ PyObject* linux_x11_screenshot(PyObject *self, PyObject *args)
 
 // method function definitions
 static PyMethodDef linux_x11_methods[] = {
+    {"resolution", linux_x11_screen_resolution, METH_VARARGS, "return the screen resolution"},
     {"screenshot", linux_x11_screenshot, METH_VARARGS, "capture a screenshot using X11"},
     {NULL, NULL, 0, NULL}
 };
