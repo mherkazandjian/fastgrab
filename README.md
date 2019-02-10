@@ -19,13 +19,19 @@ flexible array, i.e a numpy array.
 ````
 ## Getting Started
 
-...
+``Fastgrab`` was initially developed in 2016 as part of an aimbot (for quake
+live). ``Fastgrab`` is developed and tested on ``linux``. As far was the 
+pre-requisited listed below are satisfied, it should work as expected on
+``windows`` and ``osx``.
 
 ### Prerequisites
 
- - ``Numpy``
- - ``gcc``
- - ``X11``
+ - ``Numpy >= 1.15``
+ - ``gcc >= 4.8.5``
+ - ``X11 => 1.20``
+
+note that ``fastgrab`` could work with lower versions but I have not tested it
+(and probaby will not). 
 
 ### Installing
 
@@ -53,6 +59,8 @@ tox
 ## Contributing
 
 submit a pull request or create an issue if you find any bugs.
+
+Any help/pull requests for windows/osx support are welcome.
 
 ## Authors
 
