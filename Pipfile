@@ -5,6 +5,7 @@ name = "pypi"
 
 [dev-packages]
 pytest = "*"
+tox-pipenv = "*"
 
 [packages]
 numpy = "*"

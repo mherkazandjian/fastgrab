@@ -1,5 +1,7 @@
 # FastGrab
 
+[![build status](https://travis-ci.org/mherkazandjian/fastgrab.svg?branch=master)](https://github.com/mherkazandjian/fastgrab/tree/master)
+
 ``Fastgrab`` is an opensouce high frame rate screen capture package. A typical
 capture frame rate at a resolution of 1080p on a modern machine is ~60 fps.
 There are several other such packages in the wild that are opensource as well, 
@@ -50,6 +52,7 @@ pyscreennshot | 0.5
 
 ### Prerequisites
 
+ - ``python >= 3.6`` (python 2 is not supported)
  - ``Numpy >= 1.15``
  - ``gcc >= 4.8.5``
  - ``X11 => 1.20``
@@ -85,6 +88,7 @@ pytest tests
 or
 
 ````bash
+pip install tox-pipenv
 cd fastgrab
 tox
 ````
@@ -94,7 +98,11 @@ tox
 Submit a pull request or create an [issue](https://github.com/mherkazandjian/fastgrab/issues/new)
 if you find any bugs.
 
-Any help/pull requests for windows/osx support are welcome.
+Any help/pull requests for the following are welcome:
+
+   - python 2.7
+   - osx
+   - windows
 
 ## Authors
 
