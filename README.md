@@ -15,10 +15,10 @@ Typical capture frame rate on a modern machine
 
 resolution    | fps
 ------------- | -----
-360p          | > 300
-720p          | 140
-1080p         | 60
-4K            | 10
+360p          | > 800
+720p          | 260
+1080p         | 200
+4K            | 20
 
 # Usage example
 
