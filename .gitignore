@@ -118,3 +118,4 @@ dmypy.json
 # jetbrains
 .idea
 fastgrab/linux_x11/cmake-build-debug
+CMakeLists.txt

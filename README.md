@@ -25,11 +25,10 @@ resolution    | fps
 ````python
   from fastgrab import screenshot
   # take a full screen screenshot
-  grab = screenshot.Screenshot()
-  img = grab.capture()
+  img = screenshot.Screenshot().capture()
   # >> img is a numpy ndarray, do whatever you want with it
   # (optional)
-  # e.g it can be displayed with matplotlib (install matplotlib first) 
+  # e.g it can be displayed with matplotlib (install matplotlib first)
   from matplotlib import pyplot as plt
   plt.imshow(img[:, :, 0:3], interpolation='none', cmap='Greys_r')
   plt.show()
@@ -42,22 +41,20 @@ pre-requisited listed below are satisfied, it should work as expected on
 ``windows`` and ``osx``. The low-level API of ``Fastgrab`` is implemented
 using the ``cpython``, ``Numpy`` and ``X11`` C APIs.
 
-``fastgrab`` is multi-threaded and it uses all the cores on the machine by
-default.
-
 ## Comparison with other packages
 
-The following comparison has been done a Intel i7-4770K with 32 GB ram and a
-Nvidia GTX 960 at a 1080p resolution. ``Fastgrab`` is designed to be fast and
+The following comparison has been done a Intel i7-6700HQ with 16 GB ram  at a
+1080p resolution. ``fastgrab`` is designed to be fast and
 does not provide any features beyond capturing the screen, unlike the other
 packages mentioned in  the comparison below that do many great things. 
 
 package       | fps
 ------------- | -----
-fastgrab      | 60
-autopy        | 10 
-pyautogui     | 1
-pyscreennshot | 0.5
+fastgrab      | 200
+python-mss    | 180
+autopy        | 34
+pyautogui     | 8
+pyscreenshot  | 4
 
 to benchmark ``fastgrab`` run the script [examples/benchmark.py](https://github.com/mherkazandjian/fastgrab/blob/master/examples/benchmark.py)
 
@@ -110,7 +107,7 @@ tox
 Submit a pull request or create an [issue](https://github.com/mherkazandjian/fastgrab/issues/new)
 if you find any bugs.
 
-Any help/pull requests for the following are welcome:
+Any help/pull requests that implement support for the following are welcome:
 
    - python 2.7
    - osx
@@ -131,3 +128,4 @@ This project is licensed under GPLv3
 * pyautogui
 * reame template taken from: [PurpleBooth](https://gist.github.com/PurpleBooth/109311bb0361f32d87a2)
 * https://stackoverflow.com/questions/69645/take-a-screenshot-via-a-python-script-linux/16141058#16141058
+* python-mss

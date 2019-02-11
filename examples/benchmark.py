@@ -14,7 +14,7 @@ benchmark_resolutions = {
 }
 
 # the number of frames to be captured for each benchmark resolution
-n_frames = 200
+n_frames = 800
 
 # run the benchmark
 grab = screenshot.Screenshot()

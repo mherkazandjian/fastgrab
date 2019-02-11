@@ -2,7 +2,7 @@
 Module that implements the object for taking screenshots
 """
 import numpy
-from fastgrab._linux_x11 import screenshot, resolution
+from fastgrab._linux_x11 import screenshot, resolution, bytes_per_pixel
 
 
 class Screenshot(object):
@@ -65,7 +65,6 @@ class Screenshot(object):
             plt.imshow(img[:, :, 0:3], interpolation='none', cmap='Greys_r')
             plt.show()
 
-
         :param bbox: the upper left corner of the screenshot and the width
          and heigh (x0, y0, width, height).
         :return: The image as a numpy array of share (height, width, 4). The
@@ -83,12 +82,16 @@ class Screenshot(object):
 
         # declare the img array only when the image size changes
         if self._img is None:
-            self._img = numpy.zeros((height, width, 4), 'uint8')
+            self._img = numpy.zeros(
+                (height, width, bytes_per_pixel()), 'uint8'
+            )
             # print('image buffer not allocated, allocating it')
         else:
             img_h, img_w = self._img.shape[0:2]
             if img_h != height or img_w != width:
-                self._img = numpy.zeros((height, width, 4), 'uint8')
+                self._img = numpy.zeros(
+                    (height, width, bytes_per_pixel()), 'uint8'
+                )
                 # print('image buffer size changed')
 
         screenshot(bbox[0], bbox[1], self._img)

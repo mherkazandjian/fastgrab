@@ -8,8 +8,9 @@ module_info = Extension(
     libraries=['X11', 'gomp'],
     extra_compile_args=[
         '-fno-strict-aliasing',
-        '-fopenmp',
-        '-std=c11'
+        # '-fopenmp',
+        '-std=c11',
+        '-mtune=native'
     ],
     sources=["fastgrab/linux_x11/screenshot.c"]
 )
