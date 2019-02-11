@@ -5,7 +5,7 @@ Project metadata that describe it
 package = 'fastgrab'
 project = 'fastgrab'
 project_no_spaces = project.replace(' ', '')
-version = '0.2.0'
+version = '0.3.0-dev'
 description = 'Low level screen capture package with a numpy interface'
 authors = ['Mher Kazandjian']
 authors_string = ', '.join(authors)
