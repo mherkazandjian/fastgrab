@@ -1,6 +1,6 @@
 # FastGrab
 
-[![build status](https://travis-ci.org/mherkazandjian/fastgrab.svg?branch=master)](https://github.com/mherkazandjian/fastgrab/tree/master)
+[![CircleCI](https://circleci.com/gh/mherkazandjian/fastgrab/tree/master.svg?style=svg)](https://circleci.com/gh/mherkazandjian/fastgrab/tree/master)
 
 ``Fastgrab`` is an opensouce high frame rate screen capture package. A typical
 capture frame rate at a resolution of 1080p on a modern machine is ~60 fps.
