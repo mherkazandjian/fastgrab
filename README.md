@@ -91,15 +91,15 @@ python setup.py install
 Execute the following in the source root dir
 
 ````bash
-pytest tests
+pytest -v tests
 ````
 
 or
 
 ````bash
-pip install tox-pipenv
-pipenv install
-tox
+pip install --dev
+pipenv run python setup.py install --force
+pipenv run pytest -v tests
 ````
 
 ## Contributing
