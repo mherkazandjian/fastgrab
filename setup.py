@@ -5,7 +5,7 @@ from fastgrab import metadata
 module_info = Extension(
     "fastgrab._linux_x11",
     include_dirs=[numpy.get_include()],
-    libraries=['X11', 'gomp'],
+    libraries=['X11'],  #'gomp'],
     extra_compile_args=[
         '-fno-strict-aliasing',
         # '-fopenmp',
