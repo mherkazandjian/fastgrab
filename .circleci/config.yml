@@ -3,7 +3,7 @@ jobs:
   build:
     working_directory: ~/fastgrab
     docker:
-      - image: circleci/python:3.11
+      - image: cimg/python:3.11.4
         environment:
           PIPENV_VENV_IN_PROJECT: true
     steps:
