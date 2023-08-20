@@ -1,0 +1,18 @@
+version: 2
+jobs:
+  build:
+    working_directory: ~/fastgrab
+    docker:
+      - image: circleci/python:3.11
+        environment:
+          PIPENV_VENV_IN_PROJECT: true
+    steps:
+          - checkout
+          - run:
+              command: |
+                pip install pip --upgrade
+                pip install pipenv
+                pipenv install
+                pipenv install --dev
+                pipenv run pip install .
+                pipenv run pytest -v tests
