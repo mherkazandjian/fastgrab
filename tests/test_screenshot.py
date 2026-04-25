@@ -1,50 +1,26 @@
+"""Cross-platform API contract tests.
+
+These tests run on Linux (X11 or Wayland), Windows, and macOS — they
+exercise the public :class:`fastgrab.screenshot.Screenshot` API
+without touching any platform-specific internals. The four
+``_linux_x11``-direct tests live in ``tests/test_x11_lowlevel.py``
+and are skipped on non-Linux.
+"""
 import numpy
 import pytest
 
 from fastgrab import screenshot
-from fastgrab import _linux_x11
 
 
 def test_screenshot_instance_can_be_created():
     screenshot.Screenshot()
 
 
-def test_low_level_resolution_returns_positive_2_tuple():
-    res = _linux_x11.resolution()
-    assert isinstance(res, tuple)
-    assert len(res) == 2
-    width, height = res
-    assert isinstance(width, int) and isinstance(height, int)
-    assert width > 0 and height > 0
-
-
-def test_low_level_bytes_per_pixel_is_4():
-    # X11 ZPixmap on every supported platform we ship to is 32-bit (BGRA).
-    assert _linux_x11.bytes_per_pixel() == 4
-
-
-def test_low_level_screenshot_fills_buffer():
-    width, height = _linux_x11.resolution()
-    buf = numpy.zeros((height, width, 4), dtype="uint8")
-    _linux_x11.screenshot(0, 0, buf)
-    # Alpha channel is left as raw X data; at least one of B/G/R should not be
-    # the original zero across the entire screen unless the screen is all
-    # black, in which case this assertion still passes via the dtype/shape
-    # checks.
-    assert buf.shape == (height, width, 4)
-    assert buf.dtype == numpy.uint8
-
-
-def test_screensize_matches_low_level_resolution():
-    grab = screenshot.Screenshot()
-    assert grab.screensize == _linux_x11.resolution()
-
-
 def test_screensize_is_cached():
     grab = screenshot.Screenshot()
     first = grab.screensize
     # Mutate the backing field; if cached, the property returns the new value
-    # without re-querying the X server.
+    # without re-querying the underlying backend.
     grab._screensize = (1, 1)
     assert grab.screensize == (1, 1)
     assert first != (1, 1)  # sanity: original was a real resolution

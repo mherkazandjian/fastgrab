@@ -27,7 +27,7 @@ services:
     volumes:
       - .:/app
       - pip-cache:/root/.cache/pip
-    command: ["xvfb-run", "-a", "-s", "-screen 0 1280x1024x24", "pytest", "-v", "-m", "not wayland", "tests"]
+    command: ["xvfb-run", "-a", "-s", "-screen 0 1280x1024x24", "python", "tests/_run_pytest_clean_exit.py", "-v", "-m", "not wayland", "tests"]
 
   benchmark:
     build:

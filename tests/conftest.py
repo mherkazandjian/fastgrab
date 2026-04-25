@@ -2,12 +2,27 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import time
 
 import pytest
 
 
 SOCKET_NAME = "fastgrab-painter.sock"
+
+
+# Pytest looks at this module-level list and refuses to *import* the named
+# files during collection. Marker filters (-m "not wayland") and
+# pytestmark = pytest.mark.skipif(...) only skip test functions — they
+# don't prevent the test module's imports from running, which is where
+# the cross-platform CI jobs (windows, macos) tripped: test_integration_wlr.py
+# imports pywayland, test_x11_lowlevel.py imports the libX11 C extension.
+collect_ignore = []
+if sys.platform != "linux":
+    collect_ignore.extend([
+        "test_integration_wlr.py",   # imports fastgrab.backends.wlr → pywayland
+        "test_x11_lowlevel.py",      # imports fastgrab._linux_x11
+    ])
 
 
 def _x11_available() -> bool:
@@ -33,6 +48,10 @@ def _wayland_available() -> bool:
 
 @pytest.fixture(scope="session", autouse=True)
 def require_some_display():
+    # On Windows/macOS the system always has a desktop available to capture;
+    # the display-server gate is a Linux-only concept.
+    if sys.platform != "linux":
+        return
     if not (_x11_available() or _wayland_available()):
         pytest.skip(
             "no usable display server (need DISPLAY or WAYLAND_DISPLAY)",
