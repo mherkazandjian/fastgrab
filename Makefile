@@ -17,12 +17,14 @@ ifeq ($(docker),1)
 DC := docker compose run --rm --entrypoint bash test -c
 BUILD_CMD := $(DC) 'poetry build'
 TEST_CMD := docker compose run --rm test
+TEST_WAYLAND_CMD := docker compose run --rm test-wayland
 INSTALL_CMD := $(DC) 'pip install .'
 BENCH_CMD := docker compose run --rm benchmark
 LOCK_CMD := $(DC) 'poetry lock'
 else
 BUILD_CMD := poetry build
-TEST_CMD := pytest tests
+TEST_CMD := pytest -m 'not wayland' tests
+TEST_WAYLAND_CMD := pytest -m wayland tests
 INSTALL_CMD := pip install .
 BENCH_CMD := python examples/benchmark.py
 LOCK_CMD := poetry lock
@@ -32,9 +34,13 @@ endif
 build:
 	$(BUILD_CMD)
 
-#@help: run the unit + integration test suite
+#@help: run the X11 unit + integration test suite
 test:
 	$(TEST_CMD)
+
+#@help: run the wayland (wlr-screencopy) integration test suite under cage
+test-wayland:
+	$(TEST_WAYLAND_CMD)
 
 #@help: install fastgrab into the active python environment
 install:
@@ -97,4 +103,4 @@ help:
 	@echo "Pass docker=1 to run targets in the dev container, e.g.:"
 	@echo "  make test docker=1"
 
-.PHONY: help build test install dev benchmark lock clean
+.PHONY: help build test test-wayland install dev benchmark lock clean

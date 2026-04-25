@@ -1,14 +1,19 @@
 """Poetry build hook + standalone in-place builder for the libX11 C extension.
 
 When invoked by Poetry / pip during wheel build, ``build(setup_kwargs)`` is
-called and injects the C extension into the setup kwargs.
+called and injects the C extension into the setup kwargs — but only on
+Linux. Windows and macOS get a pure-Python wheel because their backends
+(``fastgrab.backends.windows`` / ``fastgrab.backends.macos``) are pure
+ctypes against the OS-native APIs and have no C-side build step.
 
 When invoked as a script (``python build.py``), it runs setuptools'
 ``build_ext --inplace`` so the resulting ``.so`` lands next to the Python
 source. The dev/test container's entrypoint uses this path because
 poetry-core's PEP 660 editable install does not place compiled extensions
-in-tree on its own.
+in-tree on its own. On non-Linux hosts the script is a no-op.
 """
+import sys
+
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext as _build_ext
 
@@ -35,6 +40,8 @@ EXT_MODULES = [
 
 
 def build(setup_kwargs):
+    if sys.platform != "linux":
+        return  # pure-Python wheel on Windows / macOS
     setup_kwargs.update({
         "ext_modules": EXT_MODULES,
         "cmdclass": {"build_ext": build_ext},
@@ -42,6 +49,10 @@ def build(setup_kwargs):
 
 
 if __name__ == "__main__":
+    if sys.platform != "linux":
+        # No C extension to build on Windows / macOS — exit cleanly so the
+        # docker entrypoint and CI scripts stay portable.
+        raise SystemExit(0)
     setup(
         name="fastgrab",
         ext_modules=EXT_MODULES,
