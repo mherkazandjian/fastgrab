@@ -1,0 +1,12 @@
+.git
+.gitignore
+.tox
+.pytest_cache
+.idea
+__pycache__
+*.py[cod]
+build/
+dist/
+*.egg-info/
+fastgrab/_linux_x11*.so
+fastgrab/linux_x11/cmake-build-debug
