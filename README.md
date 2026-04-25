@@ -34,10 +34,10 @@ resolution    | fps
 ## Getting Started
 
 ``Fastgrab`` was initially developed in 2016 as part of an aimbot (for quake
-live). ``Fastgrab`` is developed and tested on ``linux``. As far as the 
-pre-requisited listed below are satisfied, it should work as expected on
-``windows`` and ``osx``. The low-level API of ``Fastgrab`` is implemented
-using the ``cpython``, ``Numpy`` and ``X11`` C APIs.
+live). ``Fastgrab`` is Linux/X11 only — the low-level API is implemented
+using the ``cpython``, ``Numpy`` and ``X11`` C APIs. Other backends
+(Wayland / macOS / Windows) would ship as opt-in pip extras; the default
+wheel stays Linux/X11 and dependency-light.
 
 ## Comparison with other packages
 
@@ -58,10 +58,11 @@ to benchmark ``fastgrab`` run the script [examples/benchmark.py](https://github.
 
 ### Prerequisites
 
- - ``python >= 3.6`` (python 2 is not supported)
- - ``Numpy >= 1.15``
+ - ``python >= 3.8`` (python 2 is not supported)
+ - ``Numpy >= 1.15`` (auto-installed by pip)
  - ``gcc >= 4.8.5``
- - ``X11 => 1.20``
+ - ``X11 >= 1.20`` (system package: ``libx11-dev`` for build, ``libX11``
+   and ``libgomp1`` at runtime)
 
 note that ``fastgrab`` could work with lower versions but I have not tested it
 (and probaby will not). 
@@ -75,41 +76,54 @@ pip install fastgrab
 ```
 
 ```bash
-pip install git+git://github.com/mherkazandjian/fastgrab.git
+pip install git+https://github.com/mherkazandjian/fastgrab.git
 ```
 
 ```bash
 git clone https://github.com/mherkazandjian/fastgrab.git
 cd fastgrab
-python setup.py install
+pip install .
 ```
 
 ## Running the tests
 
-Execute the following in the source root dir
+The canonical way to run the test suite is through the project's docker
+compose setup, which bundles ``Xvfb``, ``libX11`` and the build toolchain
+so tests are reproducible regardless of the host:
 
 ````bash
-pytest tests
+make test docker=1
 ````
 
-or
+which is equivalent to
 
 ````bash
-pip install tox-pipenv
-pipenv install
-tox
+docker compose run --rm test
 ````
+
+If you have ``pytest``, ``numpy``, ``python-xlib`` and an X server (or
+``xvfb-run``) available on the host, the suite also runs directly:
+
+````bash
+make test
+````
+
+The ``Makefile`` exposes ``build``, ``install``, ``dev`` (a virtual
+desktop on ``localhost:5901`` over VNC), ``benchmark``, ``lock`` and
+``clean`` targets — run ``make`` with no arguments for the help listing.
 
 ## Contributing
 
 Submit a pull request or create an [issue](https://github.com/mherkazandjian/fastgrab/issues/new)
 if you find any bugs.
 
-Any help/pull requests that implement support for the following are welcome:
+Any help/pull requests that implement support for the following are welcome.
+The default wheel must stay Linux/X11 and dependency-light, so additional
+backends ship as opt-in pip extras (``pip install fastgrab[<extra>]``):
 
-   - python 2.7
-   - osx
-   - windows
+   - macOS backend
+   - Windows backend
+   - Wayland backend
 
 ## Authors
 
