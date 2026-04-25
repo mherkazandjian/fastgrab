@@ -20,12 +20,22 @@ classifiers = [
 packages = [{include = "fastgrab"}]
 include = [
     {path = "fastgrab/linux_x11/*.c", format = "sdist"},
+    {path = "fastgrab/backends/protocols/*.xml", format = ["sdist", "wheel"]},
+    {path = "fastgrab/backends/protocols/*.py", format = ["sdist", "wheel"]},
 ]
 build = "build.py"
 
 [tool.poetry.dependencies]
 python = "^3.8"
 numpy = "*"
+pywayland = {version = "^0.4.17", optional = true}
+dbus-next = {version = "^0.2.3", optional = true}
+pipewire-python = {version = "^0.2.0", optional = true}
+
+[tool.poetry.extras]
+wayland = ["pywayland"]
+wayland-portal = ["dbus-next", "pipewire-python"]
+wayland-all = ["pywayland", "dbus-next", "pipewire-python"]
 
 [tool.poetry.group.dev.dependencies]
 pytest = "*"
@@ -38,4 +48,5 @@ build-backend = "poetry.core.masonry.api"
 [tool.pytest.ini_options]
 markers = [
     "integration: pixel-level tests that mutate X server state (need DISPLAY + xsetroot)",
+    "wayland: pixel-level tests that exercise the Wayland (wlr-screencopy) backend (need WAYLAND_DISPLAY + a wlroots compositor like cage)",
 ]

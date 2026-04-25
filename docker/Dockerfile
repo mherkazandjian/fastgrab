@@ -22,16 +22,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         x11-xserver-utils \
         xdotool \
         procps \
+        cage \
+        libwayland-client0 \
+        libwayland-dev \
+        wayland-protocols \
+        pkg-config \
+        ca-certificates \
+        curl \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir poetry numpy pytest python-xlib \
+RUN pip install --no-cache-dir \
+        poetry \
+        numpy \
+        pytest \
+        python-xlib \
+        pywayland \
     && poetry config virtualenvs.create false
 
 WORKDIR /app
 
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint
 COPY docker/start-desktop.sh /usr/local/bin/start-desktop
-RUN chmod +x /usr/local/bin/entrypoint /usr/local/bin/start-desktop
+COPY docker/start-wayland-desktop.sh /usr/local/bin/start-wayland-desktop
+RUN chmod +x /usr/local/bin/entrypoint \
+             /usr/local/bin/start-desktop \
+             /usr/local/bin/start-wayland-desktop
 
 EXPOSE 5900
 

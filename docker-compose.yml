@@ -27,7 +27,7 @@ services:
     volumes:
       - .:/app
       - pip-cache:/root/.cache/pip
-    command: ["xvfb-run", "-a", "-s", "-screen 0 1280x1024x24", "pytest", "-v", "tests"]
+    command: ["xvfb-run", "-a", "-s", "-screen 0 1280x1024x24", "pytest", "-v", "-m", "not wayland", "tests"]
 
   benchmark:
     build:
@@ -42,6 +42,23 @@ services:
       DISPLAY: ":99"
       SCREEN_GEOMETRY: "3840x2160x24"
     command: ["start-desktop", "python", "examples/benchmark.py"]
+
+  test-wayland:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: fastgrab-dev
+    init: true
+    volumes:
+      - .:/app
+      - pip-cache:/root/.cache/pip
+    environment:
+      WAYLAND_DISPLAY: "wayland-1"
+      XDG_RUNTIME_DIR: "/tmp/xdg-runtime"
+      WLR_BACKENDS: "headless"
+      WLR_LIBINPUT_NO_DEVICES: "1"
+      FASTGRAB_TEST_BACKEND: "wlr"
+    command: ["start-wayland-desktop", "python", "tests/_run_pytest_clean_exit.py", "-v", "-m", "wayland", "tests"]
 
 volumes:
   pip-cache:

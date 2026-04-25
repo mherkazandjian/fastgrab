@@ -2,17 +2,25 @@
 Module that implements the object for taking screenshots
 """
 import numpy
-from fastgrab._linux_x11 import screenshot, resolution, bytes_per_pixel
+
+from fastgrab.backends import _resolve_backend
 
 
 class Screenshot(object):
     """
     Main object that captures screenshots and provides other utilities
     """
-    def __init__(self):
+    def __init__(self, backend=None):
         """
         Constructor
+
+        :param backend: optional explicit backend name — one of
+            ``'x11'``, ``'wlr'``, ``'portal'``. When ``None`` (default)
+            the backend is auto-detected from the environment:
+            Wayland sessions try wlr → portal; X11 sessions use x11.
         """
+        self._backend = _resolve_backend(backend)
+        """The capture backend (BaseBackend subclass instance)"""
 
         self._screensize = None
         """tuple, (width, height), backing variable for self.screensize"""
@@ -26,7 +34,7 @@ class Screenshot(object):
         return the screensize/resolution
         """
         if self._screensize is None:
-            self._screensize = resolution()
+            self._screensize = self._backend.resolution()
             return self._screensize
         else:
             return self._screensize
@@ -43,12 +51,12 @@ class Screenshot(object):
             ).format(bbox, self.screensize)
             raise ValueError(msg)
 
-    def capture(self, bbox: tuple=None) -> numpy.zeros:
+    def capture(self, bbox: tuple=None) -> numpy.ndarray:
         """
         Take a screenshot and return the image
 
-        The captured image is a height x width for each R, G, B cannel, the
-        alpha channel is zeroed out.
+        The captured image is a height x width for each B, G, R, A channel
+        on little-endian Linux x86_64. The alpha channel is typically zeroed.
 
         # in this example, a full screen screenshot is taken and displayed with
         # matplotlib. Matplotlib is not required and is used for demonstration
@@ -67,8 +75,8 @@ class Screenshot(object):
 
         :param bbox: the upper left corner of the screenshot and the width
          and heigh (x0, y0, width, height).
-        :return: The image as a numpy array of share (height, width, 4). The
-         last layer is zeros out.
+        :return: The image as a numpy array of shape (height, width, 4) in
+         BGRA byte order.
         """
 
         # check/set the dimensions of the image that will be captured
@@ -80,20 +88,20 @@ class Screenshot(object):
 
         self.check_bbox(bbox)
 
+        bpp = self._backend.bytes_per_pixel()
+
         # declare the img array only when the image size changes
         if self._img is None:
             self._img = numpy.zeros(
-                (height, width, bytes_per_pixel()), 'uint8'
+                (height, width, bpp), 'uint8'
             )
-            # print('image buffer not allocated, allocating it')
         else:
             img_h, img_w = self._img.shape[0:2]
             if img_h != height or img_w != width:
                 self._img = numpy.zeros(
-                    (height, width, bytes_per_pixel()), 'uint8'
+                    (height, width, bpp), 'uint8'
                 )
-                # print('image buffer size changed')
 
-        screenshot(bbox[0], bbox[1], self._img)
+        self._backend.screenshot(bbox[0], bbox[1], self._img)
 
         return self._img
