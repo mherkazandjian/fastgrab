@@ -1,7 +1,5 @@
 # FastGrab
 
-[![CircleCI](https://circleci.com/gh/mherkazandjian/fastgrab/tree/master.svg?style=svg)](https://circleci.com/gh/mherkazandjian/fastgrab/tree/master)
-
 ``Fastgrab`` is an opensouce high frame rate screen capture package. A typical
 capture frame rate at a resolution of 1080p on a modern machine is ~60 fps.
 There are several other such packages in the wild that are opensource as well, 
@@ -56,7 +54,7 @@ autopy        | 34
 pyautogui     | 8
 pyscreenshot  | 4
 
-to benchmark ``fastgrab`` run the script [examples/benchmark.py](https://github.com/mherkazandjian/fastgrab/blob/master/examples/benchmark.py)
+to benchmark ``fastgrab`` run the script [examples/benchmark.py](https://github.com/mherkazandjian/fastgrab/blob/main/examples/benchmark.py)
 
 ### Prerequisites
 
