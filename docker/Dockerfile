@@ -24,7 +24,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         procps \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir numpy pytest python-xlib
+RUN pip install --no-cache-dir poetry numpy pytest python-xlib \
+    && poetry config virtualenvs.create false
 
 WORKDIR /app
 

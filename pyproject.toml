@@ -1,0 +1,41 @@
+[tool.poetry]
+name = "fastgrab"
+version = "0.3.0.dev0"
+description = "Low level screen capture package with a numpy interface"
+authors = ["Mher Kazandjian <mherkazandjian@gmail.com>"]
+license = "GPL-3.0-or-later"
+readme = "README.md"
+homepage = "https://github.com/mherkazandjian/fastgrab"
+repository = "https://github.com/mherkazandjian/fastgrab"
+keywords = ["screenshot", "screen-capture", "x11", "numpy"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C",
+    "Topic :: Multimedia :: Graphics :: Capture :: Screen Capture",
+]
+packages = [{include = "fastgrab"}]
+include = [
+    {path = "fastgrab/linux_x11/*.c", format = "sdist"},
+]
+build = "build.py"
+
+[tool.poetry.dependencies]
+python = "^3.8"
+numpy = "*"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "*"
+python-xlib = "*"
+
+[build-system]
+requires = ["poetry-core>=1.5.0", "setuptools", "numpy"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: pixel-level tests that mutate X server state (need DISPLAY + xsetroot)",
+]
