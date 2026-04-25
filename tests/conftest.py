@@ -11,6 +11,20 @@ import pytest
 SOCKET_NAME = "fastgrab-painter.sock"
 
 
+# Pytest looks at this module-level list and refuses to *import* the named
+# files during collection. Marker filters (-m "not wayland") and
+# pytestmark = pytest.mark.skipif(...) only skip test functions — they
+# don't prevent the test module's imports from running, which is where
+# the cross-platform CI jobs (windows, macos) tripped: test_integration_wlr.py
+# imports pywayland, test_x11_lowlevel.py imports the libX11 C extension.
+collect_ignore = []
+if sys.platform != "linux":
+    collect_ignore.extend([
+        "test_integration_wlr.py",   # imports fastgrab.backends.wlr → pywayland
+        "test_x11_lowlevel.py",      # imports fastgrab._linux_x11
+    ])
+
+
 def _x11_available() -> bool:
     display = os.environ.get("DISPLAY")
     if not display:
