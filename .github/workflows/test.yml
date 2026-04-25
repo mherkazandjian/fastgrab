@@ -6,7 +6,7 @@ on:
 
 jobs:
   x11:
-    name: x11 (xvfb + libX11)
+    name: linux x11 (xvfb + libX11)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -15,7 +15,7 @@ jobs:
         run: docker compose run --rm test
 
   wayland:
-    name: wayland (wlr-screencopy via cage)
+    name: linux wayland (wlr-screencopy via cage)
     runs-on: ubuntu-latest
     # Headless wlroots can be flaky in CI — fail-soft initially. Drop this
     # once the job's pass-rate is steady.
@@ -25,3 +25,45 @@ jobs:
 
       - name: Run wlr-screencopy integration tests
         run: docker compose run --rm test-wayland
+
+  windows:
+    name: windows (BitBlt + DIBSection)
+    runs-on: windows-latest
+    # New backend — fail-soft until the runner's display behaviour proves
+    # stable. Promote to required after a clean baseline.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install fastgrab + pytest
+        run: |
+          python -m pip install --upgrade pip
+          pip install .
+          pip install pytest
+
+      - name: Run cross-platform contract tests
+        run: pytest -v -m "not wayland and not integration" tests
+
+  macos:
+    name: macos (CGDisplayCreateImage)
+    runs-on: macos-latest
+    # Same fail-soft rationale as windows; macOS Screen Recording (TCC)
+    # behaviour on the runner has not yet been observed end-to-end.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install fastgrab + pytest
+        run: |
+          python -m pip install --upgrade pip
+          pip install .
+          pip install pytest
+
+      - name: Run cross-platform contract tests
+        run: pytest -v -m "not wayland and not integration" tests

@@ -2,6 +2,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import time
 
 import pytest
@@ -33,6 +34,10 @@ def _wayland_available() -> bool:
 
 @pytest.fixture(scope="session", autouse=True)
 def require_some_display():
+    # On Windows/macOS the system always has a desktop available to capture;
+    # the display-server gate is a Linux-only concept.
+    if sys.platform != "linux":
+        return
     if not (_x11_available() or _wayland_available()):
         pytest.skip(
             "no usable display server (need DISPLAY or WAYLAND_DISPLAY)",

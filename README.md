@@ -34,10 +34,12 @@ resolution    | fps
 ## Getting Started
 
 ``Fastgrab`` was initially developed in 2016 as part of an aimbot (for quake
-live). ``Fastgrab`` is Linux/X11 only — the low-level API is implemented
-using the ``cpython``, ``Numpy`` and ``X11`` C APIs. Other backends
-(Wayland / macOS / Windows) would ship as opt-in pip extras; the default
-wheel stays Linux/X11 and dependency-light.
+live). It supports **Linux** (X11 via a libX11 C extension; Wayland via the
+``wlr-screencopy-v1`` protocol behind the ``[wayland]`` extra), **Windows
+10/11** (Win32 ``BitBlt`` via ``ctypes``), and **macOS** (CoreGraphics
+``CGDisplayCreateImage`` via ``ctypes``). The plain
+``pip install fastgrab`` works on all three platforms; only Wayland needs
+an opt-in extra.
 
 ## Comparison with other packages
 
@@ -58,11 +60,23 @@ to benchmark ``fastgrab`` run the script [examples/benchmark.py](https://github.
 
 ### Prerequisites
 
+Common to all platforms:
+
  - ``python >= 3.8`` (python 2 is not supported)
  - ``Numpy >= 1.15`` (auto-installed by pip)
- - ``gcc >= 4.8.5``
- - ``X11 >= 1.20`` (system package: ``libx11-dev`` for build, ``libX11``
-   and ``libgomp1`` at runtime)
+
+Per-platform extras:
+
+ - **Linux/X11**: ``gcc >= 4.8.5``, ``X11 >= 1.20`` (system package:
+   ``libx11-dev`` for build; ``libX11`` and ``libgomp1`` at runtime).
+ - **Linux/Wayland**: a wlroots-based compositor (Sway, Hyprland, river,
+   niri, cage) for the no-prompt path; the ``[wayland]`` extra (``pip
+   install fastgrab[wayland]``) pulls in ``pywayland``.
+ - **Windows 10/11**: nothing beyond Python + numpy. Capture goes through
+   GDI ``BitBlt`` via ``ctypes``.
+ - **macOS**: nothing beyond Python + numpy. macOS 10.15+ requires
+   *Screen Recording* permission for the running app (System Settings →
+   Privacy & Security).
 
 note that ``fastgrab`` could work with lower versions but I have not tested it
 (and probaby will not). 
@@ -117,13 +131,15 @@ desktop on ``localhost:5901`` over VNC), ``benchmark``, ``lock`` and
 Submit a pull request or create an [issue](https://github.com/mherkazandjian/fastgrab/issues/new)
 if you find any bugs.
 
-Any help/pull requests that implement support for the following are welcome.
-The default wheel must stay Linux/X11 and dependency-light, so additional
-backends ship as opt-in pip extras (``pip install fastgrab[<extra>]``):
+Any help/pull requests are welcome. The default wheel must stay
+dependency-light; additional backends or features ship as opt-in pip
+extras (``pip install fastgrab[<extra>]``) when they have non-trivial
+runtime deps. Open follow-ups include:
 
-   - macOS backend
-   - Windows backend
-   - Wayland backend
+   - ``xdg-desktop-portal`` + PipeWire fallback for GNOME/KDE Wayland
+     (currently stubbed behind the ``[wayland-portal]`` extra)
+   - macOS ``ScreenCaptureKit`` backend for Apple-Silicon-era systems
+   - Multi-monitor capture across all backends
 
 ## Authors
 
