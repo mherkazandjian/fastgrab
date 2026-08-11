@@ -31,6 +31,40 @@ resolution    | fps
   plt.imshow(img[:, :, 0:3], interpolation='none', cmap='Greys_r')
   plt.show()
 ````
+
+## Screen recording (draft, Linux/X11)
+
+The opt-in ``fastgrab.recording`` module pipes frames into ``ffmpeg``:
+
+````bash
+  fastgrab-record --fullscreen --duration 10 -o demo.mp4
+````
+
+Optional overlays:
+
+````bash
+  fastgrab-record --fullscreen -o demo.mp4 \
+      --show-clicks --click-style concentric --click-color 255,200,0 \
+      --show-cursor \
+      --subtitle "0.5-3.0:Hello world" --subtitle "4.0-6.5:Second line" \
+      --subtitle-font /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf \
+      --subtitle-fontsize 32 --subtitle-color yellow \
+      --subtitle-box-color black@0.6 --subtitle-position bottom
+````
+
+- ``--show-clicks`` animates every detected mouse click; ``--click-style``
+  picks the pattern (``ring``, ``concentric``, ``circle``, ``crosshair``),
+  ``--click-color``/``--click-lifetime`` tune it.
+- ``--show-cursor`` stamps an emulated arrow pointer at the mouse position —
+  the X11 capture path never includes the real cursor sprite.
+- ``--subtitle START-END:TEXT`` (repeatable) renders timed subtitles;
+  colours accept any ffmpeg colour string (``white``, ``0xRRGGBB``,
+  ``red@0.8``). The same options exist on the Python API via
+  ``ClickStyle``, ``Subtitle`` and ``SubtitleStyle``.
+
+Click/cursor tracking needs the ``[gui]`` extra (``python-xlib``); subtitles
+need a font file (``$FASTGRAB_FONT`` or the bundled DejaVu search paths).
+
 ## Getting Started
 
 ``Fastgrab`` was initially developed in 2016 as part of an aimbot (for quake

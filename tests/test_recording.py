@@ -1,0 +1,358 @@
+"""Smoke tests for fastgrab.recording.
+
+Runs only when ffmpeg is on PATH and an X11 DISPLAY is available — i.e.
+inside ``docker compose run --rm test`` or on a host with both. The
+test records ~6 frames at 240×180 to a tmp file and verifies the
+container is non-empty and recognised by ffprobe (when available).
+"""
+import argparse
+import io
+import os
+import shutil
+import subprocess
+import time
+
+import numpy
+import pytest
+
+from fastgrab.recording import (
+    ClickStyle,
+    FfmpegEncoder,
+    Recorder,
+    Subtitle,
+    SubtitleStyle,
+    infer_codec,
+)
+from fastgrab.recording import cli as recording_cli
+from fastgrab.recording import clicks as click_mod
+from fastgrab.recording import encoder as encoder_mod
+from fastgrab.recording import subtitles as subtitles_mod
+
+
+pytestmark = pytest.mark.skipif(
+    shutil.which("ffmpeg") is None,
+    reason="ffmpeg not available on PATH",
+)
+
+
+def _x11_available():
+    return bool(os.environ.get("DISPLAY"))
+
+
+def test_infer_codec_extensions():
+    assert infer_codec("/tmp/clip.mp4") == "mp4"
+    assert infer_codec("clip.WebM") == "webm"
+    assert infer_codec("anim.gif") == "gif"
+    with pytest.raises(ValueError):
+        infer_codec("clip.mkv")
+
+
+def test_encoder_writes_mp4(tmp_path):
+    out = tmp_path / "encoder.mp4"
+    width, height, fps = 64, 48, 10
+    enc = FfmpegEncoder(str(out), width, height, fps=fps)
+    frame = numpy.zeros((height, width, 4), dtype=numpy.uint8)
+    frame[..., 2] = 255  # red in BGRA
+    with enc:
+        for _ in range(8):
+            enc.write_frame(frame)
+    assert out.exists()
+    assert out.stat().st_size > 0
+
+
+def test_encoder_rejects_wrong_shape(tmp_path):
+    out = tmp_path / "shape.mp4"
+    enc = FfmpegEncoder(str(out), 32, 32, fps=10)
+    bad = numpy.zeros((16, 32, 4), dtype=numpy.uint8)
+    with enc:
+        with pytest.raises(ValueError):
+            enc.write_frame(bad)
+
+
+def test_drawtext_filter_assembled_when_font_present(tmp_path, monkeypatch):
+    # Force a fake font path so the test is deterministic regardless
+    # of host font config.
+    fake_font = tmp_path / "fake.ttf"
+    fake_font.write_bytes(b"")
+    monkeypatch.setenv("FASTGRAB_FONT", str(fake_font))
+    enc = FfmpegEncoder(
+        str(tmp_path / "x.mp4"), 64, 48, fps=10,
+        title="Hello: world", overlay_text="watermark",
+    )
+    argv = enc._build_argv()
+    # The two drawtext filters end up combined in a single -vf arg.
+    assert "-vf" in argv
+    vf_value = argv[argv.index("-vf") + 1]
+    assert "drawtext=" in vf_value
+    # title text gets escaped — the colon must not appear unescaped.
+    assert "Hello\\: world" in vf_value
+    assert "watermark" in vf_value
+    # First-3-seconds gating uses lt(t,N).
+    assert "lt(t," in vf_value
+
+
+def test_drawtext_skipped_when_no_font(tmp_path, monkeypatch):
+    monkeypatch.setattr(encoder_mod, "_FONT_CANDIDATES", ())
+    monkeypatch.delenv("FASTGRAB_FONT", raising=False)
+    enc = FfmpegEncoder(
+        str(tmp_path / "x.mp4"), 64, 48, fps=10, title="Hello",
+    )
+    argv = enc._build_argv()
+    assert "-vf" not in argv  # no font → no drawtext filter
+
+
+def test_overlay_clicks_draws_bright_pixels():
+    frame = numpy.zeros((100, 100, 4), dtype=numpy.uint8)
+    events = [{"x": 50, "y": 50, "t_press": time.monotonic() - 0.05}]
+    click_mod.overlay_clicks(frame, events, bbox_origin=(0, 0))
+    # Some pixels in the centre region should now carry the BGR ring colour.
+    centre = frame[40:60, 40:60]
+    assert centre.max() > 0, "expected the click ring to colour pixels"
+
+
+def test_overlay_clicks_respects_bbox_origin():
+    frame = numpy.zeros((50, 50, 4), dtype=numpy.uint8)
+    # A click at screen (200, 200) inside a region whose top-left is
+    # (180, 180) should land at frame coords (20, 20).
+    events = [{"x": 200, "y": 200, "t_press": time.monotonic() - 0.05}]
+    click_mod.overlay_clicks(frame, events, bbox_origin=(180, 180))
+    # The ring is drawn around (20, 20) — pixels far from there should
+    # remain untouched.
+    far = frame[40:50, 40:50]
+    assert far.max() == 0
+    near = frame[10:30, 10:30]
+    assert near.max() > 0
+
+
+def test_overlay_clicks_drops_expired():
+    frame = numpy.zeros((50, 50, 4), dtype=numpy.uint8)
+    # An event older than CLICK_LIFETIME should not draw anything.
+    events = [{
+        "x": 25, "y": 25,
+        "t_press": time.monotonic() - (click_mod.CLICK_LIFETIME + 0.1),
+    }]
+    click_mod.overlay_clicks(frame, events)
+    assert frame.max() == 0
+
+
+@pytest.mark.parametrize("pattern", list(click_mod.CLICK_PATTERNS))
+def test_click_patterns_paint_near_event(pattern):
+    frame = numpy.zeros((200, 200, 4), dtype=numpy.uint8)
+    events = [{"x": 100, "y": 100, "t_press": time.monotonic() - 0.1}]
+    style = ClickStyle(pattern=pattern)
+    click_mod.overlay_clicks(frame, events, style=style)
+    near = frame[60:140, 60:140]
+    assert near.max() > 0, "pattern {!r} painted nothing".format(pattern)
+    # The animation is bounded by radius1 (~60 px) — corners stay black.
+    assert frame[0:20, 0:20].max() == 0
+    assert frame[180:200, 180:200].max() == 0
+
+
+def test_click_concentric_uses_multiple_radii():
+    # Mid-animation, the three phase-offset rings should paint pixels
+    # at distinctly different distances from the click point.
+    frame = numpy.zeros((300, 300, 4), dtype=numpy.uint8)
+    style = ClickStyle(pattern="concentric")
+    events = [{"x": 150, "y": 150, "t_press": time.monotonic() - 0.2}]
+    click_mod.overlay_clicks(frame, events, style=style)
+    yy, xx = numpy.nonzero(frame[..., 0])
+    dists = numpy.sqrt((xx - 150) ** 2 + (yy - 150) ** 2)
+    assert dists.max() - dists.min() > 20
+
+
+def test_click_style_color_honored():
+    frame = numpy.zeros((100, 100, 4), dtype=numpy.uint8)
+    # Pure red in BGR: B=0, G=0, R=255.
+    style = ClickStyle(pattern="circle", color=(0, 0, 255))
+    events = [{"x": 50, "y": 50, "t_press": time.monotonic() - 0.05}]
+    click_mod.overlay_clicks(frame, events, style=style)
+    centre = frame[45:55, 45:55]
+    assert centre[..., 2].max() > 200  # red channel painted
+    assert centre[..., 0].max() == 0   # blue untouched
+
+
+def test_click_style_rejects_unknown_pattern():
+    with pytest.raises(ValueError):
+        ClickStyle(pattern="spiral")
+
+
+def test_draw_cursor_stamps_arrow():
+    frame = numpy.zeros((100, 100, 4), dtype=numpy.uint8)
+    click_mod.draw_cursor(frame, 40, 40)
+    # Arrow occupies a small box below-right of the tip.
+    region = frame[40:62, 40:55]
+    assert region.max() > 0
+    # White fill → all BGR channels painted somewhere.
+    assert frame[..., 0].max() == 255
+    # Far corner untouched.
+    assert frame[90:100, 90:100].max() == 0
+
+
+def test_draw_cursor_respects_bbox_origin():
+    frame = numpy.zeros((50, 50, 4), dtype=numpy.uint8)
+    click_mod.draw_cursor(frame, 200, 200, bbox_origin=(180, 180))
+    assert frame[20:40, 20:35].max() > 0
+    assert frame[0:10, 0:10].max() == 0
+
+
+def test_draw_cursor_clips_at_edges():
+    frame = numpy.zeros((30, 30, 4), dtype=numpy.uint8)
+    # Tip at the very corner and fully outside — neither may raise.
+    click_mod.draw_cursor(frame, 0, 0)
+    click_mod.draw_cursor(frame, -50, -50)
+    click_mod.draw_cursor(frame, 1000, 1000)
+
+
+def test_subtitle_requires_end_after_start():
+    with pytest.raises(ValueError):
+        Subtitle(text="nope", start=2.0, end=2.0)
+
+
+def test_build_subtitle_filters(tmp_path, monkeypatch):
+    fake_font = tmp_path / "fake.ttf"
+    fake_font.write_bytes(b"")
+    monkeypatch.setenv("FASTGRAB_FONT", str(fake_font))
+    subs = [Subtitle(text="Hello: world", start=1.5, end=4.0)]
+    vf = subtitles_mod.build_subtitle_filters(subs)
+    assert "drawtext=" in vf
+    assert "between(t,1.5,4.0)" in vf
+    # Colon in the text must be escaped for the filter parser.
+    assert "Hello\\: world" in vf
+    assert str(fake_font) in vf
+
+
+def test_build_subtitle_filters_style_overrides(tmp_path, monkeypatch):
+    fake_font = tmp_path / "fake.ttf"
+    fake_font.write_bytes(b"")
+    monkeypatch.setenv("FASTGRAB_FONT", str(fake_font))
+    style = SubtitleStyle(
+        font_size=40, font_color="yellow", box_color="blue@0.5",
+        position="top",
+    )
+    subs = [Subtitle(text="styled", start=0.0, end=1.0)]
+    vf = subtitles_mod.build_subtitle_filters(subs, style)
+    assert "fontcolor=yellow" in vf
+    assert "fontsize=40" in vf
+    assert "boxcolor=blue@0.5" in vf
+    assert "y=30" in vf  # top placement
+
+
+def test_build_subtitle_filters_empty_and_fontless(monkeypatch):
+    assert subtitles_mod.build_subtitle_filters([]) is None
+    monkeypatch.setattr(encoder_mod, "_FONT_CANDIDATES", ())
+    monkeypatch.delenv("FASTGRAB_FONT", raising=False)
+    subs = [Subtitle(text="x", start=0.0, end=1.0)]
+    assert subtitles_mod.build_subtitle_filters(subs) is None
+
+
+def test_encoder_argv_includes_subtitles(tmp_path, monkeypatch):
+    fake_font = tmp_path / "fake.ttf"
+    fake_font.write_bytes(b"")
+    monkeypatch.setenv("FASTGRAB_FONT", str(fake_font))
+    enc = FfmpegEncoder(
+        str(tmp_path / "x.mp4"), 64, 48, fps=10,
+        subtitles=[Subtitle(text="sub", start=0.5, end=2.0)],
+    )
+    argv = enc._build_argv()
+    vf_value = argv[argv.index("-vf") + 1]
+    assert "between(t,0.5,2.0)" in vf_value
+    assert "sub" in vf_value
+
+
+def test_cli_parse_subtitle():
+    sub = recording_cli._parse_subtitle("1.5-4.0:Hello world")
+    assert isinstance(sub, Subtitle)
+    assert (sub.start, sub.end, sub.text) == (1.5, 4.0, "Hello world")
+    with pytest.raises(argparse.ArgumentTypeError):
+        recording_cli._parse_subtitle("not-a-subtitle")
+    with pytest.raises(argparse.ArgumentTypeError):
+        recording_cli._parse_subtitle("3-1:backwards")
+
+
+def test_cli_parse_bgr():
+    assert recording_cli._parse_bgr("255,200,0") == (255, 200, 0)
+    with pytest.raises(argparse.ArgumentTypeError):
+        recording_cli._parse_bgr("1,2")
+    with pytest.raises(argparse.ArgumentTypeError):
+        recording_cli._parse_bgr("300,0,0")
+
+
+def test_print_xbindkeys_outputs_snippet(capsys):
+    rc = recording_cli.main(["--print-xbindkeys"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "xbindkeysrc" in out
+    assert "fastgrab-record --gui" in out
+
+
+def test_cli_requires_capture_target(capsys):
+    # No --fullscreen / --region / --gui → argparse.error → SystemExit(2).
+    with pytest.raises(SystemExit) as exc:
+        recording_cli.main(["-o", "/tmp/whatever.mp4"])
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "--fullscreen" in err
+    assert "--region" in err
+
+
+@pytest.mark.skipif(not _x11_available(), reason="needs X11 DISPLAY")
+def test_recorder_bbox_rounds_odd_dims_to_even():
+    rec = Recorder(
+        output_path="/tmp/unused.mp4",
+        bbox=(0, 0, 1089, 615),
+        fps=10,
+        backend="x11",
+    )
+    x, y, w, h = rec._resolved_bbox()
+    assert (x, y) == (0, 0)
+    assert (w, h) == (1088, 614)
+
+
+@pytest.mark.skipif(not _x11_available(), reason="needs X11 DISPLAY")
+def test_recorder_countdown_cancelled_records_nothing(tmp_path):
+    import threading
+
+    out = tmp_path / "never.mp4"
+    rec = Recorder(
+        output_path=str(out), bbox=(0, 0, 120, 90), fps=10, backend="x11",
+    )
+    stop = threading.Event()
+    stop.set()  # fire before the countdown even ticks
+    stats = rec.record(countdown=5, stop_event=stop)
+    # Aborted during the countdown → ffmpeg never ran, nothing on disk.
+    assert stats["frames"] == 0
+    assert stats["elapsed_seconds"] == 0.0
+    assert not out.exists()
+
+
+@pytest.mark.skipif(not _x11_available(), reason="needs X11 DISPLAY")
+def test_recorder_smoke_mp4(tmp_path):
+    out = tmp_path / "smoke.mp4"
+    rec = Recorder(
+        output_path=str(out),
+        bbox=(0, 0, 240, 180),
+        fps=10,
+        backend="x11",
+    )
+    seen = []
+    stats = rec.record(duration=0.6, on_progress=lambda n, _e: seen.append(n))
+    assert stats["frames"] >= 4
+    # on_progress fires once per captured frame with a monotonic count that
+    # ends on the final total.
+    assert seen == sorted(seen)
+    assert seen[-1] == stats["frames"]
+    assert out.exists()
+    assert out.stat().st_size > 0
+    if shutil.which("ffprobe"):
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=codec_name",
+                "-of", "default=nokey=1:noprint_wrappers=1",
+                str(out),
+            ],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "h264" in result.stdout.strip().lower()
