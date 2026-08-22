@@ -3,8 +3,52 @@ import os
 import shutil
 import subprocess
 
+import numpy
+
 
 SUPPORTED_CODECS = ("mp4", "webm", "gif")
+
+# Codecs that encode to yuv420p and therefore need even width/height.
+# gif goes through a palette filter and has no such constraint.
+_EVEN_DIMENSION_CODECS = ("mp4", "webm")
+
+
+def validate_fps(fps) -> int:
+    """Return ``fps`` as an int, or raise :class:`ValueError`.
+
+    Shared by :class:`FfmpegEncoder` and
+    :class:`fastgrab.recording.Recorder` so API callers get a clear error
+    instead of a ``ZeroDivisionError`` from the capture loop or a cryptic
+    ffmpeg failure.
+    """
+    if isinstance(fps, bool) or not isinstance(fps, (int, float)):
+        raise ValueError("fps must be a positive number, got {!r}".format(fps))
+    if fps <= 0 or fps != int(fps):
+        raise ValueError(
+            "fps must be a positive integer, got {!r}".format(fps)
+        )
+    return int(fps)
+
+
+def validate_dimensions(codec: str, width: int, height: int) -> None:
+    """Raise :class:`ValueError` if ``width``/``height`` can't be encoded.
+
+    mp4 (libx264) and webm (libvpx-vp9) are written as yuv420p, which
+    requires even dimensions; ffmpeg otherwise fails late with a generic
+    error. :class:`Recorder` rounds its region down to satisfy this, but
+    a standalone :class:`FfmpegEncoder` gets whatever the caller passes.
+    """
+    if width <= 0 or height <= 0:
+        raise ValueError(
+            "width and height must be positive, got {}x{}".format(
+                width, height
+            )
+        )
+    if codec in _EVEN_DIMENSION_CODECS and (width % 2 or height % 2):
+        raise ValueError(
+            "{} output requires even width and height (yuv420p), got "
+            "{}x{}".format(codec, width, height)
+        )
 
 # DejaVu ships on Debian/Ubuntu (and the dev container) by default, so
 # probing this short list gets us a working drawtext filter without
@@ -186,8 +230,9 @@ class FfmpegEncoder:
         self.output_path = output_path
         self.width = width
         self.height = height
-        self.fps = fps
+        self.fps = validate_fps(fps)
         self.codec = codec or infer_codec(output_path)
+        validate_dimensions(self.codec, width, height)
         self.title = title
         self.overlay_text = overlay_text
         self.font_path = font_path
@@ -236,9 +281,11 @@ class FfmpegEncoder:
     def write_frame(self, frame) -> None:
         """Write one BGRA frame to ffmpeg's stdin.
 
-        ``frame`` must be a contiguous ``(H, W, 4)`` ``uint8`` numpy
-        array matching the encoder's configured size — this is what
-        :meth:`fastgrab.screenshot.Screenshot.capture` returns.
+        ``frame`` must be a ``(H, W, 4)`` ``uint8`` numpy array matching
+        the encoder's configured size — this is what
+        :meth:`fastgrab.screenshot.Screenshot.capture` returns. The
+        array's buffer is handed to the pipe directly (no ``tobytes()``
+        copy); a non-contiguous view is made contiguous first.
         """
         if self._proc is None:
             raise RuntimeError("encoder not started; call start() first")
@@ -248,8 +295,14 @@ class FfmpegEncoder:
                     frame.shape, self.width, self.height
                 )
             )
+        if frame.dtype != numpy.uint8:
+            raise ValueError(
+                "frame dtype must be uint8, got {}".format(frame.dtype)
+            )
+        if not frame.flags.c_contiguous:
+            frame = numpy.ascontiguousarray(frame)
         try:
-            self._proc.stdin.write(frame.tobytes())
+            self._proc.stdin.write(frame)
         except BrokenPipeError as exc:
             err = self._drain_stderr()
             raise RuntimeError(

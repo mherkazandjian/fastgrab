@@ -6,7 +6,6 @@ is not on PATH; recorder tests additionally need an X11 DISPLAY — i.e.
 inside ``docker compose run --rm test``.
 """
 import argparse
-import io
 import os
 import shutil
 import subprocess
@@ -58,6 +57,46 @@ def test_encoder_writes_mp4(tmp_path):
         for _ in range(8):
             enc.write_frame(frame)
     assert out.exists()
+    assert out.stat().st_size > 0
+
+
+def test_encoder_validates_fps_and_dimensions(tmp_path):
+    out = str(tmp_path / "x.mp4")
+    for bad_fps in (0, -1, 1.5, "30", True):
+        with pytest.raises(ValueError, match="fps"):
+            FfmpegEncoder(out, 64, 48, fps=bad_fps)
+    assert FfmpegEncoder(out, 64, 48, fps=30.0).fps == 30
+    # yuv420p codecs need even dimensions; fail at construction, not in
+    # ffmpeg's stderr after the first frame.
+    with pytest.raises(ValueError, match="even"):
+        FfmpegEncoder(out, 63, 48)
+    with pytest.raises(ValueError, match="even"):
+        FfmpegEncoder(str(tmp_path / "x.webm"), 64, 47)
+    with pytest.raises(ValueError, match="positive"):
+        FfmpegEncoder(out, 0, 48)
+    # gif has no such constraint.
+    FfmpegEncoder(str(tmp_path / "x.gif"), 63, 47)
+
+
+def test_recorder_validates_fps_before_opening_display(tmp_path):
+    # Must raise even with no DISPLAY: validation happens before the
+    # Screenshot backend is constructed.
+    with pytest.raises(ValueError, match="fps"):
+        Recorder(str(tmp_path / "x.mp4"), fps=0)
+
+
+@requires_ffmpeg
+def test_encoder_accepts_non_contiguous_and_rejects_wrong_dtype(tmp_path):
+    out = tmp_path / "views.mp4"
+    enc = FfmpegEncoder(str(out), 32, 24, fps=10)
+    wide = numpy.zeros((24, 64, 4), dtype=numpy.uint8)
+    strided = wide[:, ::2]          # right shape, not C-contiguous
+    assert not strided.flags.c_contiguous
+    with enc:
+        for _ in range(4):
+            enc.write_frame(strided)
+        with pytest.raises(ValueError, match="uint8"):
+            enc.write_frame(numpy.zeros((24, 32, 4), dtype=numpy.float32))
     assert out.stat().st_size > 0
 
 

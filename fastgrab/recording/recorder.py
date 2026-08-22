@@ -5,7 +5,7 @@ import time
 from fastgrab.screenshot import Screenshot
 
 from .clicks import ClickStyle, MouseTracker, draw_cursor, overlay_clicks
-from .encoder import FfmpegEncoder, infer_codec
+from .encoder import FfmpegEncoder, infer_codec, validate_fps
 
 
 class Recorder:
@@ -38,7 +38,9 @@ class Recorder:
                  subtitles=None, subtitle_style=None):
         self.output_path = output_path
         self.bbox = bbox  # (x, y, w, h) or None for fullscreen
-        self.fps = fps
+        # Validate before touching the display so bad input fails fast
+        # and headless callers get a ValueError, not a display error.
+        self.fps = validate_fps(fps)
         self.codec = codec or infer_codec(output_path)
         self.title = title
         self.overlay_text = overlay_text

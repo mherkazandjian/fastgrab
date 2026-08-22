@@ -262,7 +262,11 @@ stats  # {'frames': captured, 'written_frames': captured + duplicates,
   when it is non-zero.
 - `FfmpegEncoder(output_path, width, height, fps=30, codec=None, ...)` is
   usable standalone as a context manager: `start()`, `write_frame(bgra)`,
-  `close()`. `write_frame` rejects frames whose shape isn't `(H, W, 4)`.
+  `close()`. Construction raises `ValueError` for a non-positive/non-integer
+  `fps` or, for mp4/webm, odd width/height (yuv420p needs even dims; gif is
+  exempt). `write_frame` rejects frames whose shape isn't `(H, W, 4)` or
+  whose dtype isn't `uint8`, and writes the array buffer directly — no
+  per-frame copy — so pass `capture()`'s array as-is.
 
 ## 6. Troubleshooting — symptom → cause → fix
 
