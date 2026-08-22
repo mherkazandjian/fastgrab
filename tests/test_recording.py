@@ -220,7 +220,9 @@ def test_build_subtitle_filters(tmp_path, monkeypatch):
     assert "between(t,1.5,4.0)" in vf
     # Colon in the text must be escaped for the filter parser.
     assert "Hello\\: world" in vf
-    assert str(fake_font) in vf
+    # The path is escaped like the text — on Windows it contains ':' and
+    # '\\', so compare against the escaped form, not the raw string.
+    assert "fontfile=" + encoder_mod._escape_drawtext(str(fake_font)) in vf
 
 
 def test_build_subtitle_filters_style_overrides(tmp_path, monkeypatch):
@@ -247,23 +249,21 @@ def test_build_subtitle_filters_empty_and_fontless(monkeypatch):
     assert subtitles_mod.build_subtitle_filters(subs) is None
 
 
-def test_font_path_is_escaped_in_drawtext(tmp_path, monkeypatch):
+def test_font_path_is_escaped_in_drawtext():
     # A ':' inside the font path would be read as an option separator by
-    # the filter parser, so it has to be escaped like the text is.
-    font_dir = tmp_path / "fonts:odd"
-    font_dir.mkdir()
-    fake_font = font_dir / "fake.ttf"
-    fake_font.write_bytes(b"")
-    monkeypatch.setenv("FASTGRAB_FONT", str(fake_font))
-    escaped = str(fake_font).replace(":", "\\:")
+    # the filter parser, so it has to be escaped like the text is. The
+    # path is synthetic (explicit font_path= skips the existence check)
+    # because ':' is not a legal filename character on Windows.
+    font = "/fonts:odd/fake.ttf"
+    escaped = "/fonts\\:odd/fake.ttf"
 
-    vf = encoder_mod._build_drawtext_filter(title="t")
-    assert "fontfile=" + escaped in vf
-    assert "fontfile=" + str(fake_font) + ":" not in vf
+    vf = encoder_mod._build_drawtext_filter(title="t", font_path=font)
+    assert "fontfile=" + escaped + ":" in vf
+    assert "fontfile=" + font + ":" not in vf
 
     subs = [Subtitle(text="x", start=0.0, end=1.0)]
-    vf = subtitles_mod.build_subtitle_filters(subs)
-    assert "fontfile=" + escaped in vf
+    vf = subtitles_mod.build_subtitle_filters(subs, SubtitleStyle(font_path=font))
+    assert "fontfile=" + escaped + ":" in vf
 
 
 def test_encoder_argv_includes_subtitles(tmp_path, monkeypatch):
