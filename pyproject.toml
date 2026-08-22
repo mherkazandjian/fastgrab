@@ -50,6 +50,10 @@ pytest = "*"
 python-xlib = "*"
 
 [build-system]
+# Build against NumPy 2.x headers: per NumPy's downstream-packaging
+# guidance, binaries built against 2.x are runtime-compatible with
+# NumPy 1.x (the C extension only uses the plain buffer API), so this
+# does not conflict with the >=1.26 runtime floor above.
 requires = ["poetry-core>=1.5.0", "setuptools", "numpy>=2.0"]
 build-backend = "poetry.core.masonry.api"
 

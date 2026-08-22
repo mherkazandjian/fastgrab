@@ -244,7 +244,8 @@ rec = Recorder(
 )
 stats = rec.record(duration=5.0)                 # or stop_event=threading.Event(), countdown=3,
                                                  #    on_progress=lambda n, t: ..., on_countdown=lambda s: ...
-stats  # {'output': ..., 'frames': N, 'elapsed_seconds': T, 'achieved_fps': F}
+stats  # {'frames': captured, 'written_frames': captured + duplicates,
+       #  'elapsed_seconds': T, 'achieved_fps': captured / T, 'output': path}
 ```
 
 - `record()` with neither `duration` nor `stop_event` runs until
@@ -253,9 +254,12 @@ stats  # {'output': ..., 'frames': N, 'elapsed_seconds': T, 'achieved_fps': F}
   it cheap and don't touch GUI widgets from it.
 - Width/height are rounded **down to even** (yuv420p requirement); a
   region that rounds to 0 raises `ValueError`.
-- When capture is slower than `fps`, ffmpeg duplicates the last frame so
-  the clip's duration still matches wall-clock and subtitle timings stay
-  correct.
+- When capture is slower than `fps`, the last frame is written again for
+  every missed tick so the clip's duration still matches wall-clock and
+  subtitle timings stay correct. `stats["frames"]` / `achieved_fps` report
+  real capture speed; `stats["written_frames"] - stats["frames"]` is the
+  duplicate count, and the CLI summary prints `N duplicated to hold F fps`
+  when it is non-zero.
 - `FfmpegEncoder(output_path, width, height, fps=30, codec=None, ...)` is
   usable standalone as a context manager: `start()`, `write_frame(bgra)`,
   `close()`. `write_frame` rejects frames whose shape isn't `(H, W, 4)`.

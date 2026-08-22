@@ -34,13 +34,29 @@ resolution    | fps
 
 ## Screen recording (draft, Linux/X11)
 
-The opt-in ``fastgrab.recording`` module pipes frames into ``ffmpeg``:
+The opt-in ``fastgrab.recording`` module pipes frames into ``ffmpeg``
+(which must be on ``PATH``). Pick exactly one capture target —
+``--fullscreen``, ``--region X,Y,W,H`` or ``--gui`` — and an output whose
+extension selects the codec (``.mp4``, ``.webm`` or ``.gif``):
 
 ````bash
   fastgrab-record --fullscreen --duration 10 -o demo.mp4
+  fastgrab-record --region 100,100,1280,720 --fps 60 -o clip.webm   # Ctrl-C to stop
+  fastgrab-record --fullscreen --countdown 3 --title "My demo" --overlay-text "v1.2" -o demo.mp4
 ````
 
-Optional overlays:
+- ``--fps N`` sets the target rate (default 30). If capture runs slower
+  than that, the last frame is repeated so the clip's length still matches
+  wall-clock time; the summary line reports the real capture rate and how
+  many frames were duplicated.
+- ``--duration S`` stops after S seconds; without it, recording runs until
+  Ctrl-C and the file is finalised cleanly.
+- ``--countdown S`` waits before the first frame — time to move the
+  terminal out of shot.
+- ``--title TEXT`` shows top-centre for the first 3 seconds;
+  ``--overlay-text TEXT`` is a watermark in the top-right for the whole clip.
+
+Optional pointer overlays and subtitles:
 
 ````bash
   fastgrab-record --fullscreen -o demo.mp4 \
@@ -54,7 +70,7 @@ Optional overlays:
 
 - ``--show-clicks`` animates every detected mouse click; ``--click-style``
   picks the pattern (``ring``, ``concentric``, ``circle``, ``crosshair``),
-  ``--click-color``/``--click-lifetime`` tune it.
+  ``--click-color B,G,R``/``--click-lifetime`` tune it.
 - ``--show-cursor`` stamps an emulated arrow pointer at the mouse position —
   the X11 capture path never includes the real cursor sprite.
 - ``--subtitle START-END:TEXT`` (repeatable) renders timed subtitles;
@@ -64,6 +80,20 @@ Optional overlays:
 
 Click/cursor tracking needs the ``[gui]`` extra (``python-xlib``); subtitles
 need a font file (``$FASTGRAB_FONT`` or the bundled DejaVu search paths).
+
+Interactive use: ``fastgrab-record --gui`` opens a drag-to-select region
+picker followed by a small settings dialog (needs ``tkinter``), and
+``fastgrab-record --print-xbindkeys`` prints a snippet for binding that to
+a hotkey such as ``Print``.
+
+From Python:
+
+````python
+  from fastgrab.recording import Recorder
+  stats = Recorder("demo.mp4", bbox=(0, 0, 1280, 720), fps=30).record(duration=5)
+  # stats: frames (captured), written_frames (incl. duplicates),
+  #        elapsed_seconds, achieved_fps, output
+````
 
 ## Getting Started
 
@@ -96,8 +126,8 @@ to benchmark ``fastgrab`` run the script [examples/benchmark.py](https://github.
 
 Common to all platforms:
 
- - ``python >= 3.8`` (python 2 is not supported)
- - ``Numpy >= 1.15`` (auto-installed by pip)
+ - ``python >= 3.10`` (python 2 is not supported)
+ - ``Numpy >= 1.26`` (auto-installed by pip)
 
 Per-platform extras:
 
