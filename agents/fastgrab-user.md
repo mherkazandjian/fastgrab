@@ -185,8 +185,9 @@ without ffmpeg — the error only appears when encoding starts.
 
 ### CLI — `fastgrab-record`
 
-Exactly one capture target is required: `--fullscreen`, `--region X,Y,W,H`,
-or `--gui`. Output format is inferred from the extension: `.mp4`
+A capture target is required: `--fullscreen`, `--region X,Y,W,H`, or
+`--gui` (which may be combined with either of the first two to skip the drag
+selector and open only the settings dialog). Output format is inferred from the extension: `.mp4`
 (libx264), `.webm` (libvpx-vp9), `.gif`.
 
 ```bash
@@ -209,13 +210,13 @@ Flag reference:
 | flag | meaning |
 |---|---|
 | `-o/--output PATH` | required unless `--gui`; `.mp4` / `.webm` / `.gif` |
-| `--fullscreen` / `--region X,Y,W,H` / `--gui` | capture target (pick one); W,H ≥ 2 |
+| `--fullscreen` / `--region X,Y,W,H` / `--gui` | capture target; `--gui` combinable with the other two; W,H ≥ 2 |
 | `--fps N` | target fps, default 30 |
 | `--duration S` | stop after S seconds; omit → run until Ctrl-C / SIGTERM (file is finalised cleanly) |
 | `--countdown S` | delay before the first frame (ffmpeg not even spawned until it ends) |
 | `--title TEXT` | drawtext, top-centre, first 3 s |
 | `--overlay-text TEXT` | drawtext watermark, top-right, whole clip |
-| `--show-clicks` | animate mouse clicks (`[gui]` extra) |
+| `--show-clicks` | animate mouse clicks (`[gui]` extra: python-xlib) |
 | `--click-style` | `ring` (default) / `concentric` / `circle` / `crosshair` |
 | `--click-color B,G,R` | note **BGR** order, e.g. `255,200,0`; default cyan |
 | `--click-lifetime S` | animation length, default 0.5 |

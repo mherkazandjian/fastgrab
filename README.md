@@ -35,9 +35,11 @@ resolution    | fps
 ## Screen recording (draft, Linux/X11)
 
 The opt-in ``fastgrab.recording`` module pipes frames into ``ffmpeg``
-(which must be on ``PATH``). Pick exactly one capture target —
-``--fullscreen``, ``--region X,Y,W,H`` or ``--gui`` — and an output whose
-extension selects the codec (``.mp4``, ``.webm`` or ``.gif``):
+(which must be on ``PATH``). Pick a capture target — ``--fullscreen`` or
+``--region X,Y,W,H`` for scripted use, or ``--gui`` to select interactively
+(``--gui`` can be combined with either to skip the drag selector and go
+straight to the settings dialog) — and an output whose extension selects
+the codec (``.mp4``, ``.webm`` or ``.gif``):
 
 ````bash
   fastgrab-record --fullscreen --duration 10 -o demo.mp4
@@ -78,8 +80,10 @@ Optional pointer overlays and subtitles:
   ``red@0.8``). The same options exist on the Python API via
   ``ClickStyle``, ``Subtitle`` and ``SubtitleStyle``.
 
-Click/cursor tracking needs the ``[gui]`` extra (``python-xlib``); subtitles
-need a font file (``$FASTGRAB_FONT`` or the bundled DejaVu search paths).
+Click/cursor tracking and ``--gui`` need the ``[gui]`` extra
+(``pip install fastgrab[gui]``, which pulls in ``python-xlib`` for pointer
+polling and ``Pillow`` for the selector's preview); subtitles need a font
+file (``$FASTGRAB_FONT`` or the bundled DejaVu search paths).
 
 Interactive use: ``fastgrab-record --gui`` opens a drag-to-select region
 picker followed by a small settings dialog (needs ``tkinter``), and

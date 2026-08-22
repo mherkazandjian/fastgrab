@@ -240,7 +240,6 @@ class FfmpegEncoder:
         self.subtitles = subtitles
         self.subtitle_style = subtitle_style
         self._proc = None
-        self._frame_nbytes = width * height * 4
 
     def _build_argv(self):
         vf = _build_drawtext_filter(
