@@ -4,7 +4,7 @@ import time
 
 from fastgrab.screenshot import Screenshot
 
-from .clicks import MouseTracker, draw_cursor, overlay_clicks
+from .clicks import ClickStyle, MouseTracker, draw_cursor, overlay_clicks
 from .encoder import FfmpegEncoder, infer_codec
 
 
@@ -62,6 +62,12 @@ class Recorder:
         # padding — sub-pixel difference, encoder-fatal if not handled.
         w -= w % 2
         h -= h % 2
+        if w <= 0 or h <= 0:
+            raise ValueError(
+                "region too small after codec alignment: {!r}".format(
+                    self.bbox
+                )
+            )
         return (x, y, w, h)
 
     def record(self, duration: float = None,
@@ -70,10 +76,20 @@ class Recorder:
                on_countdown=None) -> dict:
         """Run the capture loop until ``duration`` elapses or ``stop_event`` fires.
 
-        Returns a small stats dict — frame count, wall time, achieved fps.
-        Either bound is sufficient; passing neither records until the
-        process is interrupted (Ctrl-C in the CLI), which surfaces here
-        as :class:`KeyboardInterrupt`.
+        Returns a small stats dict: ``frames`` (frames captured from the
+        screen), ``written_frames`` (frames handed to ffmpeg — captured
+        plus duplicates, see below), ``elapsed_seconds``, ``achieved_fps``
+        (captured / elapsed, i.e. how fast *capture* actually ran) and
+        ``output``. Either bound is sufficient; passing neither records
+        until the process is interrupted (Ctrl-C in the CLI), which
+        surfaces here as :class:`KeyboardInterrupt`.
+
+        ffmpeg stamps incoming raw frames at the fixed target rate, so
+        when capture runs slower than ``fps`` the latest frame is written
+        multiple times — once per elapsed tick — keeping the output's
+        duration equal to wall-clock time (and subtitle windows correct)
+        at the cost of duplicated frames. ``written_frames - frames`` is
+        the number of duplicates.
 
         ``on_progress``, if given, is called after every captured frame as
         ``on_progress(n_frames, elapsed_seconds)`` so a caller can render a
@@ -98,7 +114,10 @@ class Recorder:
             subtitles=self.subtitles, subtitle_style=self.subtitle_style,
         )
         tracker = (
-            MouseTracker() if (self.show_clicks or self.show_cursor) else None
+            MouseTracker(
+                lifetime=(self.click_style or ClickStyle()).lifetime
+            )
+            if (self.show_clicks or self.show_cursor) else None
         )
 
         if countdown and countdown > 0:
@@ -112,6 +131,7 @@ class Recorder:
                     # so ffmpeg was never started and there's no file.
                     return {
                         "frames": 0,
+                        "written_frames": 0,
                         "elapsed_seconds": 0.0,
                         "achieved_fps": 0.0,
                         "output": self.output_path,
@@ -122,9 +142,9 @@ class Recorder:
             if on_countdown is not None:
                 on_countdown(0.0)
 
-        n_frames = 0
+        n_captured = 0  # frames grabbed from the screen
+        n_written = 0   # frames handed to ffmpeg (captured + duplicates)
         t0 = time.monotonic()
-        next_tick = t0
         deadline = (t0 + duration) if duration is not None else None
         try:
             if tracker is not None:
@@ -152,11 +172,29 @@ class Recorder:
                                 color=self.cursor_color,
                                 scale=self.cursor_scale,
                             )
-                    encoder.write_frame(frame)
-                    n_frames += 1
+                    n_captured += 1
+                    # ffmpeg timestamps every raw frame at the fixed target
+                    # rate, so if capture + overlays run slower than the
+                    # target fps the output would otherwise come out short
+                    # and sped up (and subtitle windows would drift). Write
+                    # the frame once for every tick that has come due —
+                    # duplicating frames when we're behind — so the output
+                    # duration tracks wall-clock time. The 1e-6 guards
+                    # against float rounding (n * period landing a hair
+                    # below the tick) silently dropping a frame captured
+                    # exactly on time.
+                    now = time.monotonic()
+                    due = int((now - t0) / period + 1e-6)
+                    while n_written <= due:
+                        encoder.write_frame(frame)
+                        n_written += 1
                     if on_progress is not None:
-                        on_progress(n_frames, time.monotonic() - t0)
-                    next_tick += period
+                        on_progress(n_captured, now - t0)
+                    # Sleep until the next *unwritten* tick rather than
+                    # advancing by one period: after a stall n_written has
+                    # jumped ahead, and a stale tick would make the loop
+                    # spin, capturing frames that `due` then discards.
+                    next_tick = t0 + n_written * period
                     slack = next_tick - time.monotonic()
                     if slack > 0:
                         time.sleep(slack)
@@ -165,8 +203,9 @@ class Recorder:
                 tracker.close()
         elapsed = time.monotonic() - t0
         return {
-            "frames": n_frames,
+            "frames": n_captured,
+            "written_frames": n_written,
             "elapsed_seconds": elapsed,
-            "achieved_fps": (n_frames / elapsed) if elapsed > 0 else 0.0,
+            "achieved_fps": (n_captured / elapsed) if elapsed > 0 else 0.0,
             "output": self.output_path,
         }

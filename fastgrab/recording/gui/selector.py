@@ -22,8 +22,16 @@ DIM_FACTOR = 0.4
 REDRAW_INTERVAL_MS = 20
 
 
-def select_region():
-    """Open the selector. Returns ``(x, y, w, h)`` or ``None``."""
+def select_region(backend=None):
+    """Open the selector. Returns ``(x, y, w, h)`` or ``None``.
+
+    ``backend`` is passed to :class:`fastgrab.screenshot.Screenshot`.
+    The caller should hand over the same backend the recorder will use
+    (the CLI passes ``x11``) — auto-detection could otherwise snapshot
+    a Wayland output while the coordinates are later applied to the
+    X11 virtual root, which selects the wrong area on scaled or
+    multi-monitor desktops.
+    """
     try:
         import tkinter as tk
     except ImportError as exc:
@@ -46,7 +54,7 @@ def select_region():
     #    we'll display while the user picks a region. The capture copy
     #    is ours — Screenshot's internal buffer gets reused on the next
     #    capture(), so we np.array() it to detach.
-    grab = Screenshot()
+    grab = Screenshot(backend=backend)
     bgra = numpy.array(grab.capture(), copy=True)
     h, w = bgra.shape[:2]
 

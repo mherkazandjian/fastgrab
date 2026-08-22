@@ -75,6 +75,10 @@ def _build_drawtext_filter(title: str = None, overlay_text: str = None,
     font = font_path or _find_font()
     if font is None:
         return None
+    # The font path goes into the same filter string as the text, so it
+    # needs the same escaping — an unescaped ':' (Windows drive letters)
+    # would be parsed as a filter-option separator.
+    font = _escape_drawtext(font)
     parts = []
     if title:
         parts.append(

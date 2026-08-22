@@ -82,13 +82,18 @@ class MouseTracker:
     :func:`overlay_clicks` and the position to :func:`draw_cursor` —
     when only the cursor is wanted, the returned events are simply
     ignored.
+
+    ``lifetime`` is how long events are kept, in seconds. The recorder
+    passes its :class:`ClickStyle` lifetime here so a non-default
+    animation duration isn't cut short by the tracker's pruning.
     """
 
-    def __init__(self):
+    def __init__(self, lifetime: float = CLICK_LIFETIME):
         self._display = None
         self._root = None
         self._prev_mask = 0
         self._events = []  # list of {"x", "y", "t_press"}
+        self._lifetime = lifetime
         self.position = None  # (x, y) screen-absolute, from the last poll
 
     def start(self):
@@ -131,7 +136,7 @@ class MouseTracker:
         # Drop expired events so the list stays bounded.
         self._events = [
             e for e in self._events
-            if (now - e["t_press"]) < CLICK_LIFETIME
+            if (now - e["t_press"]) < self._lifetime
         ]
         return list(self._events)
 

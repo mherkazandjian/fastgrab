@@ -61,7 +61,7 @@ class SubtitleStyle:
             )
 
 
-def build_subtitle_filters(subtitles, style=None) -> str:
+def build_subtitle_filters(subtitles, style=None) -> "str | None":
     """Compose the drawtext filter chain for ``subtitles``.
 
     Returns ``None`` when there is nothing to render or no usable font
@@ -74,6 +74,9 @@ def build_subtitle_filters(subtitles, style=None) -> str:
     font = style.font_path or _find_font()
     if font is None:
         return None
+    # Same parser as the text — a ':' in the path (e.g. Windows drive
+    # letters) would break the filter string if left unescaped.
+    font = _escape_drawtext(font)
     if style.position == "bottom":
         xy = "x=(w-text_w)/2:y=h-text_h-40"
     else:

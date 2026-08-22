@@ -1,9 +1,9 @@
 """Smoke tests for fastgrab.recording.
 
-Runs only when ffmpeg is on PATH and an X11 DISPLAY is available — i.e.
-inside ``docker compose run --rm test`` or on a host with both. The
-test records ~6 frames at 240×180 to a tmp file and verifies the
-container is non-empty and recognised by ffprobe (when available).
+Pure-numpy overlay tests, filter-assembly tests, and CLI parsing tests
+run anywhere. Tests that actually spawn ffmpeg are skipped when ffmpeg
+is not on PATH; recorder tests additionally need an X11 DISPLAY — i.e.
+inside ``docker compose run --rm test``.
 """
 import argparse
 import io
@@ -29,7 +29,7 @@ from fastgrab.recording import encoder as encoder_mod
 from fastgrab.recording import subtitles as subtitles_mod
 
 
-pytestmark = pytest.mark.skipif(
+requires_ffmpeg = pytest.mark.skipif(
     shutil.which("ffmpeg") is None,
     reason="ffmpeg not available on PATH",
 )
@@ -47,6 +47,7 @@ def test_infer_codec_extensions():
         infer_codec("clip.mkv")
 
 
+@requires_ffmpeg
 def test_encoder_writes_mp4(tmp_path):
     out = tmp_path / "encoder.mp4"
     width, height, fps = 64, 48, 10
@@ -60,6 +61,7 @@ def test_encoder_writes_mp4(tmp_path):
     assert out.stat().st_size > 0
 
 
+@requires_ffmpeg
 def test_encoder_rejects_wrong_shape(tmp_path):
     out = tmp_path / "shape.mp4"
     enc = FfmpegEncoder(str(out), 32, 32, fps=10)
@@ -245,6 +247,25 @@ def test_build_subtitle_filters_empty_and_fontless(monkeypatch):
     assert subtitles_mod.build_subtitle_filters(subs) is None
 
 
+def test_font_path_is_escaped_in_drawtext(tmp_path, monkeypatch):
+    # A ':' inside the font path would be read as an option separator by
+    # the filter parser, so it has to be escaped like the text is.
+    font_dir = tmp_path / "fonts:odd"
+    font_dir.mkdir()
+    fake_font = font_dir / "fake.ttf"
+    fake_font.write_bytes(b"")
+    monkeypatch.setenv("FASTGRAB_FONT", str(fake_font))
+    escaped = str(fake_font).replace(":", "\\:")
+
+    vf = encoder_mod._build_drawtext_filter(title="t")
+    assert "fontfile=" + escaped in vf
+    assert "fontfile=" + str(fake_font) + ":" not in vf
+
+    subs = [Subtitle(text="x", start=0.0, end=1.0)]
+    vf = subtitles_mod.build_subtitle_filters(subs)
+    assert "fontfile=" + escaped in vf
+
+
 def test_encoder_argv_includes_subtitles(tmp_path, monkeypatch):
     fake_font = tmp_path / "fake.ttf"
     fake_font.write_bytes(b"")
@@ -275,6 +296,50 @@ def test_cli_parse_bgr():
         recording_cli._parse_bgr("1,2")
     with pytest.raises(argparse.ArgumentTypeError):
         recording_cli._parse_bgr("300,0,0")
+
+
+def test_cli_parse_region():
+    assert recording_cli._parse_region("10,20,300,200") == (10, 20, 300, 200)
+    for bad in ("1,2,3", "a,b,c,d", "-1,0,10,10", "0,-5,10,10",
+                "0,0,1,10", "0,0,10,1", "0,0,0,0"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            recording_cli._parse_region(bad)
+
+
+def test_cli_fps_must_be_positive_int():
+    assert recording_cli._positive_int("30") == 30
+    for bad in ("0", "-5", "abc", "1.5"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            recording_cli._positive_int(bad)
+    parser = recording_cli.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--fullscreen", "-o", "x.mp4", "--fps", "0"])
+
+
+class _StubRoot:
+    """Stand-in for an Xlib root window: a fixed pointer, no buttons."""
+
+    class _Pointer:
+        root_x, root_y, mask = 5, 7, 0
+
+    def query_pointer(self):
+        return self._Pointer()
+
+
+def test_mouse_tracker_honours_lifetime():
+    now = time.monotonic()
+    stale = {"x": 1, "y": 1, "t_press": now - 0.8}
+
+    default = click_mod.MouseTracker()
+    default._root = _StubRoot()
+    default._events = [dict(stale)]
+    assert default.poll() == []  # 0.8 s > default 0.5 s lifetime → pruned
+
+    longer = click_mod.MouseTracker(lifetime=2.0)
+    longer._root = _StubRoot()
+    longer._events = [dict(stale)]
+    assert len(longer.poll()) == 1  # still within the 2 s window
+    assert longer.position == (5, 7)
 
 
 def test_print_xbindkeys_outputs_snippet(capsys):
@@ -309,6 +374,17 @@ def test_recorder_bbox_rounds_odd_dims_to_even():
 
 
 @pytest.mark.skipif(not _x11_available(), reason="needs X11 DISPLAY")
+def test_recorder_rejects_region_too_small_after_alignment(tmp_path):
+    # 1x1 rounds down to 0x0 for yuv420p; must fail before ffmpeg starts.
+    rec = Recorder(
+        output_path=str(tmp_path / "tiny.mp4"), bbox=(0, 0, 1, 1), backend="x11",
+    )
+    with pytest.raises(ValueError, match="too small"):
+        rec.record(duration=0.1)
+    assert not (tmp_path / "tiny.mp4").exists()
+
+
+@pytest.mark.skipif(not _x11_available(), reason="needs X11 DISPLAY")
 def test_recorder_countdown_cancelled_records_nothing(tmp_path):
     import threading
 
@@ -325,6 +401,7 @@ def test_recorder_countdown_cancelled_records_nothing(tmp_path):
     assert not out.exists()
 
 
+@requires_ffmpeg
 @pytest.mark.skipif(not _x11_available(), reason="needs X11 DISPLAY")
 def test_recorder_smoke_mp4(tmp_path):
     out = tmp_path / "smoke.mp4"
@@ -337,6 +414,12 @@ def test_recorder_smoke_mp4(tmp_path):
     seen = []
     stats = rec.record(duration=0.6, on_progress=lambda n, _e: seen.append(n))
     assert stats["frames"] >= 4
+    # ffmpeg receives at least one frame per captured frame; any extras
+    # are duplicates written to hold the target rate.
+    assert stats["written_frames"] >= stats["frames"]
+    assert stats["achieved_fps"] == pytest.approx(
+        stats["frames"] / stats["elapsed_seconds"]
+    )
     # on_progress fires once per captured frame with a monotonic count that
     # ends on the final total.
     assert seen == sorted(seen)

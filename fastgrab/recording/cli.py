@@ -35,11 +35,31 @@ def _parse_region(value: str):
         raise argparse.ArgumentTypeError(
             "region values must be integers, got {!r}".format(value)
         )
-    if w <= 0 or h <= 0:
+    if x < 0 or y < 0:
         raise argparse.ArgumentTypeError(
-            "region width and height must be positive, got {}x{}".format(w, h)
+            "region origin must be non-negative, got {},{}".format(x, y)
+        )
+    # Codecs aligned to yuv420p drop one odd pixel per dimension, so
+    # anything below 2 px rounds down to zero at encode time.
+    if w < 2 or h < 2:
+        raise argparse.ArgumentTypeError(
+            "region width and height must be at least 2, got {}x{}".format(w, h)
         )
     return (x, y, w, h)
+
+
+def _positive_int(value: str):
+    try:
+        iv = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "expected an integer, got {!r}".format(value)
+        )
+    if iv <= 0:
+        raise argparse.ArgumentTypeError(
+            "value must be positive, got {}".format(iv)
+        )
+    return iv
 
 
 def _parse_bgr(value: str):
@@ -102,7 +122,7 @@ def build_parser():
         help="capture the whole screen",
     )
     p.add_argument(
-        "--fps", type=int, default=30,
+        "--fps", type=_positive_int, default=30,
         help="target frames per second (default: 30)",
     )
     p.add_argument(
@@ -206,7 +226,7 @@ def _run_gui(args):
     elif args.region is not None:
         bbox = args.region
     else:
-        bbox = select_region()
+        bbox = select_region(backend=args.backend)
         if bbox is None:
             print("fastgrab: selection cancelled", file=sys.stderr)
             return None
@@ -371,7 +391,7 @@ def main(argv=None):
                 on_progress=progress_cb,
                 countdown=args.countdown, on_countdown=_stdout_countdown(),
             )
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError) as exc:
         if progress_cb is not None:
             sys.stdout.write("\n")
         print("error: {}".format(exc), file=sys.stderr)
@@ -385,13 +405,16 @@ def main(argv=None):
     if stats is None:
         return 0
 
+    duplicated = stats.get("written_frames", stats["frames"]) - stats["frames"]
     print(
         "wrote {output}: {frames} frames in {elapsed:.2f}s "
-        "({fps:.1f} fps achieved)".format(
+        "({fps:.1f} fps achieved{dup})".format(
             output=stats["output"],
             frames=stats["frames"],
             elapsed=stats["elapsed_seconds"],
             fps=stats["achieved_fps"],
+            dup=(", {} duplicated to hold {} fps".format(duplicated, args.fps)
+                 if duplicated > 0 else ""),
         )
     )
     return 0
