@@ -15,14 +15,14 @@
 
 ifeq ($(docker),1)
 DC := docker compose run --rm --entrypoint bash test -c
-BUILD_CMD := $(DC) 'poetry build'
+BUILD_CMD := $(DC) 'rm -f fastgrab/*.so && poetry build'
 TEST_CMD := docker compose run --rm test
 TEST_WAYLAND_CMD := docker compose run --rm test-wayland
 INSTALL_CMD := $(DC) 'poetry install --extras gui'
 BENCH_CMD := docker compose run --rm benchmark
 LOCK_CMD := $(DC) 'poetry lock'
 else
-BUILD_CMD := poetry build
+BUILD_CMD := rm -f fastgrab/*.so && poetry build
 TEST_CMD := pytest -m 'not wayland' tests
 TEST_WAYLAND_CMD := pytest -m wayland tests
 INSTALL_CMD := poetry install --extras gui
@@ -67,10 +67,10 @@ lock:
 #@help: remove build artifacts (also docker compose volumes when docker=1)
 clean:
 ifeq ($(docker),1)
-	-docker run --rm -v "$(CURDIR)":/work -w /work alpine sh -c 'rm -rf dist build *.egg-info'
+	-docker run --rm -v "$(CURDIR)":/work -w /work alpine sh -c 'rm -rf dist build *.egg-info fastgrab/*.so'
 	-docker compose down -v
 else
-	rm -rf dist build *.egg-info
+	rm -rf dist build *.egg-info fastgrab/*.so
 endif
 
 define AWK_SCRIPT
