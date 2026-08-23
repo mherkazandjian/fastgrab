@@ -25,6 +25,18 @@ include = [
     {path = "fastgrab/backends/protocols/*.xml", format = ["sdist", "wheel"]},
     {path = "fastgrab/backends/protocols/*.py", format = ["sdist", "wheel"]},
 ]
+# Explicit excludes: Poetry only honours .gitignore when git is available,
+# and the dev container (where `make build docker=1` runs) has none — so
+# IDE leftovers and caches under fastgrab/ would otherwise be packaged into
+# the sdist AND the wheel. Stale in-place *.so builds can't be excluded by
+# pattern (the build hook's fresh output has the same name and must be
+# packaged), so `make build` deletes them before invoking poetry.
+exclude = [
+    "fastgrab/**/__pycache__",
+    "fastgrab/linux_x11/cmake-build-debug",
+    "fastgrab/linux_x11/.idea",
+    "fastgrab/linux_x11/CMakeLists.txt",
+]
 build = "build.py"
 
 [tool.poetry.dependencies]
