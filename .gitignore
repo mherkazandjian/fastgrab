@@ -119,3 +119,7 @@ dmypy.json
 .idea
 fastgrab/linux_x11/cmake-build-debug
 CMakeLists.txt
+
+# recorder output / demo clips
+*.mp4
+*.webm

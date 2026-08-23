@@ -31,6 +31,74 @@ resolution    | fps
   plt.imshow(img[:, :, 0:3], interpolation='none', cmap='Greys_r')
   plt.show()
 ````
+
+## Screen recording (draft, Linux/X11)
+
+The opt-in ``fastgrab.recording`` module pipes frames into ``ffmpeg``
+(which must be on ``PATH``). Pick a capture target — ``--fullscreen`` or
+``--region X,Y,W,H`` for scripted use, or ``--gui`` to select interactively
+(``--gui`` can be combined with either to skip the drag selector and go
+straight to the settings dialog) — and an output whose extension selects
+the codec (``.mp4``, ``.webm`` or ``.gif``):
+
+````bash
+  fastgrab-record --fullscreen --duration 10 -o demo.mp4
+  fastgrab-record --region 100,100,1280,720 --fps 60 -o clip.webm   # Ctrl-C to stop
+  fastgrab-record --fullscreen --countdown 3 --title "My demo" --overlay-text "v1.2" -o demo.mp4
+````
+
+- ``--fps N`` sets the target rate (default 30). If capture runs slower
+  than that, the last frame is repeated so the clip's length still matches
+  wall-clock time; the summary line reports the real capture rate and how
+  many frames were duplicated.
+- ``--duration S`` stops after S seconds; without it, recording runs until
+  Ctrl-C and the file is finalised cleanly.
+- ``--countdown S`` waits before the first frame — time to move the
+  terminal out of shot.
+- ``--title TEXT`` shows top-centre for the first 3 seconds;
+  ``--overlay-text TEXT`` is a watermark in the top-right for the whole clip.
+
+Optional pointer overlays and subtitles:
+
+````bash
+  fastgrab-record --fullscreen -o demo.mp4 \
+      --show-clicks --click-style concentric --click-color 255,200,0 \
+      --show-cursor \
+      --subtitle "0.5-3.0:Hello world" --subtitle "4.0-6.5:Second line" \
+      --subtitle-font /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf \
+      --subtitle-fontsize 32 --subtitle-color yellow \
+      --subtitle-box-color black@0.6 --subtitle-position bottom
+````
+
+- ``--show-clicks`` animates every detected mouse click; ``--click-style``
+  picks the pattern (``ring``, ``concentric``, ``circle``, ``crosshair``),
+  ``--click-color B,G,R``/``--click-lifetime`` tune it.
+- ``--show-cursor`` stamps an emulated arrow pointer at the mouse position —
+  the X11 capture path never includes the real cursor sprite.
+- ``--subtitle START-END:TEXT`` (repeatable) renders timed subtitles;
+  colours accept any ffmpeg colour string (``white``, ``0xRRGGBB``,
+  ``red@0.8``). The same options exist on the Python API via
+  ``ClickStyle``, ``Subtitle`` and ``SubtitleStyle``.
+
+Click/cursor tracking and ``--gui`` need the ``[gui]`` extra
+(``pip install fastgrab[gui]``, which pulls in ``python-xlib`` for pointer
+polling and ``Pillow`` for the selector's preview); subtitles need a font
+file (``$FASTGRAB_FONT`` or the bundled DejaVu search paths).
+
+Interactive use: ``fastgrab-record --gui`` opens a drag-to-select region
+picker followed by a small settings dialog (needs ``tkinter``), and
+``fastgrab-record --print-xbindkeys`` prints a snippet for binding that to
+a hotkey such as ``Print``.
+
+From Python:
+
+````python
+  from fastgrab.recording import Recorder
+  stats = Recorder("demo.mp4", bbox=(0, 0, 1280, 720), fps=30).record(duration=5)
+  # stats: frames (captured), written_frames (incl. duplicates),
+  #        elapsed_seconds, achieved_fps, output
+````
+
 ## Getting Started
 
 ``Fastgrab`` was initially developed in 2016 as part of an aimbot (for quake
@@ -62,13 +130,22 @@ to benchmark ``fastgrab`` run the script [examples/benchmark.py](https://github.
 
 Common to all platforms:
 
- - ``python >= 3.8`` (python 2 is not supported)
- - ``Numpy >= 1.15`` (auto-installed by pip)
+ - ``python >= 3.10`` (python 2 is not supported)
+ - ``Numpy >= 1.26`` (auto-installed by pip)
 
 Per-platform extras:
 
- - **Linux/X11**: ``gcc >= 4.8.5``, ``X11 >= 1.20`` (system package:
-   ``libx11-dev`` for build; ``libX11`` and ``libgomp1`` at runtime).
+ - **Linux/X11**: the C extension is compiled on install, so you need a C
+   toolchain plus the Python and X11 headers:
+
+   - Debian/Ubuntu: ``sudo apt install build-essential python3-dev libx11-dev``
+   - Fedora: ``sudo dnf install gcc python3-devel libX11-devel``
+
+   Runtime needs only ``libX11`` and ``libgomp1`` (``libgomp`` on Fedora),
+   which are present on any desktop. ``Python.h: No such file`` means the
+   Python headers are missing (``python3-dev``); ``stdio.h: No such file``
+   means the toolchain headers are (``build-essential``). Tested on
+   Debian-based Python images, Ubuntu 24.04 and Fedora 44, Python 3.10–3.14.
  - **Linux/Wayland**: a wlroots-based compositor (Sway, Hyprland, river,
    niri, cage) for the no-prompt path; the ``[wayland]`` extra (``pip
    install fastgrab[wayland]``) pulls in ``pywayland``.

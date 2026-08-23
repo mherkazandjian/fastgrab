@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "fastgrab"
-version = "0.3.0.dev0"
+version = "0.3.0"
 description = "Low level screen capture package with a numpy interface"
 authors = ["Mher Kazandjian <mherkazandjian@gmail.com>"]
 license = "GPL-3.0-or-later"
@@ -28,23 +28,33 @@ include = [
 build = "build.py"
 
 [tool.poetry.dependencies]
-python = "^3.8"
-numpy = "*"
+python = "^3.10"
+numpy = ">=1.26"
 pywayland = {version = "^0.4.17", optional = true}
 dbus-next = {version = "^0.2.3", optional = true}
 pipewire-python = {version = "^0.2.0", optional = true}
+python-xlib = {version = "*", optional = true}
+Pillow = {version = "*", optional = true}
 
 [tool.poetry.extras]
 wayland = ["pywayland"]
 wayland-portal = ["dbus-next", "pipewire-python"]
 wayland-all = ["pywayland", "dbus-next", "pipewire-python"]
+gui = ["python-xlib", "Pillow"]
+
+[tool.poetry.scripts]
+fastgrab-record = "fastgrab.recording.cli:main"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "*"
 python-xlib = "*"
 
 [build-system]
-requires = ["poetry-core>=1.5.0", "setuptools", "numpy"]
+# Build against NumPy 2.x headers: per NumPy's downstream-packaging
+# guidance, binaries built against 2.x are runtime-compatible with
+# NumPy 1.x (the C extension only uses the plain buffer API), so this
+# does not conflict with the >=1.26 runtime floor above.
+requires = ["poetry-core>=1.5.0", "setuptools", "numpy>=2.0"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.pytest.ini_options]

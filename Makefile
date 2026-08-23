@@ -18,14 +18,14 @@ DC := docker compose run --rm --entrypoint bash test -c
 BUILD_CMD := $(DC) 'poetry build'
 TEST_CMD := docker compose run --rm test
 TEST_WAYLAND_CMD := docker compose run --rm test-wayland
-INSTALL_CMD := $(DC) 'pip install .'
+INSTALL_CMD := $(DC) 'poetry install --extras gui'
 BENCH_CMD := docker compose run --rm benchmark
 LOCK_CMD := $(DC) 'poetry lock'
 else
 BUILD_CMD := poetry build
 TEST_CMD := pytest -m 'not wayland' tests
 TEST_WAYLAND_CMD := pytest -m wayland tests
-INSTALL_CMD := pip install .
+INSTALL_CMD := poetry install --extras gui
 BENCH_CMD := python examples/benchmark.py
 LOCK_CMD := poetry lock
 endif
@@ -42,7 +42,7 @@ test:
 test-wayland:
 	$(TEST_WAYLAND_CMD)
 
-#@help: install fastgrab into the active python environment
+#@help: install fastgrab + [gui] extra into the poetry-managed venv
 install:
 	$(INSTALL_CMD)
 
