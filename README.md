@@ -135,8 +135,17 @@ Common to all platforms:
 
 Per-platform extras:
 
- - **Linux/X11**: ``gcc >= 4.8.5``, ``X11 >= 1.20`` (system package:
-   ``libx11-dev`` for build; ``libX11`` and ``libgomp1`` at runtime).
+ - **Linux/X11**: the C extension is compiled on install, so you need a C
+   toolchain plus the Python and X11 headers:
+
+   - Debian/Ubuntu: ``sudo apt install build-essential python3-dev libx11-dev``
+   - Fedora: ``sudo dnf install gcc python3-devel libX11-devel``
+
+   Runtime needs only ``libX11`` and ``libgomp1`` (``libgomp`` on Fedora),
+   which are present on any desktop. ``Python.h: No such file`` means the
+   Python headers are missing (``python3-dev``); ``stdio.h: No such file``
+   means the toolchain headers are (``build-essential``). Tested on
+   Debian-based Python images, Ubuntu 24.04 and Fedora 44, Python 3.10–3.14.
  - **Linux/Wayland**: a wlroots-based compositor (Sway, Hyprland, river,
    niri, cage) for the no-prompt path; the ``[wayland]`` extra (``pip
    install fastgrab[wayland]``) pulls in ``pywayland``.

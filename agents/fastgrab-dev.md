@@ -105,7 +105,10 @@ examples/                   single_screenshot.py, low_level_api_screenshot.py, b
   any new optional backend.
 - The C extension `fastgrab._linux_x11` exposes `resolution()`,
   `bytes_per_pixel()`, `screenshot(x, y, img)`. It does a single `memcpy`
-  from `XImage->data`; it links `X11` and `gomp`.
+  from `XImage->data`; it links `X11` and `gomp`. Every entry point checks
+  `XOpenDisplay`/`XGetImage` for NULL and raises `RuntimeError` (before
+  0.3.0 an unreachable `DISPLAY` segfaulted); images are released with
+  `XDestroyImage`.
 
 ## 4. Build system
 
@@ -271,14 +274,19 @@ are no release/publish steps in CI.
 ### Validate the install story (release prep / install-issue triage)
 
 Use a **fresh minimal base image** (`python:3.11-slim`, `python:3.12-slim`,
-`ubuntu:24.04`), install only what the README claims
-(`gcc libx11-dev libgomp1 xvfb xauth`), `pip install /repo` from a
-read-only mount, then under `Xvfb :99` run the two-line API and expect
-shape `(480, 640, 4)` for a `640x480x24` screen. **Do not use
-`docker/Dockerfile` for this** — it pre-installs the full toolchain and
-hides regressions. Report pip status, import status, capture shape, and
-the last lines of any failing log; don't paper over a missing system dep
-by installing it.
+`ubuntu:24.04`, `fedora:latest`), install only what the README claims with
+`--no-install-recommends` (`build-essential python3-dev libx11-dev libgomp1
+xvfb xauth`), and install from a **clean `git archive` export** — never
+from a copy or mount of the working tree, which carries gitignored
+`build/` objects and prebuilt `_linux_x11*.so` that setuptools silently
+reuses (a whole "green" matrix once never compiled a line). Use
+`pip install -v` and require a `gcc … screenshot.c` line in the log. Wait
+for `/tmp/.X11-unix/X99` before capturing (Fedora's Xvfb takes seconds),
+then run the two-line API and expect `(480, 640, 4)` for a `640x480x24`
+screen. **Do not use `docker/Dockerfile` for this** — it pre-installs the
+full toolchain and hides regressions. Report pip status, compiled yes/no,
+import status, capture shape, and the last lines of any failing log;
+don't paper over a missing system dep by installing it.
 
 ### Triage a "pip install failed" issue
 

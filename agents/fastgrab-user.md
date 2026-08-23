@@ -46,10 +46,13 @@ pip install git+https://github.com/mherkazandjian/fastgrab.git   # latest from s
 Platform prerequisites:
 
 - **Linux / X11** — a C extension is compiled on install. Needs a C
-  compiler and X11 headers: `gcc`, `libx11-dev` (Debian/Ubuntu) /
-  `libX11-devel` (Fedora). Runtime: `libX11`, `libgomp1`. If
-  `pip install` fails on Linux, a missing `libx11-dev` or `gcc` is the
-  cause ~90% of the time.
+  toolchain plus Python and X11 headers:
+  Debian/Ubuntu `sudo apt install build-essential python3-dev libx11-dev`;
+  Fedora `sudo dnf install gcc python3-devel libX11-devel`. Runtime:
+  `libX11`, `libgomp1`. If `pip install` fails on Linux, read the last
+  `fatal error` line: `Python.h` missing → `python3-dev`; `stdio.h`
+  missing → `build-essential`; `X11/Xlib.h` missing → `libx11-dev`.
+  Verified on Python 3.10–3.14, Ubuntu 24.04, Fedora 44.
 - **Linux / Wayland** — `pip install fastgrab[wayland]`. Works on
   **wlroots** compositors only (Sway, Hyprland, river, niri, cage) via
   `wlr-screencopy-v1`. GNOME and KDE do not expose that protocol; the
@@ -273,9 +276,11 @@ stats  # {'frames': captured, 'written_frames': captured + duplicates,
 
 | symptom | cause | fix |
 |---|---|---|
-| `pip install` fails compiling on Linux, mentions `X11/Xlib.h` or `gcc` | missing build deps | `apt install gcc libx11-dev` (or distro equivalent), retry |
+| `pip install` fails: `fatal error: Python.h: No such file` | Python headers missing (system Python on Ubuntu/Debian/Fedora) | `apt install python3-dev` / `dnf install python3-devel`, retry |
+| `pip install` fails: `fatal error: stdio.h` or `X11/Xlib.h: No such file` | C toolchain / X11 headers missing | `apt install build-essential libx11-dev` / `dnf install gcc libX11-devel`, retry |
 | `ImportError: ... _linux_x11` | C extension not built / wrong Python ABI | reinstall in the same interpreter: `pip install --force-reinstall --no-binary :all: fastgrab` |
 | `RuntimeError: no usable display server detected` | neither `DISPLAY` nor `WAYLAND_DISPLAY` set (ssh, cron, container) | run under a display, or `xvfb-run python script.py` for headless work |
+| `RuntimeError: cannot open X display: is DISPLAY set and the X server reachable?` | `DISPLAY` is set but points at a dead/unauthorised server (stale ssh value, Xvfb not up yet, missing `xauth` cookie) | fix `DISPLAY`/`XAUTHORITY`, or wait for the server; versions before 0.3.0 segfaulted here instead |
 | `RuntimeError: backend 'wlr' requires the wayland extra` | forced `wlr` without pywayland | `pip install fastgrab[wayland]` |
 | Wayland on GNOME/KDE: black frames or only some windows | wlr protocol unavailable; XWayland fallback sees X11 clients only | no fix yet — portal backend is stubbed; run the X11 session or a wlroots compositor |
 | `NotImplementedError` from portal backend | `[wayland-portal]` is a placeholder | same as above |
