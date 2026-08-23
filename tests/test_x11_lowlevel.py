@@ -47,3 +47,25 @@ def test_low_level_screenshot_fills_buffer():
 def test_screensize_matches_low_level_resolution():
     grab = screenshot.Screenshot(backend="x11")
     assert grab.screensize == _linux_x11.resolution()
+
+
+def test_unreachable_display_raises_instead_of_segfaulting(monkeypatch):
+    # Regression: every entry point used to dereference a NULL Display*
+    # when XOpenDisplay failed, crashing the interpreter (exit 139).
+    monkeypatch.setenv("DISPLAY", ":77")
+    with pytest.raises(RuntimeError, match="cannot open X display"):
+        _linux_x11.resolution()
+    with pytest.raises(RuntimeError, match="cannot open X display"):
+        _linux_x11.bytes_per_pixel()
+    with pytest.raises(RuntimeError, match="cannot open X display"):
+        _linux_x11.screenshot(0, 0, numpy.zeros((2, 2, 4), dtype=numpy.uint8))
+    # And through the public API — Screenshot() itself doesn't touch the
+    # server, the first capture() does.
+    from fastgrab import screenshot
+    with pytest.raises(RuntimeError, match="cannot open X display"):
+        screenshot.Screenshot(backend="x11").capture()
+
+
+def test_screenshot_rejects_non_3d_buffer():
+    with pytest.raises(ValueError, match="height, width, 4"):
+        _linux_x11.screenshot(0, 0, numpy.zeros((8, 8), dtype=numpy.uint8))
