@@ -21,14 +21,32 @@ def _normalise_blur(blur):
         return blur
     regions = []
     for region in blur:
-        values = tuple(int(v) for v in region)
+        values = tuple(region)
         if len(values) != 4:
             raise ValueError(
                 "blur regions must be (x, y, width, height); got {!r}".format(
                     region
                 )
             )
-        regions.append(values)
+        whole = []
+        for value in values:
+            as_int = int(value)
+            if as_int != value:
+                raise ValueError(
+                    "blur region coordinates must be whole pixels; got {!r}"
+                    " — round them yourself so the rectangle lands where "
+                    "you meant".format(region)
+                )
+            whole.append(as_int)
+        if whole[2] <= 0 or whole[3] <= 0:
+            # An empty rectangle would be stored as a real target and then
+            # silently clipped away, leaving the caller believing the
+            # region was redacted.
+            raise ValueError(
+                "blur region width and height must be positive; got "
+                "{!r}".format(region)
+            )
+        regions.append(tuple(whole))
     return tuple(regions)
 
 
@@ -62,8 +80,7 @@ class Screenshot(object):
         self._img = None
         """The buffer where the captured image is stored"""
 
-        self.blur = _normalise_blur(blur)
-        """Default blur regions applied by capture(), or None"""
+        self.blur = blur   # normalised by the property setter below
 
         self.blur_style = blur_style
         """effects.BlurStyle used for self.blur, or None for the defaults"""
@@ -71,6 +88,21 @@ class Screenshot(object):
         self._blur_scratch = {}
         """Work buffers reused across captures by fastgrab.effects, so a
         capture loop blurring a fixed region stops reallocating them"""
+
+    @property
+    def blur(self):
+        """Regions obscured in every capture, or ``None`` / ``True``.
+
+        A property rather than a plain attribute so that assigning to it
+        after construction goes through the same validation the
+        constructor uses — otherwise ``grab.blur = (r for r in rects)``
+        would redact one frame and then silently stop.
+        """
+        return self._blur
+
+    @blur.setter
+    def blur(self, value):
+        self._blur = _normalise_blur(value)
 
     @property
     def screensize(self) -> tuple:

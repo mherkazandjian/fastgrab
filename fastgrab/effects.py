@@ -51,7 +51,7 @@ DEFAULT_FILL_COLOR = (0, 0, 0)  # B, G, R — a black box
 _SCRATCH_LIMIT = 24
 
 
-@dataclass
+@dataclass(frozen=True)
 class BlurStyle:
     """How a region is obscured.
 
@@ -61,9 +61,14 @@ class BlurStyle:
     ``fill``. ``passes`` is how many box blurs approximate the gaussian;
     three is the usual choice. Their radii are scaled so the combined
     variance approximates a single box blur of ``radius`` — integer radii
-    can't hit it exactly, and at small radii the pass count is reduced
-    rather than let the blur come out stronger than asked. See
-    :func:`_pass_radii`.
+    can't hit it exactly, so the result may land up to 25% either side of
+    it, and at small radii the pass count is reduced rather than let the
+    blur come out several times stronger. See :func:`_pass_radii`.
+
+    The dataclass is frozen. Validation happens once at construction, and
+    a redaction style that could be weakened afterwards — ``style.radius
+    = 0`` turning a blur into a no-op — would defeat the point of
+    validating it at all.
     """
 
     method: str = "box"
@@ -106,19 +111,21 @@ class BlurStyle:
                 "a pixelate block of {} leaves the region unchanged; use 2 "
                 "or more".format(self.block)
             )
-        self.color = tuple(int(c) for c in self.color)
-        if len(self.color) != 3:
+        color = tuple(int(c) for c in self.color)
+        if len(color) != 3:
             raise ValueError(
                 "blur colour must be a (B, G, R) tuple, got {!r}".format(
                     self.color
                 )
             )
-        if not all(0 <= c <= 255 for c in self.color):
+        if not all(0 <= c <= 255 for c in color):
             raise ValueError(
                 "blur colour values must be in 0..255, got {!r}".format(
                     self.color
                 )
             )
+        # Frozen, so normalising the colour needs the back door.
+        object.__setattr__(self, "color", color)
 
 
 def _scratch_get(scratch, name, shape, dtype=numpy.float32):
@@ -289,6 +296,13 @@ def _pass_radii(radius, passes):
     and takes the first one whose combined variance lands within
     :data:`_VARIANCE_TOLERANCE` of the target.
 
+    The tolerance is symmetric: the result can be up to a quarter weaker
+    or stronger than the requested radius, whichever integer radius comes
+    closest. Both neighbours of the ideal real radius are tried, because
+    rounding to the nearer one is not the same as picking the one whose
+    variance is nearer — at radius 19 over 24 passes, rounding picks a
+    radius that misses the envelope while its floor sits inside it.
+
     Dropping passes matters at small radii: the ideal share can round to
     a zero radius, and flooring it at 1 instead — as an earlier version
     did — makes the blur far stronger than asked. Three passes of radius
@@ -297,13 +311,16 @@ def _pass_radii(radius, passes):
     """
     target = ((2 * radius + 1) ** 2 - 1) / 12.0
     for n in range(passes, 0, -1):
-        share = target / n
-        r = int(round((math.sqrt(12.0 * share + 1.0) - 1.0) / 2.0))
-        if r < 1:
-            continue
-        variance = n * ((2 * r + 1) ** 2 - 1) / 12.0
-        if abs(variance - target) <= _VARIANCE_TOLERANCE * target:
-            return [r] * n
+        ideal = (math.sqrt(12.0 * (target / n) + 1.0) - 1.0) / 2.0
+        candidates = {
+            max(1, int(math.floor(ideal))), max(1, int(math.ceil(ideal))),
+        }
+        error, radii = min(
+            (abs(n * ((2 * r + 1) ** 2 - 1) / 12.0 - target), [r] * n)
+            for r in candidates
+        )
+        if error <= _VARIANCE_TOLERANCE * target:
+            return radii
     # n == 1 reproduces the requested radius exactly, so this is only
     # reached if radius itself is degenerate — which BlurStyle rejects.
     return [max(1, radius)]
@@ -446,11 +463,25 @@ def blur_regions(img, regions=None, style=None, origin=(0, 0),
         regions = [(0, 0, img.shape[1], img.shape[0])]
         origin = (0, 0)
 
-    # Nothing to do — bail before touching the frame at all.
-    if style.method in ("box", "gaussian") and style.radius <= 0:
-        return img
-    if style.method == "pixelate" and style.block <= 1:
-        return img
+    # Revalidate here rather than trusting construction: blur_regions
+    # accepts any object with these attributes, and an identity setting
+    # that quietly returns the frame untouched is how redaction leaks.
+    if style.method not in BLUR_METHODS:
+        raise ValueError(
+            "unknown blur method {!r}; expected one of {}".format(
+                style.method, ", ".join(BLUR_METHODS)
+            )
+        )
+    if style.method in ("box", "gaussian") and style.radius < 1:
+        raise ValueError(
+            "a {} blur of radius {} would leave the region "
+            "unchanged".format(style.method, style.radius)
+        )
+    if style.method == "pixelate" and style.block < 2:
+        raise ValueError(
+            "a pixelate block of {} would leave the region "
+            "unchanged".format(style.block)
+        )
 
     for region in regions:
         box = _clip(region, img.shape, origin)
@@ -463,5 +494,5 @@ def blur_regions(img, regions=None, style=None, origin=(0, 0),
         elif style.method == "pixelate":
             _pixelate_sub(sub, style.block, scratch)
         else:
-            _blur_sub(sub, style, scratch)
+            _blur_sub(sub, style, scratch)  # box / gaussian
     return img

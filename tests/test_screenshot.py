@@ -264,3 +264,48 @@ def test_malformed_blur_regions_raise_instead_of_being_skipped():
             _stub_grab(blur=bad)
     with pytest.raises(ValueError):
         _stub_grab().capture(blur=[("a", 2, 3, 4)])
+
+
+def test_assigning_blur_after_construction_is_normalised_too():
+    """Regression: the public attribute bypassed validation entirely."""
+    grab = _stub_grab(blur_style=_fill_style())
+    grab.blur = (r for r in [(4, 4, 8, 8)])
+    for attempt in range(3):
+        img = grab.capture()
+        assert (img[4:12, 4:12, 0] == _MARKER[0]).all(), (
+            "capture {} came back unredacted".format(attempt)
+        )
+    assert grab.blur == ((4, 4, 8, 8),)
+
+
+def test_assigning_a_malformed_blur_after_construction_raises():
+    grab = _stub_grab()
+    with pytest.raises(ValueError):
+        grab.blur = [(1, 2, 3)]
+
+
+@pytest.mark.parametrize("region", [
+    (10, 10, 0, 20),      # zero width
+    (10, 10, 20, 0),      # zero height
+    (10, 10, -5, 20),     # negative width
+])
+def test_empty_blur_regions_raise_rather_than_being_skipped(region):
+    """An empty rectangle would be stored, then silently clipped away."""
+    with pytest.raises(ValueError, match="positive"):
+        _stub_grab(blur=[region])
+
+
+@pytest.mark.parametrize("region", [
+    (10.5, 10, 20, 20),
+    (10, 10, 20.7, 20),
+    (10, 10, 0.4, 20),    # would truncate to an empty rectangle
+])
+def test_fractional_blur_coordinates_raise(region):
+    """Truncating a coordinate could shift the box off part of the secret."""
+    with pytest.raises(ValueError, match="whole pixels"):
+        _stub_grab(blur=[region])
+
+
+def test_integral_floats_are_accepted():
+    grab = _stub_grab(blur=[(10.0, 10.0, 20.0, 20.0)], blur_style=_fill_style())
+    assert grab.blur == ((10, 10, 20, 20),)

@@ -264,14 +264,43 @@ def test_values_irrelevant_to_the_method_are_left_alone(kwargs):
     BlurStyle(**kwargs)
 
 
-def test_blur_regions_still_no_ops_on_a_mutated_style():
-    """The guard inside blur_regions survives a style mutated after init."""
+def test_blur_style_cannot_be_weakened_after_construction():
+    """Frozen: validating at construction is pointless if it can be undone."""
+    import dataclasses
+
     style = BlurStyle(method="box", radius=4)
-    style.radius = 0
+    for field, value in (("radius", 0), ("block", 1), ("method", "swirl")):
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(style, field, value)
+
+
+class _LooseStyle:
+    """A duck-typed stand-in for BlurStyle, with no validation of its own."""
+
+    def __init__(self, method="box", radius=12, block=16, passes=3,
+                 color=(0, 0, 0)):
+        self.method = method
+        self.radius = radius
+        self.block = block
+        self.passes = passes
+        self.color = color
+
+
+@pytest.mark.parametrize("style,match", [
+    (_LooseStyle(method="box", radius=0), "unchanged"),
+    (_LooseStyle(method="gaussian", radius=0), "unchanged"),
+    (_LooseStyle(method="pixelate", block=1), "unchanged"),
+    (_LooseStyle(method="swirl"), "unknown blur method"),
+])
+def test_blur_regions_rejects_an_identity_or_unknown_style(style, match):
+    """blur_regions revalidates: it must never quietly return the frame.
+
+    An unknown method previously fell through to the box/gaussian branch,
+    so a typo silently produced a blur instead of an error.
+    """
     img = _noise(16, 16, seed=8)
-    before = img.copy()
-    blur_regions(img, None, style)
-    assert (img == before).all()
+    with pytest.raises(ValueError, match=match):
+        blur_regions(img, None, style)
 
 
 def test_blur_regions_returns_the_same_array_object():
