@@ -18,6 +18,15 @@ def _normalise_blur(blur):
     """
     if blur is None or blur is True or blur is False:
         return blur
+    try:
+        if len(blur) == 0:
+            # Documented as "capture this frame unmodified", so it must
+            # not drag in fastgrab.effects. Only a sized container can be
+            # checked without consuming it; an empty generator still
+            # imports, which is a fair price for not eating its contents.
+            return ()
+    except TypeError:
+        pass
     from fastgrab.effects import _normalise_regions
     return _normalise_regions(blur)
 
@@ -52,10 +61,8 @@ class Screenshot(object):
         self._img = None
         """The buffer where the captured image is stored"""
 
-        self.blur = blur   # normalised by the property setter below
-
-        self.blur_style = blur_style
-        """effects.BlurStyle used for self.blur, or None for the defaults"""
+        self.blur = blur              # both normalised/validated by the
+        self.blur_style = blur_style  # property setters defined below
 
         self._blur_scratch = {}
         """Work buffers reused across captures by fastgrab.effects, so a
@@ -75,6 +82,29 @@ class Screenshot(object):
     @blur.setter
     def blur(self, value):
         self._blur = _normalise_blur(value)
+
+    @property
+    def blur_style(self):
+        """The :class:`fastgrab.effects.BlurStyle` used for :attr:`blur`.
+
+        Validated on assignment for the same reason as :attr:`blur`, and
+        so that a bad style is refused up front rather than at the end of
+        the next ``capture()`` — by which point the backend has already
+        overwritten the shared buffer that a caller may still be holding
+        as a redacted frame.
+        """
+        return self._blur_style
+
+    @blur_style.setter
+    def blur_style(self, value):
+        if value is not None:
+            from fastgrab.effects import BlurStyle
+            if not isinstance(value, BlurStyle):
+                raise TypeError(
+                    "blur_style must be a BlurStyle or None, got "
+                    "{!r}".format(type(value).__name__)
+                )
+        self._blur_style = value
 
     @property
     def screensize(self) -> tuple:

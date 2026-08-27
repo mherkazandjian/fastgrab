@@ -651,9 +651,11 @@ def test_recorder_blur_can_be_changed_after_construction():
     frame = rec._grab.capture(bbox=(0, 0, 64, 48))
     assert (frame[0:16, 0:16, 0] == 7).all()
 
-    # And the setter validates, like the constructor does.
+    # And both setters validate, like the constructor does.
     with pytest.raises(ValueError):
         rec.blur = [(0, 0, 0, 16)]
+    with pytest.raises(TypeError):
+        rec.blur_style = "fill"
 
 
 @pytest.mark.skipif(not _x11_available(), reason="needs X11 DISPLAY")

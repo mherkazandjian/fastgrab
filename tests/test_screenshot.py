@@ -327,3 +327,44 @@ def test_a_rejected_blur_override_does_not_clear_the_previous_frame():
 
     # Same buffer object; it must still hold the redacted frame.
     assert (frame[..., 0] == _MARKER[0]).all()
+
+
+def test_blur_style_is_validated_on_assignment():
+    """Regression: a bad style was stored and only raised mid-capture.
+
+    By then the backend had overwritten the shared buffer, so a caller's
+    previously redacted frame had already gone clear.
+    """
+    grab = _stub_grab(blur=True, blur_style=_fill_style())
+    frame = grab.capture()
+    assert (frame[..., 0] == _MARKER[0]).all()
+
+    for bad in ("fill", {}, object()):
+        with pytest.raises(TypeError, match="BlurStyle"):
+            grab.blur_style = bad
+    with pytest.raises(TypeError):
+        _stub_grab(blur=True, blur_style="fill")
+
+    # Rejected before anything captured, so the held frame is untouched.
+    assert (frame[..., 0] == _MARKER[0]).all()
+    assert grab.blur_style is not None
+
+
+def test_empty_blur_list_does_not_import_the_effects_module():
+    """blur=[] is documented as "capture unmodified", so it must stay lazy."""
+    import subprocess
+    import sys
+
+    probe = (
+        "import sys;"
+        "from fastgrab import screenshot;"
+        "g = screenshot.Screenshot(blur=[]);"
+        "g.capture(blur=[]);"
+        "assert 'fastgrab.effects' not in sys.modules, 'imported for a no-op';"
+        "print('ok')"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
+    assert "ok" in result.stdout

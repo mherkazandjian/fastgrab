@@ -78,6 +78,23 @@ class BlurStyle:
     color: tuple = DEFAULT_FILL_COLOR
 
     def __post_init__(self):
+        for name in ("radius", "block", "passes"):
+            value = getattr(self, name)
+            try:
+                whole = int(value)
+            except (TypeError, ValueError):
+                # int(nan) and int("x") land here, so NaN cannot slip past
+                # the range checks below by failing every comparison.
+                raise ValueError(
+                    "blur {} must be a whole number of pixels, got "
+                    "{!r}".format(name, value)
+                )
+            if whole != value:
+                raise ValueError(
+                    "blur {} must be a whole number of pixels, got "
+                    "{!r}".format(name, value)
+                )
+            object.__setattr__(self, name, whole)
         if self.method not in BLUR_METHODS:
             raise ValueError(
                 "unknown blur method {!r}; expected one of {}".format(
@@ -497,7 +514,11 @@ def blur_regions(img, regions=None, style=None, origin=(0, 0),
         modified in place; only channels 0..2 are written.
     :param regions: an iterable of ``(x, y, w, h)`` rectangles, or
         ``None`` for the whole frame. Rectangles are clipped to the
-        frame; ones that fall entirely outside it are skipped.
+        frame; ones that fall entirely outside it are skipped. The
+        iterable is consumed once, so a generator passed to two separate
+        calls redacts only the first — hold a list, or go through
+        :meth:`fastgrab.screenshot.Screenshot.capture`, which stores its
+        regions materialised for exactly this reason.
     :param style: a :class:`BlurStyle`; ``None`` means the defaults
         (a box blur of radius 12).
     :param origin: the frame's top-left corner in the caller's
@@ -520,16 +541,15 @@ def blur_regions(img, regions=None, style=None, origin=(0, 0),
     if style is None:
         style = BlurStyle()
     elif not isinstance(style, BlurStyle):
-        # Duck-typed styles are allowed, but they get the full BlurStyle
-        # validation rather than a subset of it — a loose style with
-        # passes=0 or a colour that is really an image would otherwise
-        # return the frame untouched and look like a successful redaction.
-        style = BlurStyle(
-            method=getattr(style, "method", "box"),
-            radius=getattr(style, "radius", DEFAULT_RADIUS),
-            block=getattr(style, "block", DEFAULT_BLOCK),
-            passes=getattr(style, "passes", DEFAULT_PASSES),
-            color=getattr(style, "color", DEFAULT_FILL_COLOR),
+        # Deliberately not duck-typed. Reading attributes off whatever
+        # arrives, with defaults for the missing ones, meant a stray
+        # value silently became a default box blur: blur_regions(img,
+        # None, "fill") softened the region instead of painting it out,
+        # and only fill actually destroys pixels.
+        raise TypeError(
+            "style must be a BlurStyle or None, got {!r}".format(
+                type(style).__name__
+            )
         )
 
     if regions is None:

@@ -257,6 +257,20 @@ def test_core_entry_point_materialises_a_generator():
     assert (img[0:4, 0:4, B] == 1).all()
 
 
+def test_regions_are_all_validated_before_any_pixel_changes():
+    """A lazy `for region in regions` would redact, then raise part-way.
+
+    Validating up front means a bad rectangle anywhere in the list leaves
+    the frame exactly as it was, rather than half-redacted.
+    """
+    img = _noise(12, 12, seed=7)
+    before = img.copy()
+    regions = (r for r in [(0, 0, 4, 4), (6, 6, 0, 2)])
+    with pytest.raises(ValueError, match="positive"):
+        blur_regions(img, regions, BlurStyle(method="fill", color=(1, 2, 3)))
+    assert (img == before).all(), "the first region was applied before raising"
+
+
 def test_origin_translates_screen_coordinates_into_the_frame():
     img = numpy.full((10, 10, 4), 50, numpy.uint8)
     blur_regions(
@@ -304,7 +318,7 @@ def test_blur_style_cannot_be_weakened_after_construction():
 
 
 class _LooseStyle:
-    """A duck-typed stand-in for BlurStyle, with no validation of its own."""
+    """A duck-typed stand-in for BlurStyle — deliberately not accepted."""
 
     def __init__(self, method="box", radius=12, block=16, passes=3,
                  color=(0, 0, 0)):
@@ -315,53 +329,63 @@ class _LooseStyle:
         self.color = color
 
 
-@pytest.mark.parametrize("style,match", [
-    (_LooseStyle(method="box", radius=0), "unchanged"),
-    (_LooseStyle(method="gaussian", radius=0), "unchanged"),
-    (_LooseStyle(method="pixelate", block=1), "unchanged"),
-    (_LooseStyle(method="swirl"), "unknown blur method"),
-    (_LooseStyle(method="gaussian", passes=0), "passes"),
-    (_LooseStyle(method="fill", color=(1, 2)), "B, G, R"),
-    (_LooseStyle(method="fill", color=300), "B, G, R"),
+@pytest.mark.parametrize("style", [
+    "fill",                 # the method name instead of a style
+    {},
+    object(),
+    _LooseStyle(),          # right shape, still not a BlurStyle
+    BlurStyle,              # the class rather than an instance
 ])
-def test_blur_regions_rejects_an_identity_or_unknown_style(style, match):
-    """blur_regions revalidates: it must never quietly return the frame.
+def test_blur_regions_rejects_anything_that_is_not_a_blur_style(style):
+    """Reading attributes off a stray object turned it into a box blur.
 
-    An unknown method previously fell through to the box/gaussian branch,
-    so a typo silently produced a blur instead of an error.
+    ``blur_regions(img, None, "fill")`` used to fall back to every
+    default and softly blur the region, when the caller had asked for the
+    one method that actually destroys pixels.
     """
     img = _noise(16, 16, seed=8)
-    with pytest.raises(ValueError, match=match):
+    before = img.copy()
+    with pytest.raises(TypeError, match="BlurStyle"):
         blur_regions(img, None, style)
+    assert (img == before).all(), "the frame was touched before rejecting"
 
 
-def test_blur_regions_returns_the_same_array_object():
-    img = _noise(8, 8, seed=9)
-    assert blur_regions(img, None, BlurStyle(method="fill")) is img
+@pytest.mark.parametrize("kwargs,match", [
+    ({"method": "swirl"}, "unknown blur method"),
+    ({"method": "gaussian", "passes": 0}, "passes"),
+    ({"method": "fill", "color": (1, 2)}, "B, G, R"),
+    ({"method": "fill", "color": 300}, "B, G, R"),
+])
+def test_blur_style_rejects_structurally_invalid_settings(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        BlurStyle(**kwargs)
 
 
-def test_scratch_reuse_does_not_change_the_result():
-    """The reused work buffers must be an optimisation, nothing more."""
-    style = BlurStyle(method="gaussian", radius=4)
-    regions = [(3, 3, 20, 14)]
-    a = _noise(24, 30, seed=10)
-    b = a.copy()
-    scratch = {}
-    # Prime the scratch dict with a different shape first, so the second
-    # call exercises both reuse and a fresh allocation.
-    blur_regions(_noise(12, 12, seed=11), None, style, scratch=scratch)
-    blur_regions(a, regions, style, scratch=scratch)
-    blur_regions(b, regions, style)
-    assert (a == b).all()
+def test_blur_style_rejects_an_image_as_a_colour():
+    """A fill whose "colour" is an image assigns the frame back to itself."""
+    with pytest.raises(ValueError, match="B, G, R"):
+        BlurStyle(method="fill", color=numpy.zeros((8, 8, 3), numpy.uint8))
 
 
-def test_scratch_dict_stays_bounded():
-    style = BlurStyle(radius=2)
-    scratch = {}
-    for size in range(4, 60):
-        blur_regions(_noise(size, size, seed=size), None, style,
-                     scratch=scratch)
-    assert len(scratch) <= 32
+@pytest.mark.parametrize("kwargs", [
+    {"radius": 1.5},
+    {"method": "pixelate", "block": 2.5},
+    {"method": "gaussian", "passes": 1.5},
+    {"radius": float("nan")},
+    {"method": "pixelate", "block": float("nan")},
+    {"radius": "12"},
+])
+def test_blur_style_rejects_non_whole_controls(kwargs):
+    """These used to construct, then fail with TypeError deep in a capture.
+
+    NaN is the interesting one: it evades every ``<`` range check.
+    """
+    with pytest.raises(ValueError, match="whole number"):
+        BlurStyle(**kwargs)
+
+
+def test_blur_style_accepts_integral_floats():
+    assert BlurStyle(radius=8.0).radius == 8
 
 
 # --------------------------------------------------------------------
