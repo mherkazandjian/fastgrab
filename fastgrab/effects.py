@@ -178,6 +178,9 @@ def _normalise_regions(regions):
     because a screen-absolute region legitimately misses a sub-region
     capture.
     """
+    # Checked before consuming: an exhausted generator and an empty one
+    # are indistinguishable afterwards.
+    is_iterator = hasattr(regions, "__next__")
     out = []
     for region in regions:
         values = tuple(region)
@@ -202,6 +205,15 @@ def _normalise_regions(regions):
                 "{!r}".format(region)
             )
         out.append(tuple(whole))
+    if not out and is_iterator:
+        # Reusing one generator across two calls would redact the first
+        # frame and quietly leave the rest in the clear. An empty list is
+        # still an honest "do nothing".
+        raise ValueError(
+            "blur regions iterable was empty or already consumed; pass "
+            "[] to do nothing, and hold a list rather than a generator "
+            "to reuse regions across calls"
+        )
     return tuple(out)
 
 
@@ -516,9 +528,11 @@ def blur_regions(img, regions=None, style=None, origin=(0, 0),
         ``None`` for the whole frame. Rectangles are clipped to the
         frame; ones that fall entirely outside it are skipped. The
         iterable is consumed once, so a generator passed to two separate
-        calls redacts only the first — hold a list, or go through
-        :meth:`fastgrab.screenshot.Screenshot.capture`, which stores its
-        regions materialised for exactly this reason.
+        calls redacts only the first. Hold a list instead, or set
+        ``Screenshot(blur=...)`` / ``grab.blur = ...``, which materialise
+        once and reuse the result for every capture. Note that a per-call
+        ``capture(blur=...)`` override does *not* store anything, so it
+        is one-shot in the same way.
     :param style: a :class:`BlurStyle`; ``None`` means the defaults
         (a box blur of radius 12).
     :param origin: the frame's top-left corner in the caller's

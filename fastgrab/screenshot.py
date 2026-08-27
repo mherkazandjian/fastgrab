@@ -19,16 +19,30 @@ def _normalise_blur(blur):
     if blur is None or blur is True or blur is False:
         return blur
     try:
-        if len(blur) == 0:
-            # Documented as "capture this frame unmodified", so it must
-            # not drag in fastgrab.effects. Only a sized container can be
-            # checked without consuming it; an empty generator still
-            # imports, which is a fair price for not eating its contents.
-            return ()
+        regions = tuple(blur)
     except TypeError:
-        pass
+        raise TypeError(
+            "blur must be None, True, False, or an iterable of "
+            "(x, y, width, height); got {!r}".format(type(blur).__name__)
+        )
+    if not regions:
+        if hasattr(blur, "__next__"):
+            # An empty *iterator* is almost always one that was already
+            # consumed by an earlier call — silently capturing in the
+            # clear is exactly the failure this feature must not have.
+            # An intentional no-op is spelled [] or False.
+            raise ValueError(
+                "blur regions iterable was empty or already consumed; "
+                "pass [] or False to capture unmodified, and store a "
+                "list rather than a generator to reuse regions"
+            )
+        # A genuinely empty list is documented as "capture unmodified",
+        # so it must not drag in fastgrab.effects. Materialising first
+        # (the iterable is consumed either way) is what lets this be
+        # decided before the import.
+        return ()
     from fastgrab.effects import _normalise_regions
-    return _normalise_regions(blur)
+    return _normalise_regions(regions)
 
 
 class Screenshot(object):

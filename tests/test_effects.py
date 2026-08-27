@@ -567,3 +567,60 @@ def test_steady_state_allocates_no_per_region_work_buffers(method):
         "{} allocation scales with the region: {:.0f} KiB -> {:.0f} KiB"
         .format(method, small / 1024.0, large / 1024.0)
     )
+
+
+# --------------------------------------------------------------------
+# Scratch equivalence and bounding (restored — an earlier edit in this
+# branch dropped these three when rewriting an adjacent block)
+# --------------------------------------------------------------------
+
+def test_blur_regions_returns_the_same_array_object():
+    img = _noise(8, 8, seed=9)
+    assert blur_regions(img, None, BlurStyle(method="fill")) is img
+
+
+@pytest.mark.parametrize("style", [
+    BlurStyle(method="gaussian", radius=4),
+    BlurStyle(method="box", radius=6),
+    BlurStyle(method="pixelate", block=5),
+])
+def test_scratch_reuse_does_not_change_the_result(style):
+    """The reused work buffers must be an optimisation, nothing more."""
+    regions = [(3, 3, 20, 14)]
+    a = _noise(24, 30, seed=10)
+    b = a.copy()
+    scratch = {}
+    # Prime the scratch dict with a different shape first, so the second
+    # call exercises both reuse and a fresh allocation.
+    blur_regions(_noise(12, 12, seed=11), None, style, scratch=scratch)
+    blur_regions(a, regions, style, scratch=scratch)
+    blur_regions(b, regions, style)
+    assert (a == b).all()
+
+
+def test_scratch_dict_stays_bounded():
+    """A caller blurring a different size every frame must not grow it."""
+    style = BlurStyle(radius=2)
+    scratch = {}
+    for size in range(4, 60):
+        blur_regions(_noise(size, size, seed=size), None, style,
+                     scratch=scratch)
+    assert len(scratch) <= 32
+
+
+def test_scratch_dict_stays_bounded_for_pixelate():
+    style = BlurStyle(method="pixelate", block=4)
+    scratch = {}
+    for size in range(8, 60):
+        blur_regions(_noise(size, size, seed=size), None, style,
+                     scratch=scratch)
+    assert len(scratch) <= 32
+
+
+def test_exhausted_region_iterator_raises_instead_of_doing_nothing():
+    """A generator reused across calls would silently stop redacting."""
+    img = _noise(16, 16, seed=12)
+    gen = (r for r in [(0, 0, 4, 4)])
+    blur_regions(img, gen, BlurStyle(method="fill", color=(1, 2, 3)))
+    with pytest.raises(ValueError, match="empty or already consumed"):
+        blur_regions(img, gen, BlurStyle(method="fill", color=(1, 2, 3)))
