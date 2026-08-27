@@ -636,6 +636,27 @@ def test_recorder_forwards_blur_to_its_screenshot():
 
 
 @pytest.mark.skipif(not _x11_available(), reason="needs X11 DISPLAY")
+def test_recorder_blur_can_be_changed_after_construction():
+    """Regression: rec.blur was a copy, so updates never reached recording."""
+    rec = Recorder(
+        output_path="/tmp/unused.mp4", bbox=(0, 0, 64, 48), backend="x11",
+    )
+    assert rec.blur is None
+
+    rec.blur = [(0, 0, 16, 16)]
+    rec.blur_style = BlurStyle(method="fill", color=(7, 11, 13))
+    assert rec._grab.blur == ((0, 0, 16, 16),)
+    assert rec._grab.blur_style is rec.blur_style
+
+    frame = rec._grab.capture(bbox=(0, 0, 64, 48))
+    assert (frame[0:16, 0:16, 0] == 7).all()
+
+    # And the setter validates, like the constructor does.
+    with pytest.raises(ValueError):
+        rec.blur = [(0, 0, 0, 16)]
+
+
+@pytest.mark.skipif(not _x11_available(), reason="needs X11 DISPLAY")
 def test_recorder_frames_are_redacted_before_overlays():
     """The frame handed to the encoder must already be blurred."""
     rec = Recorder(

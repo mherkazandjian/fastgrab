@@ -111,10 +111,25 @@ class BlurStyle:
                 "a pixelate block of {} leaves the region unchanged; use 2 "
                 "or more".format(self.block)
             )
-        color = tuple(int(c) for c in self.color)
+        try:
+            color = tuple(self.color)
+        except TypeError:
+            raise ValueError(
+                "blur colour must be a (B, G, R) tuple, got {!r}".format(
+                    self.color
+                )
+            )
         if len(color) != 3:
             raise ValueError(
                 "blur colour must be a (B, G, R) tuple, got {!r}".format(
+                    self.color
+                )
+            )
+        try:
+            color = tuple(int(c) for c in color)
+        except (TypeError, ValueError):
+            raise ValueError(
+                "blur colour values must be integers, got {!r}".format(
                     self.color
                 )
             )
@@ -126,6 +141,51 @@ class BlurStyle:
             )
         # Frozen, so normalising the colour needs the back door.
         object.__setattr__(self, "color", color)
+
+
+def _normalise_regions(regions):
+    """Validate an iterable of rectangles and materialise it into a tuple.
+
+    Shared by :func:`blur_regions` and
+    :func:`fastgrab.screenshot._normalise_blur` so the low-level entry
+    point is no less strict than the capture API.
+
+    Materialising matters because a caller can reasonably pass a
+    generator, and a stored one-shot iterable would redact one frame and
+    silently leave every later one in the clear. Empty and fractional
+    rectangles raise rather than being skipped: an empty rectangle looks
+    like a real target to the caller but covers nothing, and truncating a
+    fractional origin can shift the box off a sliver of what it was meant
+    to hide. Rectangles that merely fall outside the frame are a
+    different matter — those are clipped away silently by :func:`_clip`,
+    because a screen-absolute region legitimately misses a sub-region
+    capture.
+    """
+    out = []
+    for region in regions:
+        values = tuple(region)
+        if len(values) != 4:
+            raise ValueError(
+                "blur regions must be (x, y, width, height); got "
+                "{!r}".format(region)
+            )
+        whole = []
+        for value in values:
+            as_int = int(value)
+            if as_int != value:
+                raise ValueError(
+                    "blur region coordinates must be whole pixels; got {!r}"
+                    " — round them yourself so the rectangle lands where "
+                    "you meant".format(region)
+                )
+            whole.append(as_int)
+        if whole[2] <= 0 or whole[3] <= 0:
+            raise ValueError(
+                "blur region width and height must be positive; got "
+                "{!r}".format(region)
+            )
+        out.append(tuple(whole))
+    return tuple(out)
 
 
 def _scratch_get(scratch, name, shape, dtype=numpy.float32):
@@ -459,29 +519,24 @@ def blur_regions(img, regions=None, style=None, origin=(0, 0),
     """
     if style is None:
         style = BlurStyle()
-    if regions is None:
-        regions = [(0, 0, img.shape[1], img.shape[0])]
-        origin = (0, 0)
+    elif not isinstance(style, BlurStyle):
+        # Duck-typed styles are allowed, but they get the full BlurStyle
+        # validation rather than a subset of it — a loose style with
+        # passes=0 or a colour that is really an image would otherwise
+        # return the frame untouched and look like a successful redaction.
+        style = BlurStyle(
+            method=getattr(style, "method", "box"),
+            radius=getattr(style, "radius", DEFAULT_RADIUS),
+            block=getattr(style, "block", DEFAULT_BLOCK),
+            passes=getattr(style, "passes", DEFAULT_PASSES),
+            color=getattr(style, "color", DEFAULT_FILL_COLOR),
+        )
 
-    # Revalidate here rather than trusting construction: blur_regions
-    # accepts any object with these attributes, and an identity setting
-    # that quietly returns the frame untouched is how redaction leaks.
-    if style.method not in BLUR_METHODS:
-        raise ValueError(
-            "unknown blur method {!r}; expected one of {}".format(
-                style.method, ", ".join(BLUR_METHODS)
-            )
-        )
-    if style.method in ("box", "gaussian") and style.radius < 1:
-        raise ValueError(
-            "a {} blur of radius {} would leave the region "
-            "unchanged".format(style.method, style.radius)
-        )
-    if style.method == "pixelate" and style.block < 2:
-        raise ValueError(
-            "a pixelate block of {} would leave the region "
-            "unchanged".format(style.block)
-        )
+    if regions is None:
+        regions = ((0, 0, img.shape[1], img.shape[0]),)
+        origin = (0, 0)
+    else:
+        regions = _normalise_regions(regions)
 
     for region in regions:
         box = _clip(region, img.shape, origin)

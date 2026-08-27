@@ -309,3 +309,21 @@ def test_fractional_blur_coordinates_raise(region):
 def test_integral_floats_are_accepted():
     grab = _stub_grab(blur=[(10.0, 10.0, 20.0, 20.0)], blur_style=_fill_style())
     assert grab.blur == ((10, 10, 20, 20),)
+
+
+def test_a_rejected_blur_override_does_not_clear_the_previous_frame():
+    """Regression: the backend overwrote the shared buffer before validating.
+
+    capture() hands back its internal buffer, so validating the override
+    after the backend wrote into it turned a caller's previously redacted
+    frame into a clear capture — via the very call that raised.
+    """
+    grab = _stub_grab(blur=True, blur_style=_fill_style())
+    frame = grab.capture()
+    assert (frame[..., 0] == _MARKER[0]).all()
+
+    with pytest.raises(ValueError):
+        grab.capture(blur=[(0, 0, 0, 10)])
+
+    # Same buffer object; it must still hold the redacted frame.
+    assert (frame[..., 0] == _MARKER[0]).all()

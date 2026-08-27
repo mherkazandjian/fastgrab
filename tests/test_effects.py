@@ -221,11 +221,40 @@ def test_partially_offscreen_region_is_clipped_at_the_origin():
     assert (img[3:, 3:, B] == 50).all()
 
 
-def test_zero_sized_regions_are_skipped():
+@pytest.mark.parametrize("region", [
+    (2, 2, 0, 5), (2, 2, 5, 0), (2, 2, -3, 5),
+])
+def test_zero_sized_regions_raise_rather_than_being_skipped(region):
+    """An empty rectangle looks like a real target but covers nothing.
+
+    Silently skipping it let blur_regions return successfully with the
+    frame untouched — a redaction the caller believes happened.
+    """
+    img = _noise(12, 12, seed=7)
+    with pytest.raises(ValueError, match="positive"):
+        blur_regions(img, [region], BlurStyle(method="fill"))
+
+
+def test_fractional_regions_raise_at_the_core_entry_point():
+    img = _noise(12, 12, seed=7)
+    with pytest.raises(ValueError, match="whole pixels"):
+        blur_regions(img, [(2, 2, 0.4, 5)], BlurStyle(method="fill"))
+
+
+def test_regions_outside_the_frame_are_still_skipped_silently():
+    """Clipping is not malformed input: a screen-absolute region may
+    legitimately miss a sub-region capture."""
     img = _noise(12, 12, seed=7)
     before = img.copy()
-    blur_regions(img, [(2, 2, 0, 5), (2, 2, 5, 0)], BlurStyle(method="fill"))
+    blur_regions(img, [(100, 100, 5, 5)], BlurStyle(method="fill"))
     assert (img == before).all()
+
+
+def test_core_entry_point_materialises_a_generator():
+    img = _noise(12, 12, seed=7)
+    blur_regions(img, (r for r in [(0, 0, 4, 4)]),
+                 BlurStyle(method="fill", color=(1, 2, 3)))
+    assert (img[0:4, 0:4, B] == 1).all()
 
 
 def test_origin_translates_screen_coordinates_into_the_frame():
@@ -291,6 +320,9 @@ class _LooseStyle:
     (_LooseStyle(method="gaussian", radius=0), "unchanged"),
     (_LooseStyle(method="pixelate", block=1), "unchanged"),
     (_LooseStyle(method="swirl"), "unknown blur method"),
+    (_LooseStyle(method="gaussian", passes=0), "passes"),
+    (_LooseStyle(method="fill", color=(1, 2)), "B, G, R"),
+    (_LooseStyle(method="fill", color=300), "B, G, R"),
 ])
 def test_blur_regions_rejects_an_identity_or_unknown_style(style, match):
     """blur_regions revalidates: it must never quietly return the frame.
@@ -374,7 +406,11 @@ def test_pixelate_tiles_hold_the_correct_mean():
 
 
 def test_gaussian_variance_tracks_the_requested_radius():
-    """The pass decomposition must not overshoot the requested strength."""
+    """Combined variance must stay inside a symmetric envelope.
+
+    Not "never stronger": integer radii cannot hit the target exactly, so
+    the result may land up to a quarter either side of it.
+    """
     from fastgrab.effects import _pass_radii
 
     for radius in range(1, 33):
@@ -397,6 +433,19 @@ def test_gaussian_radius_one_does_not_triple_the_strength():
     from fastgrab.effects import _pass_radii
 
     assert _pass_radii(1, 3) == [1]
+
+
+def test_pass_radii_compares_both_integer_neighbours():
+    """Regression: rounding the ideal radius dropped a pass unnecessarily.
+
+    At radius 19 over 24 passes the rounded radius (4) sits outside the
+    tolerance envelope while its floor (3) sits inside, so rounding gave
+    23 passes where 24 fit. Picking by variance rather than by proximity
+    keeps them.
+    """
+    from fastgrab.effects import _pass_radii
+
+    assert _pass_radii(19, 24) == [3] * 24
 
 
 # --------------------------------------------------------------------

@@ -59,13 +59,33 @@ class Recorder:
         self.cursor_scale = cursor_scale
         self.subtitles = subtitles
         self.subtitle_style = subtitle_style
-        self.blur = blur
-        self.blur_style = blur_style
         # Blurring is delegated to Screenshot so the frame arrives
         # already redacted and the capture loop below stays unchanged.
+        # self.blur / self.blur_style are properties onto that Screenshot
+        # rather than copies: plain attributes here would let
+        # ``rec.blur = [...]`` after construction look like it had taken
+        # effect while the recording still used the original setting.
         self._grab = Screenshot(
             backend=backend, blur=blur, blur_style=blur_style
         )
+
+    @property
+    def blur(self):
+        """Regions obscured in every recorded frame; see :class:`Screenshot`."""
+        return self._grab.blur
+
+    @blur.setter
+    def blur(self, value):
+        self._grab.blur = value
+
+    @property
+    def blur_style(self):
+        """The :class:`fastgrab.effects.BlurStyle` used for :attr:`blur`."""
+        return self._grab.blur_style
+
+    @blur_style.setter
+    def blur_style(self, value):
+        self._grab.blur_style = value
 
     def _resolved_bbox(self):
         if self.bbox is not None:

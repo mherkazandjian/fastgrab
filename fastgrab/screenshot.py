@@ -10,44 +10,16 @@ def _normalise_blur(blur):
     """Validate blur regions and materialise them into a tuple.
 
     ``blur`` is ``None`` / ``True`` / ``False`` or an iterable of
-    ``(x, y, width, height)``. Materialising matters: a caller can
-    reasonably pass a generator or a ``map(...)``, and a stored one-shot
-    iterable would redact the first capture and then silently leave every
-    later frame in the clear — the worst way for a redaction feature to
-    fail. Malformed regions raise here rather than being skipped later,
-    for the same reason.
+    ``(x, y, width, height)``. The rectangle checks live in
+    :func:`fastgrab.effects._normalise_regions` so that the low-level
+    entry point enforces exactly the same rules; importing it here is
+    still lazy, because only a caller who passed actual regions reaches
+    that line.
     """
     if blur is None or blur is True or blur is False:
         return blur
-    regions = []
-    for region in blur:
-        values = tuple(region)
-        if len(values) != 4:
-            raise ValueError(
-                "blur regions must be (x, y, width, height); got {!r}".format(
-                    region
-                )
-            )
-        whole = []
-        for value in values:
-            as_int = int(value)
-            if as_int != value:
-                raise ValueError(
-                    "blur region coordinates must be whole pixels; got {!r}"
-                    " — round them yourself so the rectangle lands where "
-                    "you meant".format(region)
-                )
-            whole.append(as_int)
-        if whole[2] <= 0 or whole[3] <= 0:
-            # An empty rectangle would be stored as a real target and then
-            # silently clipped away, leaving the caller believing the
-            # region was redacted.
-            raise ValueError(
-                "blur region width and height must be positive; got "
-                "{!r}".format(region)
-            )
-        regions.append(tuple(whole))
-    return tuple(regions)
+    from fastgrab.effects import _normalise_regions
+    return _normalise_regions(blur)
 
 
 class Screenshot(object):
@@ -163,6 +135,13 @@ class Screenshot(object):
          BGRA byte order.
         """
 
+        # Resolve the blur first: capture() hands back the reused
+        # internal buffer, so if an invalid override raised *after* the
+        # backend had written into it, a caller still holding a redacted
+        # frame from the previous call would find it turned into a clear
+        # capture by the very call that failed.
+        regions = self.blur if blur is None else _normalise_blur(blur)
+
         # check/set the dimensions of the image that will be captured
         if bbox is None:
             width, height = self.screensize
@@ -188,7 +167,6 @@ class Screenshot(object):
 
         self._backend.screenshot(bbox[0], bbox[1], self._img)
 
-        regions = self.blur if blur is None else _normalise_blur(blur)
         if regions:
             # Imported here rather than at module level so a capture that
             # never blurs doesn't pay to import the module at all.
