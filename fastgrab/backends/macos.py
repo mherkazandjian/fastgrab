@@ -9,6 +9,10 @@ V1 captures from the **main** display only (``CGMainDisplayID``).
 Multi-display capture via ``CGGetActiveDisplayList`` is a future
 ``Screenshot(display=N)`` extension.
 
+**Coordinates are device pixels**, matching X11 and wlr, and so are
+``bbox`` rectangles: a 2x panel with an 1800x1169-point desktop reports
+and captures 3600x2338.
+
 Byte order matches the rest of fastgrab: ``CGDisplayCreateImage``
 returns 32-bit-per-pixel little-endian BGRA on both Intel and Apple
 Silicon, so the captured numpy array is BGRA — same contract as X11
@@ -36,6 +40,28 @@ _K_CG_BITMAP_BYTE_ORDER_MASK = 0x7000
 _K_CG_BITMAP_BYTE_ORDER_32_LITTLE = 2 << 12  # kCGBitmapByteOrder32Little
 
 
+def _snap_rect_to_points(x, y, w, h, pixel_w, pixel_h, point_w, point_h):
+    """Map a device-pixel rect to the whole-point rect containing it.
+
+    ``CGDisplayCreateImageForRect`` takes points but returns pixels, and
+    rounds a fractional rect *outward* — 400.5 points yields 802 pixels,
+    not 801 — so round outward ourselves.
+
+    Returns ``(pt_x, pt_y, pt_w, pt_h, off_x, off_y)``: the rect to ask
+    for, in points, and the pixel offset of the requested region inside
+    the returned image.
+    """
+    pt_x0 = (x * point_w) // pixel_w
+    pt_y0 = (y * point_h) // pixel_h
+    pt_x1 = -((-(x + w) * point_w) // pixel_w)
+    pt_y1 = -((-(y + h) * point_h) // pixel_h)
+    return (
+        pt_x0, pt_y0, pt_x1 - pt_x0, pt_y1 - pt_y0,
+        x - (pt_x0 * pixel_w) // point_w,
+        y - (pt_y0 * pixel_h) // point_h,
+    )
+
+
 def _load_frameworks():
     cg_path = ctypes.util.find_library("CoreGraphics")
     cf_path = ctypes.util.find_library("CoreFoundation")
@@ -54,10 +80,19 @@ def _load_frameworks():
     cg.CGMainDisplayID.argtypes = []
     cg.CGMainDisplayID.restype = ctypes.c_uint32
 
-    cg.CGDisplayPixelsWide.argtypes = [ctypes.c_uint32]
-    cg.CGDisplayPixelsWide.restype = ctypes.c_size_t
-    cg.CGDisplayPixelsHigh.argtypes = [ctypes.c_uint32]
-    cg.CGDisplayPixelsHigh.restype = ctypes.c_size_t
+    cg.CGDisplayCopyDisplayMode.argtypes = [ctypes.c_uint32]
+    cg.CGDisplayCopyDisplayMode.restype = ctypes.c_void_p
+
+    cg.CGDisplayModeGetWidth.argtypes = [ctypes.c_void_p]
+    cg.CGDisplayModeGetWidth.restype = ctypes.c_size_t
+    cg.CGDisplayModeGetHeight.argtypes = [ctypes.c_void_p]
+    cg.CGDisplayModeGetHeight.restype = ctypes.c_size_t
+    cg.CGDisplayModeGetPixelWidth.argtypes = [ctypes.c_void_p]
+    cg.CGDisplayModeGetPixelWidth.restype = ctypes.c_size_t
+    cg.CGDisplayModeGetPixelHeight.argtypes = [ctypes.c_void_p]
+    cg.CGDisplayModeGetPixelHeight.restype = ctypes.c_size_t
+    cg.CGDisplayModeRelease.argtypes = [ctypes.c_void_p]
+    cg.CGDisplayModeRelease.restype = None
 
     class CGPoint(ctypes.Structure):
         _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
@@ -116,24 +151,45 @@ class MacosBackend(BaseBackend):
 
     # -------- BaseBackend API --------
 
+    def _display_geometry(self):
+        """Return ``(pixel_w, pixel_h, point_w, point_h)``, read fresh
+        each call so a mode switch is picked up on the next capture.
+        """
+        mode = self._cg.CGDisplayCopyDisplayMode(self._display)
+        if not mode:
+            raise RuntimeError("CGDisplayCopyDisplayMode returned NULL")
+        try:
+            return (
+                int(self._cg.CGDisplayModeGetPixelWidth(mode)),
+                int(self._cg.CGDisplayModeGetPixelHeight(mode)),
+                int(self._cg.CGDisplayModeGetWidth(mode)),
+                int(self._cg.CGDisplayModeGetHeight(mode)),
+            )
+        finally:
+            # Core Foundation *copy* rule: we own the +1 reference.
+            self._cg.CGDisplayModeRelease(mode)
+
     def resolution(self):
-        w = self._cg.CGDisplayPixelsWide(self._display)
-        h = self._cg.CGDisplayPixelsHigh(self._display)
-        return (int(w), int(h))
+        pixel_w, pixel_h, _, _ = self._display_geometry()
+        return (pixel_w, pixel_h)
 
     def bytes_per_pixel(self):
         return 4
 
     def screenshot(self, x, y, img):
         h, w, _ = img.shape
-        full_w, full_h = self.resolution()
+        pixel_w, pixel_h, point_w, point_h = self._display_geometry()
 
-        if x == 0 and y == 0 and w == full_w and h == full_h:
+        if x == 0 and y == 0 and w == pixel_w and h == pixel_h:
             image = self._cg.CGDisplayCreateImage(self._display)
+            off_x = off_y = 0
         else:
+            pt_x, pt_y, pt_w, pt_h, off_x, off_y = _snap_rect_to_points(
+                x, y, w, h, pixel_w, pixel_h, point_w, point_h
+            )
             rect = self._CGRect(
-                origin=self._CGPoint(x=float(x), y=float(y)),
-                size=self._CGSize(width=float(w), height=float(h)),
+                origin=self._CGPoint(x=float(pt_x), y=float(pt_y)),
+                size=self._CGSize(width=float(pt_w), height=float(pt_h)),
             )
             image = self._cg.CGDisplayCreateImageForRect(self._display, rect)
         if not image:
@@ -164,10 +220,10 @@ class MacosBackend(BaseBackend):
             row_stride = self._cg.CGImageGetBytesPerRow(image)
             img_w = self._cg.CGImageGetWidth(image)
             img_h = self._cg.CGImageGetHeight(image)
-            if img_w != w or img_h != h:
+            if img_w < off_x + w or img_h < off_y + h:
                 raise RuntimeError(
-                    "CGImage size {}x{} does not match requested {}x{}; "
-                    "Retina scale-factor mismatch?".format(img_w, img_h, w, h)
+                    "CGImage {}x{} too small for a {}x{} region at "
+                    "offset {},{}".format(img_w, img_h, w, h, off_x, off_y)
                 )
 
             provider = self._cg.CGImageGetDataProvider(image)
@@ -180,16 +236,17 @@ class MacosBackend(BaseBackend):
                 if not src_ptr:
                     raise RuntimeError("CFDataGetBytePtr returned NULL")
                 dst_ptr = img.ctypes.data
-                if row_stride == w * 4:
+                base = src_ptr + off_y * row_stride + off_x * 4
+                if off_x == 0 and row_stride == w * 4:
                     # Tightly packed — single memmove.
-                    ctypes.memmove(dst_ptr, src_ptr, w * h * 4)
+                    ctypes.memmove(dst_ptr, base, w * h * 4)
                 else:
-                    # Stride padding (Apple often aligns to 16 bytes) —
-                    # copy row by row.
+                    # Stride padding (Apple often aligns to 16 bytes) or
+                    # a snapped left edge — copy row by row.
                     for row in range(h):
                         ctypes.memmove(
                             dst_ptr + row * w * 4,
-                            src_ptr + row * row_stride,
+                            base + row * row_stride,
                             w * 4,
                         )
             finally:
