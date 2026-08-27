@@ -6,6 +6,32 @@ import numpy
 from fastgrab.backends import _resolve_backend
 
 
+def _normalise_blur(blur):
+    """Validate blur regions and materialise them into a tuple.
+
+    ``blur`` is ``None`` / ``True`` / ``False`` or an iterable of
+    ``(x, y, width, height)``. Materialising matters: a caller can
+    reasonably pass a generator or a ``map(...)``, and a stored one-shot
+    iterable would redact the first capture and then silently leave every
+    later frame in the clear — the worst way for a redaction feature to
+    fail. Malformed regions raise here rather than being skipped later,
+    for the same reason.
+    """
+    if blur is None or blur is True or blur is False:
+        return blur
+    regions = []
+    for region in blur:
+        values = tuple(int(v) for v in region)
+        if len(values) != 4:
+            raise ValueError(
+                "blur regions must be (x, y, width, height); got {!r}".format(
+                    region
+                )
+            )
+        regions.append(values)
+    return tuple(regions)
+
+
 class Screenshot(object):
     """
     Main object that captures screenshots and provides other utilities
@@ -36,15 +62,15 @@ class Screenshot(object):
         self._img = None
         """The buffer where the captured image is stored"""
 
-        self.blur = blur
+        self.blur = _normalise_blur(blur)
         """Default blur regions applied by capture(), or None"""
 
         self.blur_style = blur_style
         """effects.BlurStyle used for self.blur, or None for the defaults"""
 
         self._blur_scratch = {}
-        """Reused float32 work buffers, so blurring a fixed region in a
-        capture loop settles into zero allocations per frame"""
+        """Work buffers reused across captures by fastgrab.effects, so a
+        capture loop blurring a fixed region stops reallocating them"""
 
     @property
     def screensize(self) -> tuple:
@@ -130,7 +156,7 @@ class Screenshot(object):
 
         self._backend.screenshot(bbox[0], bbox[1], self._img)
 
-        regions = self.blur if blur is None else blur
+        regions = self.blur if blur is None else _normalise_blur(blur)
         if regions:
             # Imported here rather than at module level so a capture that
             # never blurs doesn't pay to import the module at all.

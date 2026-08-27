@@ -570,16 +570,51 @@ def test_cli_without_blur_passes_nothing(monkeypatch):
 
 
 def test_cli_blur_style_built_from_flags(monkeypatch):
-    kwargs = _run_cli(monkeypatch, [
+    style = _run_cli(monkeypatch, [
         "--fullscreen", "-o", "x.mp4", "--blur-all",
         "--blur-method", "fill", "--blur-color", "1,2,3",
-        "--blur-radius", "7", "--blur-block", "9",
-    ])
-    style = kwargs["blur_style"]
+    ])["blur_style"]
     assert style.method == "fill"
     assert style.color == (1, 2, 3)
+
+    style = _run_cli(monkeypatch, [
+        "--fullscreen", "-o", "x.mp4", "--blur", "0,0,80,40",
+        "--blur-method", "gaussian", "--blur-radius", "7",
+    ])["blur_style"]
+    assert style.method == "gaussian"
     assert style.radius == 7
+
+    style = _run_cli(monkeypatch, [
+        "--fullscreen", "-o", "x.mp4", "--blur", "0,0,80,40",
+        "--blur-method", "pixelate", "--blur-block", "9",
+    ])["blur_style"]
+    assert style.method == "pixelate"
     assert style.block == 9
+
+
+@pytest.mark.parametrize("flags,ignored", [
+    (["--blur-color", "0,0,0"], "--blur-color"),
+    (["--blur-method", "box", "--blur-block", "8"], "--blur-block"),
+    (["--blur-method", "fill", "--blur-radius", "4"], "--blur-radius"),
+    (["--blur-method", "pixelate", "--blur-radius", "4"], "--blur-radius"),
+])
+def test_cli_rejects_options_the_method_would_ignore(flags, ignored, capsys):
+    """--blur-color with a box blur must not quietly leave a blur behind."""
+    with pytest.raises(SystemExit):
+        recording_cli.main(["--fullscreen", "-o", "x.mp4", "--blur-all"]
+                           + flags)
+    err = capsys.readouterr().err
+    assert ignored in err
+    assert "silently ignored" in err
+
+
+def test_cli_rejects_a_pixelate_block_that_changes_nothing(capsys):
+    with pytest.raises(SystemExit):
+        recording_cli.main([
+            "--fullscreen", "-o", "x.mp4", "--blur-all",
+            "--blur-method", "pixelate", "--blur-block", "1",
+        ])
+    assert "leaves the region unchanged" in capsys.readouterr().err
 
 
 def test_cli_rejects_unknown_blur_method():
@@ -596,7 +631,7 @@ def test_recorder_forwards_blur_to_its_screenshot():
         output_path="/tmp/unused.mp4", bbox=(0, 0, 64, 48), backend="x11",
         blur=[(0, 0, 10, 10)], blur_style=style,
     )
-    assert rec._grab.blur == [(0, 0, 10, 10)]
+    assert rec._grab.blur == ((0, 0, 10, 10),)
     assert rec._grab.blur_style is style
 
 

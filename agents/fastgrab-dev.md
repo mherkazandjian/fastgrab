@@ -279,8 +279,12 @@ are no release/publish steps in CI.
 ### Add a frame effect (blur-like, pure numpy)
 
 1. Implement it in `fastgrab/effects.py` operating **in place on a view**
-   (`img[y0:y1, x0:x1, :3]`) — no full-frame copy, no per-frame
-   allocation; take the optional `scratch` dict for reusable work arrays.
+   (`img[y0:y1, x0:x1, :3]`) — no full-frame copy; take the optional
+   `scratch` dict for reusable work arrays so a capture loop allocates no
+   work buffer per frame. Two numpy traps to know: `numpy.take(out=...)`
+   allocates a full-size temporary unless you pass `mode="clip"`, and any
+   ufunc writing into a *strided* output view costs numpy's fixed ~100 KiB
+   iteration buffer (constant, not proportional to the region).
 2. Add it to `BLUR_METHODS` (or a sibling tuple), validate in
    `__post_init__`, and keep it numpy-only: a new runtime dep here would
    tax the default wheel.

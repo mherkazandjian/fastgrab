@@ -19,13 +19,41 @@ B, G, R, A = 0, 1, 2, 3
 BLUR_ONLY = [m for m in BLUR_METHODS if m != "fill"]
 
 
-def _noise(h, w, seed=0, alpha=255):
-    """A random BGRA frame with a fixed, non-uniform alpha channel."""
+def _noise(h, w, seed=0, alpha=None):
+    """A random BGRA frame.
+
+    ``alpha=None`` fills the alpha channel with a varying pattern rather
+    than a constant, so "the blur leaves alpha alone" is checked against
+    something a stray write would actually disturb.
+    """
     rng = numpy.random.default_rng(seed)
     img = numpy.empty((h, w, 4), numpy.uint8)
     img[..., :3] = rng.integers(0, 256, (h, w, 3), dtype=numpy.uint8)
-    img[..., A] = alpha
+    if alpha is None:
+        img[..., A] = rng.integers(0, 256, (h, w), dtype=numpy.uint8)
+    else:
+        img[..., A] = alpha
     return img
+
+
+def _reference_box(plane, radius):
+    """Brute-force box blur of a 2-D uint8 plane, clamped at the edges.
+
+    Deliberately written as slow nested loops over explicit window
+    bounds: it shares no code with the cumsum implementation, so it can
+    catch an off-by-one that a self-consistent test would not.
+    """
+    h, w = plane.shape
+    src = plane.astype(numpy.float64)
+    horizontal = numpy.empty((h, w), numpy.float64)
+    for x in range(w):
+        lo, hi = max(x - radius, 0), min(x + radius + 1, w)
+        horizontal[:, x] = src[:, lo:hi].mean(axis=1)
+    out = numpy.empty((h, w), numpy.float64)
+    for y in range(h):
+        lo, hi = max(y - radius, 0), min(y + radius + 1, h)
+        out[y, :] = horizontal[lo:hi, :].mean(axis=0)
+    return out
 
 
 # --------------------------------------------------------------------
@@ -78,9 +106,10 @@ def test_constant_region_survives_every_method(method):
 
 @pytest.mark.parametrize("method", BLUR_METHODS)
 def test_alpha_channel_is_never_touched(method):
-    img = _noise(24, 32, alpha=123)
+    img = _noise(24, 32, seed=12)
+    before = img[..., A].copy()
     blur_regions(img, [(4, 4, 16, 12)], BlurStyle(method=method))
-    assert (img[..., A] == 123).all()
+    assert (img[..., A] == before).all()
 
 
 @pytest.mark.parametrize("method", BLUR_ONLY)
@@ -213,12 +242,32 @@ def test_origin_translates_screen_coordinates_into_the_frame():
 # No-ops, return value, scratch reuse
 # --------------------------------------------------------------------
 
-@pytest.mark.parametrize("style", [
-    BlurStyle(method="box", radius=0),
-    BlurStyle(method="gaussian", radius=0),
-    BlurStyle(method="pixelate", block=1),
+@pytest.mark.parametrize("kwargs", [
+    {"method": "box", "radius": 0},
+    {"method": "gaussian", "radius": 0},
+    {"method": "pixelate", "block": 1},
 ])
-def test_degenerate_settings_leave_the_frame_alone(style):
+def test_identity_settings_are_rejected_not_silently_ignored(kwargs):
+    """A style that leaves pixels readable is the failure mode that leaks."""
+    with pytest.raises(ValueError, match="unchanged"):
+        BlurStyle(**kwargs)
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"method": "fill", "radius": 0},
+    {"method": "fill", "block": 1},
+    {"method": "box", "block": 1},
+    {"method": "pixelate", "radius": 0},
+])
+def test_values_irrelevant_to_the_method_are_left_alone(kwargs):
+    """Only the settings the chosen method actually reads are validated."""
+    BlurStyle(**kwargs)
+
+
+def test_blur_regions_still_no_ops_on_a_mutated_style():
+    """The guard inside blur_regions survives a style mutated after init."""
+    style = BlurStyle(method="box", radius=4)
+    style.radius = 0
     img = _noise(16, 16, seed=8)
     before = img.copy()
     blur_regions(img, None, style)
@@ -252,3 +301,167 @@ def test_scratch_dict_stays_bounded():
         blur_regions(_noise(size, size, seed=size), None, style,
                      scratch=scratch)
     assert len(scratch) <= 32
+
+
+# --------------------------------------------------------------------
+# Exact numerical oracles — the cumsum implementation checked against a
+# brute-force reference rather than against itself
+# --------------------------------------------------------------------
+
+@pytest.mark.parametrize("shape,radius", [
+    ((9, 11), 1),      # interior + head + tail all exercised
+    ((9, 11), 3),
+    ((8, 8), 4),       # 2*radius == n, the gather fallback on both axes
+    ((8, 8), 7),       # kernel far wider than the region
+    ((1, 12), 2),      # single row: fallback on y, sliced path on x
+    ((12, 1), 2),      # single column: the mirror case
+    ((5, 5), 2),       # 2*radius == n - 1, the tightest sliced case
+])
+def test_box_blur_matches_a_brute_force_reference(shape, radius):
+    img = _noise(shape[0], shape[1], seed=sum(shape) + radius)
+    expected = numpy.stack(
+        [_reference_box(img[..., c], radius) for c in range(3)], axis=-1
+    )
+    blur_regions(img, None, BlurStyle(method="box", radius=radius))
+    # Both round the same way; allow one unit for float32 vs float64.
+    assert numpy.abs(
+        img[..., :3].astype(numpy.int32) - numpy.floor(expected + 0.5)
+    ).max() <= 1
+
+
+def test_pixelate_tiles_hold_the_correct_mean():
+    """Ragged edge tiles must average their own pixels, not a padded block."""
+    img = _noise(10, 7, seed=21)
+    before = img[..., :3].astype(numpy.float64).copy()
+    blur_regions(img, None, BlurStyle(method="pixelate", block=4))
+    for y0, y1 in ((0, 4), (4, 8), (8, 10)):
+        for x0, x1 in ((0, 4), (4, 7)):
+            expected = before[y0:y1, x0:x1].mean(axis=(0, 1))
+            got = img[y0:y1, x0:x1, :3]
+            assert (got == got[0, 0]).all(), "tile is not uniform"
+            assert numpy.abs(
+                got[0, 0].astype(numpy.float64) - numpy.floor(expected + 0.5)
+            ).max() <= 1
+
+
+def test_gaussian_variance_tracks_the_requested_radius():
+    """The pass decomposition must not overshoot the requested strength."""
+    from fastgrab.effects import _pass_radii
+
+    for radius in range(1, 33):
+        for passes in (1, 2, 3, 5):
+            radii = _pass_radii(radius, passes)
+            assert radii, "no passes produced"
+            assert all(r >= 1 for r in radii)
+            assert len(radii) <= passes
+            target = ((2 * radius + 1) ** 2 - 1) / 12.0
+            got = sum((2 * r + 1) ** 2 - 1 for r in radii) / 12.0
+            assert abs(got - target) <= 0.25 * target, (
+                "radius={} passes={} -> {} (variance {} vs {})".format(
+                    radius, passes, radii, got, target
+                )
+            )
+
+
+def test_gaussian_radius_one_does_not_triple_the_strength():
+    """Regression: flooring each pass at radius 1 made this 3x too strong."""
+    from fastgrab.effects import _pass_radii
+
+    assert _pass_radii(1, 3) == [1]
+
+
+# --------------------------------------------------------------------
+# Region clipping — non-zero origin and frame-spanning cases
+# --------------------------------------------------------------------
+
+def test_partial_overlap_with_a_nonzero_origin():
+    img = numpy.full((20, 20, 4), 50, numpy.uint8)
+    # Screen rect (95, 90, 10, 10) against a frame whose origin is
+    # (100, 100): only the bottom-right 5x0... nothing overlaps in y.
+    blur_regions(img, [(95, 90, 10, 10)],
+                 BlurStyle(method="fill", color=(9, 9, 9)),
+                 origin=(100, 100))
+    assert (img[..., B] == 50).all(), "a rect above the frame was applied"
+
+    # Now one that clips against the frame's top-left corner.
+    blur_regions(img, [(95, 95, 10, 10)],
+                 BlurStyle(method="fill", color=(9, 9, 9)),
+                 origin=(100, 100))
+    assert (img[0:5, 0:5, B] == 9).all()
+    assert (img[5:, 5:, B] == 50).all()
+
+
+def test_region_spanning_the_whole_frame_and_beyond():
+    img = _noise(12, 12, seed=31)
+    blur_regions(img, [(-50, -50, 500, 500)],
+                 BlurStyle(method="fill", color=(3, 3, 3)))
+    assert (img[..., 0:3] == 3).all()
+
+
+def test_region_touching_only_the_last_pixel():
+    img = numpy.full((10, 10, 4), 50, numpy.uint8)
+    blur_regions(img, [(9, 9, 1, 1)], BlurStyle(method="fill", color=(1, 1, 1)))
+    assert img[9, 9, B] == 1
+    assert (img[0:9, :, B] == 50).all()
+    assert (img[:, 0:9, B] == 50).all()
+
+
+# --------------------------------------------------------------------
+# Scratch reuse — that it is actually used, not merely harmless
+# --------------------------------------------------------------------
+
+def test_scratch_buffers_are_actually_reused():
+    """Guards against the scratch dict being accepted and then ignored."""
+    style = BlurStyle(method="box", radius=3)
+    regions = [(2, 2, 16, 12)]
+    scratch = {}
+    blur_regions(_noise(20, 20, seed=41), regions, style, scratch=scratch)
+    assert scratch, "nothing was cached"
+    ids_before = {key: id(val) for key, val in scratch.items()}
+    blur_regions(_noise(20, 20, seed=42), regions, style, scratch=scratch)
+    assert {key: id(val) for key, val in scratch.items()} == ids_before, (
+        "second call replaced the cached buffers instead of reusing them"
+    )
+
+
+@pytest.mark.parametrize("method", ["box", "gaussian", "pixelate"])
+def test_steady_state_allocates_no_per_region_work_buffers(method):
+    """Warm calls must not allocate a buffer that scales with the region.
+
+    Not zero bytes: numpy keeps a fixed iteration buffer for ufuncs whose
+    output is a strided view, and each call builds a few small view
+    objects. What must not happen is a work buffer proportional to the
+    region — so this measures a small and a large region and checks the
+    peak stays flat, which a per-region allocation could not do.
+    """
+    import tracemalloc
+
+    style = BlurStyle(method=method, radius=4, block=4)
+
+    def warm_peak(width, height):
+        img = _noise(height + 16, width + 16, seed=width)
+        regions = [(8, 8, width, height)]
+        scratch = {}
+        for _ in range(3):                  # warm every cached buffer
+            blur_regions(img, regions, style, scratch=scratch)
+        keys = set(scratch)
+        tracemalloc.start()
+        for _ in range(5):
+            blur_regions(img, regions, style, scratch=scratch)
+        _current, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        assert set(scratch) == keys, "the scratch dict kept growing"
+        return peak
+
+    small = warm_peak(128, 96)
+    large = warm_peak(512, 384)            # 16x the pixels
+    # One un-cached float32 plane for the large region would be 768 KiB.
+    assert large < 256 * 1024, (
+        "{} peaked at {:.0f} KiB on the large region".format(
+            method, large / 1024.0
+        )
+    )
+    assert large < small + 64 * 1024, (
+        "{} allocation scales with the region: {:.0f} KiB -> {:.0f} KiB"
+        .format(method, small / 1024.0, large / 1024.0)
+    )

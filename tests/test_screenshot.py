@@ -228,3 +228,39 @@ def test_effects_is_not_imported_until_a_blur_is_requested():
     )
     assert result.returncode == 0, result.stderr
     assert "ok" in result.stdout
+
+
+def test_blur_regions_given_as_a_generator_survive_every_capture():
+    """Regression: a one-shot iterable redacted frame 1 and nothing after.
+
+    Storing the generator meant the second capture iterated an exhausted
+    object and silently returned an unredacted frame — a redaction
+    feature failing open.
+    """
+    grab = _stub_grab(
+        blur=(r for r in [(4, 4, 8, 8)]), blur_style=_fill_style()
+    )
+    for attempt in range(3):
+        img = grab.capture()
+        assert (img[4:12, 4:12, 0] == _MARKER[0]).all(), (
+            "capture {} came back unredacted".format(attempt)
+        )
+
+
+def test_per_call_blur_generator_is_materialised_too():
+    grab = _stub_grab(blur_style=_fill_style())
+    img = grab.capture(blur=iter([(0, 0, 6, 6)]))
+    assert (img[0:6, 0:6, 0] == _MARKER[0]).all()
+
+
+def test_blur_regions_are_stored_as_plain_tuples():
+    grab = _stub_grab(blur=[[1, 2, 3, 4]], blur_style=_fill_style())
+    assert grab.blur == ((1, 2, 3, 4),)
+
+
+def test_malformed_blur_regions_raise_instead_of_being_skipped():
+    for bad in ([(1, 2, 3)], [(1, 2, 3, 4, 5)]):
+        with pytest.raises(ValueError, match="x, y, width, height"):
+            _stub_grab(blur=bad)
+    with pytest.raises(ValueError):
+        _stub_grab().capture(blur=[("a", 2, 3, 4)])

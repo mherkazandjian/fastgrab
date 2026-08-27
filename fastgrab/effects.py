@@ -59,8 +59,11 @@ class BlurStyle:
     radius in pixels for ``box``/``gaussian``, ``block`` the mosaic tile
     size for ``pixelate``, and ``color`` the ``(B, G, R)`` colour for
     ``fill``. ``passes`` is how many box blurs approximate the gaussian;
-    three is the usual choice and their radii are scaled so the result
-    matches a single box blur of ``radius`` in variance.
+    three is the usual choice. Their radii are scaled so the combined
+    variance approximates a single box blur of ``radius`` — integer radii
+    can't hit it exactly, and at small radii the pass count is reduced
+    rather than let the blur come out stronger than asked. See
+    :func:`_pass_radii`.
     """
 
     method: str = "box"
@@ -88,6 +91,21 @@ class BlurStyle:
             raise ValueError(
                 "blur passes must be at least 1, got {}".format(self.passes)
             )
+        # Reject settings that are silently identity operations. This is a
+        # redaction API: a style that quietly leaves the pixels readable is
+        # the one failure mode that actually leaks, so it has to be an
+        # error rather than a no-op. Values irrelevant to the chosen
+        # method are left alone.
+        if self.method in ("box", "gaussian") and self.radius < 1:
+            raise ValueError(
+                "a {} blur of radius {} leaves the region unchanged; use 1 "
+                "or more".format(self.method, self.radius)
+            )
+        if self.method == "pixelate" and self.block < 2:
+            raise ValueError(
+                "a pixelate block of {} leaves the region unchanged; use 2 "
+                "or more".format(self.block)
+            )
         self.color = tuple(int(c) for c in self.color)
         if len(self.color) != 3:
             raise ValueError(
@@ -108,8 +126,11 @@ def _scratch_get(scratch, name, shape, dtype=numpy.float32):
 
     ``scratch`` is a caller-owned dict (see :func:`blur_regions`); when
     it is ``None`` every call allocates its own buffer. Reuse is what
-    lets a recorder blurring a fixed region settle into a steady state
-    with no per-frame allocation.
+    lets a recorder blurring a fixed region stop allocating work buffers
+    per frame. It does not reach zero bytes: numpy keeps a fixed ~100 KiB
+    iteration buffer for ufuncs whose output is a strided view (the
+    column slices in :func:`_moving_average`), which is constant no
+    matter how large the region is.
     """
     if scratch is None:
         return numpy.empty(shape, dtype)
@@ -142,6 +163,26 @@ def _window_index(scratch, length, radius):
     hi = numpy.minimum(idx + radius + 1, length)
     counts = (hi - lo).astype(numpy.float32)
     out = (lo, hi, counts)
+    if scratch is not None:
+        scratch[key] = out
+    return out
+
+
+def _edge_counts(scratch, radius):
+    """Per-position window widths for the clamped head and tail positions.
+
+    Cached like :func:`_window_index`: these are rebuilt once per axis,
+    per pass, per channel otherwise, which is pure waste in a capture
+    loop even though each array is only ``radius`` long.
+    """
+    key = ("edge", radius)
+    if scratch is not None:
+        cached = scratch.get(key)
+        if cached is not None:
+            return cached
+    head = numpy.arange(radius + 1, 2 * radius + 1, dtype=numpy.float32)
+    tail = numpy.arange(2 * radius, radius, -1, dtype=numpy.float32)
+    out = (head, tail)
     if scratch is not None:
         scratch[key] = out
     return out
@@ -187,8 +228,12 @@ def _moving_average(plane, radius, axis, scratch):
         lo, hi, counts = _window_index(scratch, n, radius)
         work = _scratch_get(scratch, "work", plane.shape)
         gather = _scratch_get(scratch, "gather", plane.shape)
-        numpy.take(cum, hi, axis=axis, out=gather)
-        numpy.take(cum, lo, axis=axis, out=work)
+        # mode="clip" never clips here — lo/hi are built from this
+        # axis's own length — but the default mode="raise" makes
+        # numpy.take allocate a full-size internal temporary even when
+        # out= is given, which defeats the scratch buffers entirely.
+        numpy.take(cum, hi, axis=axis, out=gather, mode="clip")
+        numpy.take(cum, lo, axis=axis, out=work, mode="clip")
         numpy.subtract(gather, work, out=plane)
         numpy.divide(plane, _bcast(counts, axis), out=plane)
         return
@@ -202,10 +247,9 @@ def _moving_average(plane, radius, axis, scratch):
     )
     numpy.divide(body, k, out=body)
 
+    head_counts, tail_counts = _edge_counts(scratch, radius)
+
     # Leading edge — window clamped at 0, so it holds radius+1 .. 2*radius.
-    head_counts = numpy.arange(
-        radius + 1, 2 * radius + 1, dtype=numpy.float32
-    )
     numpy.divide(
         cum[_sel(axis, slice(radius + 1, k))],
         _bcast(head_counts, axis),
@@ -214,9 +258,6 @@ def _moving_average(plane, radius, axis, scratch):
 
     # Trailing edge — window clamped at n, shrinking back to radius+1.
     tail = plane[_sel(axis, slice(n - radius, n))]
-    tail_counts = numpy.arange(
-        2 * radius, radius, -1, dtype=numpy.float32
-    )
     numpy.subtract(
         cum[_sel(axis, slice(n, n + 1))],
         cum[_sel(axis, slice(n - 2 * radius, n - radius))],
@@ -231,17 +272,41 @@ def _box_pass(plane, radius, scratch):
     _moving_average(plane, radius, 0, scratch)
 
 
-def _pass_radii(radius, passes):
-    """Per-pass radii whose combined variance matches one box of ``radius``.
+# How far the combined variance of the box passes may drift from the
+# variance of the single box blur the caller asked for. Integer radii
+# can't hit it exactly; a quarter is loose enough to keep three passes at
+# small radii and tight enough to reject a visibly wrong strength.
+_VARIANCE_TOLERANCE = 0.25
 
-    A box of radius ``r`` has variance ``((2r+1)**2 - 1) / 12``; variances
-    add across independent passes, so each of ``passes`` passes gets
-    ``1/passes`` of the target. Radii are floored at 1 — a zero-radius
-    pass would be a no-op and quietly weaken the blur.
+
+def _pass_radii(radius, passes):
+    """Per-pass radii approximating one box blur of ``radius``.
+
+    A box of radius ``r`` has variance ``((2r+1)**2 - 1) / 12``, and
+    variances add across independent passes, so each of ``passes`` passes
+    should carry ``1/passes`` of the target. Integer radii can only
+    approximate that, so this walks the pass count down from ``passes``
+    and takes the first one whose combined variance lands within
+    :data:`_VARIANCE_TOLERANCE` of the target.
+
+    Dropping passes matters at small radii: the ideal share can round to
+    a zero radius, and flooring it at 1 instead — as an earlier version
+    did — makes the blur far stronger than asked. Three passes of radius
+    1 have variance 2.0 where a single radius-1 box has 0.67, i.e. 3x too
+    strong. Fewer, honest passes beat a silently wrong strength.
     """
-    target = ((2 * radius + 1) ** 2 - 1) / float(passes)
-    r = int(round((math.sqrt(target + 1.0) - 1.0) / 2.0))
-    return [max(1, r)] * passes
+    target = ((2 * radius + 1) ** 2 - 1) / 12.0
+    for n in range(passes, 0, -1):
+        share = target / n
+        r = int(round((math.sqrt(12.0 * share + 1.0) - 1.0) / 2.0))
+        if r < 1:
+            continue
+        variance = n * ((2 * r + 1) ** 2 - 1) / 12.0
+        if abs(variance - target) <= _VARIANCE_TOLERANCE * target:
+            return [r] * n
+    # n == 1 reproduces the requested radius exactly, so this is only
+    # reached if radius itself is degenerate — which BlurStyle rejects.
+    return [max(1, radius)]
 
 
 def _blur_sub(sub, style, scratch):
@@ -264,7 +329,36 @@ def _blur_sub(sub, style, scratch):
         numpy.copyto(sub[..., channel], plane, casting="unsafe")
 
 
-def _pixelate_sub(sub, block):
+def _pixelate_plan(scratch, h, w, block):
+    """Tile boundaries, per-tile pixel counts and the expansion indices.
+
+    All of it depends only on ``(h, w, block)``, so it is cached rather
+    than rebuilt per frame.
+    """
+    key = ("pix", h, w, block)
+    if scratch is not None:
+        cached = scratch.get(key)
+        if cached is not None:
+            return cached
+    starts_y = numpy.arange(0, h, block)
+    starts_x = numpy.arange(0, w, block)
+    lens_y = numpy.diff(numpy.append(starts_y, h))
+    lens_x = numpy.diff(numpy.append(starts_x, w))
+    counts = (
+        (lens_y[:, None] * lens_x[None, :]).astype(numpy.float32)[..., None]
+    )
+    # Which tile each output row / column reads from, so the means can be
+    # expanded back with numpy.take(out=...) instead of numpy.repeat,
+    # which has no out= and would allocate the full tile image per frame.
+    idx_y = numpy.repeat(numpy.arange(len(starts_y)), lens_y)
+    idx_x = numpy.repeat(numpy.arange(len(starts_x)), lens_x)
+    plan = (starts_y, starts_x, counts, idx_y, idx_x)
+    if scratch is not None:
+        scratch[key] = plan
+    return plan
+
+
+def _pixelate_sub(sub, block, scratch):
     """Replace each ``block`` x ``block`` tile with its mean, in place.
 
     ``numpy.add.reduceat`` sums ragged runs, so a region whose size is
@@ -272,18 +366,28 @@ def _pixelate_sub(sub, block):
     edge instead of an error or a dropped strip.
     """
     h, w = sub.shape[:2]
-    starts_y = numpy.arange(0, h, block)
-    starts_x = numpy.arange(0, w, block)
-    lens_y = numpy.diff(numpy.append(starts_y, h))
-    lens_x = numpy.diff(numpy.append(starts_x, w))
-
-    acc = numpy.add.reduceat(
-        sub[..., :3].astype(numpy.float32), starts_y, axis=0
+    starts_y, starts_x, counts, idx_y, idx_x = _pixelate_plan(
+        scratch, h, w, block
     )
-    acc = numpy.add.reduceat(acc, starts_x, axis=1)
-    acc /= (lens_y[:, None] * lens_x[None, :]).astype(numpy.float32)[..., None]
-    acc += 0.5
-    tiles = numpy.repeat(numpy.repeat(acc, lens_y, axis=0), lens_x, axis=1)
+    n_y, n_x = len(starts_y), len(starts_x)
+
+    src = _scratch_get(scratch, "pix_src", (h, w, 3))
+    numpy.copyto(src, sub[..., :3])
+    rows = _scratch_get(scratch, "pix_rows", (n_y, w, 3))
+    numpy.add.reduceat(src, starts_y, axis=0, out=rows)
+    acc = _scratch_get(scratch, "pix_acc", (n_y, n_x, 3))
+    numpy.add.reduceat(rows, starts_x, axis=1, out=acc)
+    numpy.divide(acc, counts, out=acc)
+    # +0.5 so the cast back to uint8 rounds instead of truncating.
+    numpy.add(acc, 0.5, out=acc)
+
+    # mode="clip" as in _moving_average: the indices are in range by
+    # construction, and it keeps numpy.take off the path that allocates a
+    # full-size temporary despite out=.
+    spread_y = _scratch_get(scratch, "pix_spread", (h, n_x, 3))
+    numpy.take(acc, idx_y, axis=0, out=spread_y, mode="clip")
+    tiles = _scratch_get(scratch, "pix_tiles", (h, w, 3))
+    numpy.take(spread_y, idx_x, axis=1, out=tiles, mode="clip")
     numpy.copyto(sub[..., :3], tiles, casting="unsafe")
 
 
@@ -326,8 +430,10 @@ def blur_regions(img, regions=None, style=None, origin=(0, 0),
         :func:`fastgrab.recording.clicks.overlay_clicks`.
     :param scratch: an optional dict the caller keeps between calls, used
         to reuse the float32 work arrays. Same idea as ``Screenshot``'s
-        reused capture buffer: a recorder blurring a fixed region ends up
-        allocating nothing per frame.
+        reused capture buffer: a recorder blurring a fixed region stops
+        allocating work buffers per frame. What remains is numpy's own
+        fixed iteration buffer (~100 KiB), which does not grow with the
+        region.
     :return: ``img``.
 
     Each region is blurred using only the pixels inside it, so redacted
@@ -355,7 +461,7 @@ def blur_regions(img, regions=None, style=None, origin=(0, 0),
         if style.method == "fill":
             sub[..., 0:3] = style.color
         elif style.method == "pixelate":
-            _pixelate_sub(sub, style.block)
+            _pixelate_sub(sub, style.block, scratch)
         else:
             _blur_sub(sub, style, scratch)
     return img

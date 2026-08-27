@@ -403,14 +403,54 @@ def main(argv=None):
             "target: pass --blur X,Y,W,H or --blur-all"
         )
     if blur_tuned:
-        blur_style = BlurStyle(
-            method=args.blur_method,
-            radius=(args.blur_radius if args.blur_radius is not None
-                    else BlurStyle().radius),
-            block=(args.blur_block if args.blur_block is not None
-                   else BlurStyle().block),
-            color=args.blur_color or BlurStyle().color,
-        )
+        # Each tuning flag belongs to specific methods. Accepting
+        # --blur-color with a box blur would leave the user believing
+        # they had painted a solid box over a secret when they had only
+        # softened it, so refuse rather than ignore.
+        applies_to = {
+            "--blur-radius": ("box", "gaussian"),
+            "--blur-block": ("pixelate",),
+            "--blur-color": ("fill",),
+        }
+        given = [
+            name for name, value in (
+                ("--blur-radius", args.blur_radius),
+                ("--blur-block", args.blur_block),
+                ("--blur-color", args.blur_color),
+            ) if value is not None
+        ]
+        ignored = [
+            name for name in given
+            if args.blur_method not in applies_to[name]
+        ]
+        if ignored:
+            parser.error(
+                "{} {} nothing for --blur-method {} (it applies to {}); "
+                "a redaction option that is silently ignored is worse than "
+                "an error".format(
+                    " and ".join(ignored),
+                    "does" if len(ignored) == 1 else "do",
+                    args.blur_method,
+                    ", ".join(
+                        sorted({m for n in ignored for m in applies_to[n]})
+                    ),
+                )
+            )
+    if blur_tuned:
+        try:
+            blur_style = BlurStyle(
+                method=args.blur_method,
+                radius=(args.blur_radius if args.blur_radius is not None
+                        else BlurStyle().radius),
+                block=(args.blur_block if args.blur_block is not None
+                       else BlurStyle().block),
+                color=args.blur_color or BlurStyle().color,
+            )
+        except ValueError as exc:
+            # BlurStyle rejects identity settings such as
+            # --blur-method pixelate --blur-block 1; surface that as a
+            # usage error instead of a traceback.
+            parser.error(str(exc))
 
     if blur is True and (blur_style is None
                          or blur_style.method in ("box", "gaussian")):
