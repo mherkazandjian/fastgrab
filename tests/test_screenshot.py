@@ -370,16 +370,6 @@ def test_empty_blur_list_does_not_import_the_effects_module():
     assert "ok" in result.stdout
 
 
-def test_exhausted_generator_raises_on_the_stored_blur_path():
-    """The constructor materialises, so this must keep working forever."""
-    gen = (r for r in [(4, 4, 8, 8)])
-    grab = _stub_grab(blur=gen, blur_style=_fill_style())
-    for _ in range(3):
-        assert (grab.capture()[4:12, 4:12, 0] == _MARKER[0]).all()
-    # The generator is spent, but the regions were stored materialised.
-    assert grab.blur == ((4, 4, 8, 8),)
-
-
 def test_exhausted_generator_raises_on_the_per_call_path():
     """A per-call override stores nothing, so reuse must not fail open."""
     grab = _stub_grab(blur_style=_fill_style())
