@@ -6,6 +6,13 @@ import signal
 import sys
 import threading
 
+from fastgrab.effects import (
+    BLUR_METHODS,
+    DEFAULT_BLOCK,
+    DEFAULT_RADIUS,
+    BlurStyle,
+)
+
 from .clicks import CLICK_PATTERNS, ClickStyle
 from .recorder import Recorder
 from .subtitles import Subtitle, SubtitleStyle
@@ -23,7 +30,7 @@ XBINDKEYS_SNIPPET = """\
 """
 
 
-def _parse_region(value: str):
+def _parse_xywh(value: str, min_size: int):
     parts = value.split(",")
     if len(parts) != 4:
         raise argparse.ArgumentTypeError(
@@ -39,13 +46,25 @@ def _parse_region(value: str):
         raise argparse.ArgumentTypeError(
             "region origin must be non-negative, got {},{}".format(x, y)
         )
-    # Codecs aligned to yuv420p drop one odd pixel per dimension, so
-    # anything below 2 px rounds down to zero at encode time.
-    if w < 2 or h < 2:
+    if w < min_size or h < min_size:
         raise argparse.ArgumentTypeError(
-            "region width and height must be at least 2, got {}x{}".format(w, h)
+            "region width and height must be at least {}, got {}x{}".format(
+                min_size, w, h
+            )
         )
     return (x, y, w, h)
+
+
+def _parse_region(value: str):
+    # Codecs aligned to yuv420p drop one odd pixel per dimension, so a
+    # capture region below 2 px rounds down to zero at encode time.
+    return _parse_xywh(value, 2)
+
+
+def _parse_blur_region(value: str):
+    # Blur regions are clipped to the frame rather than encoded, so a
+    # single-pixel rectangle is meaningless but harmless.
+    return _parse_xywh(value, 1)
 
 
 def _positive_int(value: str):
@@ -168,6 +187,37 @@ def build_parser():
         help="stamp an emulated arrow pointer at the mouse position — the "
              "X11 capture path never includes the real cursor sprite "
              "(needs the [gui] extra: python-xlib)",
+    )
+    blur = p.add_mutually_exclusive_group()
+    blur.add_argument(
+        "--blur", type=_parse_blur_region, action="append", default=None,
+        metavar="X,Y,W,H",
+        help="obscure this screen region in every frame; repeatable",
+    )
+    blur.add_argument(
+        "--blur-all", action="store_true",
+        help="obscure the whole captured frame",
+    )
+    p.add_argument(
+        "--blur-method", default="box", choices=list(BLUR_METHODS),
+        help="how blurred regions are obscured: box, gaussian, pixelate, "
+             "or a solid fill (default: box). Only fill actually destroys "
+             "the pixels — use it for passwords and tokens.",
+    )
+    p.add_argument(
+        "--blur-radius", type=_positive_int, default=None, metavar="N",
+        help="blur kernel radius in pixels for box/gaussian "
+             "(default: {})".format(DEFAULT_RADIUS),
+    )
+    p.add_argument(
+        "--blur-block", type=_positive_int, default=None, metavar="N",
+        help="mosaic tile size in pixels for --blur-method pixelate "
+             "(default: {})".format(DEFAULT_BLOCK),
+    )
+    p.add_argument(
+        "--blur-color", type=_parse_bgr, default=None, metavar="B,G,R",
+        help="colour for --blur-method fill, e.g. 255,255,255 "
+             "(default: 0,0,0, a black box)",
     )
     p.add_argument(
         "--subtitle", type=_parse_subtitle, action="append", default=None,
@@ -339,6 +389,45 @@ def main(argv=None):
                       if args.click_lifetime is not None
                       else ClickStyle().lifetime),
         )
+    blur = True if args.blur_all else args.blur
+    blur_style = None
+    blur_tuned = (
+        args.blur_method != "box" or args.blur_radius is not None
+        or args.blur_block is not None or args.blur_color is not None
+    )
+    if blur_tuned and not blur:
+        # Silently ignoring a --blur-method the user typed would hide a
+        # failed redaction, which is the one mistake that actually leaks.
+        parser.error(
+            "--blur-method/--blur-radius/--blur-block/--blur-color need a "
+            "target: pass --blur X,Y,W,H or --blur-all"
+        )
+    if blur_tuned:
+        blur_style = BlurStyle(
+            method=args.blur_method,
+            radius=(args.blur_radius if args.blur_radius is not None
+                    else BlurStyle().radius),
+            block=(args.blur_block if args.blur_block is not None
+                   else BlurStyle().block),
+            color=args.blur_color or BlurStyle().color,
+        )
+
+    if blur is True and (blur_style is None
+                         or blur_style.method in ("box", "gaussian")):
+        # Measured in the dev container: a full 1080p frame costs ~64 ms
+        # (box) / ~180 ms (gaussian) per frame, so capture cannot hold
+        # 30 fps. The recorder duplicates frames to keep the clip's
+        # duration honest, so the output is still correct — just choppy.
+        # Say so rather than letting the fps quietly collapse.
+        print(
+            "note: --blur-all with --blur-method {} costs tens of "
+            "milliseconds per frame at 1080p and will hold capture below "
+            "the target fps; pixelate and fill are much cheaper".format(
+                "box" if blur_style is None else blur_style.method
+            ),
+            file=sys.stderr,
+        )
+
     subtitle_style = SubtitleStyle(
         font_path=args.subtitle_font,
         font_size=args.subtitle_fontsize,
@@ -359,6 +448,8 @@ def main(argv=None):
         show_cursor=args.show_cursor,
         subtitles=args.subtitle,
         subtitle_style=subtitle_style,
+        blur=blur,
+        blur_style=blur_style,
     )
 
     stop_event = threading.Event()

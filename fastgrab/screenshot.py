@@ -10,7 +10,7 @@ class Screenshot(object):
     """
     Main object that captures screenshots and provides other utilities
     """
-    def __init__(self, backend=None):
+    def __init__(self, backend=None, blur=None, blur_style=None):
         """
         Constructor
 
@@ -18,6 +18,14 @@ class Screenshot(object):
             ``'x11'``, ``'wlr'``, ``'portal'``. When ``None`` (default)
             the backend is auto-detected from the environment:
             Wayland sessions try wlr → portal; X11 sessions use x11.
+        :param blur: regions to obscure in every capture — a list of
+            screen-absolute ``(x, y, width, height)`` rectangles, or
+            ``True`` for the whole frame. ``None`` (default) captures
+            unmodified frames. See :meth:`capture`.
+        :param blur_style: a :class:`fastgrab.effects.BlurStyle`
+            selecting the method (``box``, ``gaussian``, ``pixelate`` or
+            a solid ``fill``) and its parameters; ``None`` uses the
+            defaults.
         """
         self._backend = _resolve_backend(backend)
         """The capture backend (BaseBackend subclass instance)"""
@@ -27,6 +35,16 @@ class Screenshot(object):
 
         self._img = None
         """The buffer where the captured image is stored"""
+
+        self.blur = blur
+        """Default blur regions applied by capture(), or None"""
+
+        self.blur_style = blur_style
+        """effects.BlurStyle used for self.blur, or None for the defaults"""
+
+        self._blur_scratch = {}
+        """Reused float32 work buffers, so blurring a fixed region in a
+        capture loop settles into zero allocations per frame"""
 
     @property
     def screensize(self) -> tuple:
@@ -51,7 +69,7 @@ class Screenshot(object):
             ).format(bbox, self.screensize)
             raise ValueError(msg)
 
-    def capture(self, bbox: tuple=None) -> numpy.ndarray:
+    def capture(self, bbox: tuple=None, blur=None) -> numpy.ndarray:
         """
         Take a screenshot and return the image
 
@@ -75,6 +93,14 @@ class Screenshot(object):
 
         :param bbox: the upper left corner of the screenshot and the width
          and heigh (x0, y0, width, height).
+        :param blur: regions to obscure in this capture, overriding the
+         ones passed to the constructor. A list of screen-absolute
+         ``(x, y, width, height)`` rectangles, ``True`` for the whole
+         frame, or ``False`` / ``[]`` to capture this frame unmodified.
+         ``None`` (default) falls back to ``self.blur``. Rectangles are
+         clipped to the captured region, and the blur is applied in place
+         to the returned buffer — it does not accumulate across calls
+         because the backend overwrites the whole buffer every time.
         :return: The image as a numpy array of shape (height, width, 4) in
          BGRA byte order.
         """
@@ -103,5 +129,18 @@ class Screenshot(object):
                 )
 
         self._backend.screenshot(bbox[0], bbox[1], self._img)
+
+        regions = self.blur if blur is None else blur
+        if regions:
+            # Imported here rather than at module level so a capture that
+            # never blurs doesn't pay to import the module at all.
+            from fastgrab.effects import blur_regions
+            blur_regions(
+                self._img,
+                None if regions is True else regions,
+                style=self.blur_style,
+                origin=(bbox[0], bbox[1]),
+                scratch=self._blur_scratch,
+            )
 
         return self._img

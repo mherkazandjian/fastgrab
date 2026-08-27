@@ -13,11 +13,16 @@ Public surface:
 * :class:`ClickStyle`    — click-overlay pattern / colour / timing
 * :class:`Subtitle`      — one timed subtitle line
 * :class:`SubtitleStyle` — font / colour / placement for subtitles
+* :class:`BlurStyle`     — how blurred/redacted regions are obscured
+  (re-exported from :mod:`fastgrab.effects`, which is core, not
+  recording-specific)
 
 The module imports cleanly without ``ffmpeg`` on PATH; the check is
 deferred to :meth:`FfmpegEncoder.start` so callers get a clear error
 only when they actually try to encode.
 """
+from fastgrab.effects import BlurStyle
+
 from .clicks import ClickStyle
 from .encoder import FfmpegEncoder, infer_codec
 from .recorder import Recorder
@@ -25,5 +30,5 @@ from .subtitles import Subtitle, SubtitleStyle
 
 __all__ = [
     "Recorder", "FfmpegEncoder", "infer_codec",
-    "ClickStyle", "Subtitle", "SubtitleStyle",
+    "ClickStyle", "Subtitle", "SubtitleStyle", "BlurStyle",
 ]

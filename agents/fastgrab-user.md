@@ -107,6 +107,37 @@ Semantics you must get right:
   `RuntimeError("backend 'wlr' requires the wayland extra: pip install fastgrab[wayland]")`
   — surface that hint verbatim to users. Unknown names raise `ValueError`.
 
+### Blurring / redacting regions
+
+Pure numpy, part of the default install — no extra, no Pillow, no OpenCV.
+
+```python
+from fastgrab import screenshot
+from fastgrab.effects import BlurStyle, blur_regions
+
+grab = screenshot.Screenshot(blur_style=BlurStyle(method='gaussian', radius=16))
+img = grab.capture(blur=[(100, 100, 400, 200)])   # regions are SCREEN coords
+
+# or on any BGRA array you already have
+blur_regions(img, [(0, 0, 320, 80)], BlurStyle(method='fill', color=(0, 0, 0)))
+```
+
+- `BlurStyle.method`: `box` (default, `radius`), `gaussian` (`radius`,
+  `passes`), `pixelate` (`block`), `fill` (`color`, a **BGR** tuple).
+- **Only `fill` actually destroys the pixels.** Say this whenever someone
+  wants to hide a password, token or customer name — a blur or a mosaic
+  can be partially reversed.
+- `blur=True` covers the whole frame; `blur=False` on `capture()` turns
+  off a blur set on the constructor for that call. Regions are clipped to
+  the frame, pixels outside them stay byte-identical, alpha is untouched.
+- Regions are given in **screen** coordinates even for a sub-region
+  capture — `capture()` subtracts the bbox origin for you.
+- Cost follows the region, not the screen, and does not grow with the
+  radius: ~1.6 ms for a 400x200 `box` region on either a 1080p or a 4K
+  frame. A *full* 1080p frame is ~64 ms (`box`) / ~180 ms (`gaussian`) /
+  ~23 ms (`pixelate`) / ~7 ms (`fill`) — fine for a screenshot, too slow
+  to hold 30 fps while recording unless it is `pixelate` or `fill`.
+
 ### Converting the BGRA array
 
 ```python
@@ -224,6 +255,9 @@ Flag reference:
 | `--click-color B,G,R` | note **BGR** order, e.g. `255,200,0`; default cyan |
 | `--click-lifetime S` | animation length, default 0.5 |
 | `--show-cursor` | stamp an emulated arrow at the pointer (`[gui]` extra) |
+| `--blur X,Y,W,H` / `--blur-all` | repeatable / whole frame; mutually exclusive; regions are screen coords |
+| `--blur-method` | `box` (default) / `gaussian` / `pixelate` / `fill`; only `fill` truly destroys pixels |
+| `--blur-radius N` / `--blur-block N` / `--blur-color B,G,R` | tuning; a tuning flag without `--blur`/`--blur-all` is an error |
 | `--subtitle START-END:TEXT` | repeatable; seconds, e.g. `1.5-4.0:Hello` |
 | `--subtitle-font PATH` | default `$FASTGRAB_FONT`, else bundled DejaVu search paths |
 | `--subtitle-fontsize N` / `--subtitle-color` / `--subtitle-box-color` / `--subtitle-position top\|bottom` | ffmpeg colour strings: `white`, `0xRRGGBB`, `red@0.8` |
@@ -232,7 +266,7 @@ Flag reference:
 ### Python API
 
 ```python
-from fastgrab.recording import Recorder, ClickStyle, Subtitle, SubtitleStyle, FfmpegEncoder, infer_codec
+from fastgrab.recording import Recorder, ClickStyle, Subtitle, SubtitleStyle, FfmpegEncoder, infer_codec, BlurStyle
 
 rec = Recorder(
     output_path="demo.mp4",          # codec inferred; or codec="mp4"|"webm"|"gif"
@@ -242,6 +276,8 @@ rec = Recorder(
     title="Demo", overlay_text="v1",
     show_clicks=True, click_style=ClickStyle(pattern="ring", color=(255, 200, 0), lifetime=0.5, thickness=4),
     show_cursor=True, cursor_color=(255, 255, 255), cursor_scale=1.0,
+    blur=[(1200, 40, 600, 120)],     # or True for the whole frame
+    blur_style=BlurStyle(method="fill", color=(0, 0, 0)),
     subtitles=[Subtitle(text="Hello", start=0.5, end=3.0)],
     subtitle_style=SubtitleStyle(font_path=None, font_size=28, font_color="white",
                                  box_color="black@0.55", border=8, position="bottom"),
@@ -256,6 +292,9 @@ stats  # {'frames': captured, 'written_frames': captured + duplicates,
   `KeyboardInterrupt`. Prefer a `threading.Event` from your own code.
 - `on_progress(n_frames, elapsed)` runs inline in the capture loop — keep
   it cheap and don't touch GUI widgets from it.
+- `blur` is applied to the captured frame before the click/cursor overlays
+  are drawn, so nothing sensitive ever reaches ffmpeg and the pointer stays
+  visible on top of a redacted region.
 - Width/height are rounded **down to even** (yuv420p requirement); a
   region that rounds to 0 raises `ValueError`.
 - When capture is slower than `fps`, the last frame is written again for
@@ -302,6 +341,8 @@ stats  # {'frames': captured, 'written_frames': captured + duplicates,
 - Recording is Linux/X11 only and marked *draft*.
 - Wayland: wlroots compositors only; GNOME/KDE portal backend is a stub.
 - Alpha channel is not meaningful (typically 0) — don't rely on it.
+- Blur regions are fixed rectangles: nothing tracks a moving window, and
+  the `--gui` selector cannot pick them.
 - Wheels for Linux are built from source on install (C extension); there is
   no manylinux binary wheel, hence the compiler requirement.
 
@@ -315,3 +356,5 @@ stats  # {'frames': captured, 'written_frames': captured + duplicates,
   `pip install fastgrab` on Linux.
 - Don't invent features: no multi-monitor, no window capture, no
   Windows/macOS recording, no portal support.
+- If the goal is hiding a secret, recommend `fill` — never let someone
+  ship a blurred password thinking it is gone.

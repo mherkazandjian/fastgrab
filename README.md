@@ -32,6 +32,54 @@ resolution    | fps
   plt.show()
 ````
 
+## Blurring and redacting regions
+
+``fastgrab.effects`` hides parts of a capture without pulling in Pillow or
+OpenCV — it is pure numpy, so it ships in the plain ``pip install fastgrab``.
+Pass ``blur=`` to ``capture()``, or call ``blur_regions`` on any BGRA array
+you already have:
+
+````python
+  from fastgrab import screenshot
+  from fastgrab.effects import BlurStyle, blur_regions
+
+  grab = screenshot.Screenshot(blur_style=BlurStyle(method='gaussian', radius=16))
+  # regions are (x, y, width, height) in *screen* coordinates
+  img = grab.capture(blur=[(100, 100, 400, 200)])
+
+  # or afterwards, on a frame you already have
+  blur_regions(img, [(0, 0, 320, 80)], BlurStyle(method='fill', color=(0, 0, 0)))
+````
+
+``BlurStyle.method`` picks how a region is obscured:
+
+method     | what it does                          | tune with
+---------- | ------------------------------------- | ---------------
+``box``    | moving average (default, radius 12)   | ``radius``
+``gaussian`` | ``passes`` box blurs, smoother      | ``radius``, ``passes``
+``pixelate`` | block means, the mosaic look        | ``block``
+``fill``   | a solid ``(B, G, R)`` box, black by default | ``color``
+
+**Only ``fill`` actually destroys the pixels.** ``box``, ``gaussian`` and
+``pixelate`` throw away detail but text can be partially recovered from a
+low radius or a coarse mosaic — use ``fill`` for passwords, tokens and
+anything else that must not leak.
+
+Other things worth knowing:
+
+- Regions are clipped to the frame, and each one is blurred using only the
+  pixels inside it, so nothing smears across its edge. Pixels outside the
+  regions are left byte-identical, alpha is never touched.
+- ``blur=True`` obscures the whole frame; ``blur=False`` on ``capture()``
+  overrides a blur set on the constructor for that one call.
+- Cost scales with the *region*, not the screen, and is independent of the
+  radius. Measured in the dev container: a 400×200 region costs ~1.6 ms
+  (``box``) / ~4.3 ms (``gaussian``) / ~0.8 ms (``pixelate``) / ~0.3 ms
+  (``fill``), the same on a 1080p or a 4K frame. A *full* 1080p frame is a
+  different story — ~64 ms for ``box`` and ~180 ms for ``gaussian`` — so
+  full-frame blurring is fine for a screenshot but will hold a recording
+  below 30 fps unless you use ``pixelate`` (~23 ms) or ``fill`` (~7 ms).
+
 ## Screen recording (draft, Linux/X11)
 
 The opt-in ``fastgrab.recording`` module pipes frames into ``ffmpeg``
@@ -75,6 +123,18 @@ Optional pointer overlays and subtitles:
   ``--click-color B,G,R``/``--click-lifetime`` tune it.
 - ``--show-cursor`` stamps an emulated arrow pointer at the mouse position —
   the X11 capture path never includes the real cursor sprite.
+- ``--blur X,Y,W,H`` (repeatable) obscures a screen region in every frame;
+  ``--blur-all`` does the whole frame. ``--blur-method`` selects ``box``
+  (default), ``gaussian``, ``pixelate`` or ``fill``, tuned with
+  ``--blur-radius``, ``--blur-block`` and ``--blur-color B,G,R``. Redaction
+  happens on the captured frame, so nothing sensitive reaches ffmpeg —
+  and, as above, only ``fill`` truly destroys the pixels:
+
+  ````bash
+    fastgrab-record --fullscreen -o demo.mp4 \
+        --blur 1200,40,600,120 --blur-method fill --blur-color 0,0,0
+  ````
+
 - ``--subtitle START-END:TEXT`` (repeatable) renders timed subtitles;
   colours accept any ffmpeg colour string (``white``, ``0xRRGGBB``,
   ``red@0.8``). The same options exist on the Python API via
