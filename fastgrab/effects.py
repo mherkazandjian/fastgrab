@@ -527,12 +527,14 @@ def blur_regions(img, regions=None, style=None, origin=(0, 0),
     :param regions: an iterable of ``(x, y, w, h)`` rectangles, or
         ``None`` for the whole frame. Rectangles are clipped to the
         frame; ones that fall entirely outside it are skipped. The
-        iterable is consumed once, so a generator passed to two separate
-        calls redacts only the first. Hold a list instead, or set
-        ``Screenshot(blur=...)`` / ``grab.blur = ...``, which materialise
-        once and reuse the result for every capture. Note that a per-call
-        ``capture(blur=...)`` override does *not* store anything, so it
-        is one-shot in the same way.
+        iterable is consumed once. A generator handed to a second call
+        arrives empty, and that raises rather than quietly doing nothing
+        — an exhausted iterator is indistinguishable from an empty one,
+        and silently skipping the redaction is the worse reading. Hold a
+        list instead, or set ``Screenshot(blur=...)`` / ``grab.blur =
+        ...``, which materialise once and reuse the result for every
+        capture. A per-call ``capture(blur=...)`` override stores
+        nothing, so it is one-shot in the same way.
     :param style: a :class:`BlurStyle`; ``None`` means the defaults
         (a box blur of radius 12).
     :param origin: the frame's top-left corner in the caller's

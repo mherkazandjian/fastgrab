@@ -368,3 +368,54 @@ def test_empty_blur_list_does_not_import_the_effects_module():
     )
     assert result.returncode == 0, result.stderr
     assert "ok" in result.stdout
+
+
+def test_exhausted_generator_raises_on_the_stored_blur_path():
+    """The constructor materialises, so this must keep working forever."""
+    gen = (r for r in [(4, 4, 8, 8)])
+    grab = _stub_grab(blur=gen, blur_style=_fill_style())
+    for _ in range(3):
+        assert (grab.capture()[4:12, 4:12, 0] == _MARKER[0]).all()
+    # The generator is spent, but the regions were stored materialised.
+    assert grab.blur == ((4, 4, 8, 8),)
+
+
+def test_exhausted_generator_raises_on_the_per_call_path():
+    """A per-call override stores nothing, so reuse must not fail open."""
+    grab = _stub_grab(blur_style=_fill_style())
+    gen = (r for r in [(4, 4, 8, 8)])
+    assert (grab.capture(blur=gen)[4:12, 4:12, 0] == _MARKER[0]).all()
+    with pytest.raises(ValueError, match="empty or already consumed"):
+        grab.capture(blur=gen)
+
+
+def test_exhausted_generator_raises_on_assignment():
+    grab = _stub_grab(blur_style=_fill_style())
+    gen = (r for r in [(4, 4, 8, 8)])
+    grab.blur = gen
+    with pytest.raises(ValueError, match="empty or already consumed"):
+        grab.blur = gen
+    # The rejected assignment left the previous value in place.
+    assert grab.blur == ((4, 4, 8, 8),)
+
+
+def test_an_empty_generator_raises_without_importing_effects():
+    import subprocess
+    import sys
+
+    probe = (
+        "import sys;"
+        "from fastgrab import screenshot;"
+        "\ntry:\n"
+        "    screenshot._normalise_blur((r for r in []))\n"
+        "except ValueError:\n"
+        "    assert 'fastgrab.effects' not in sys.modules, 'imported anyway';"
+        "    print('ok')\n"
+        "else:\n"
+        "    raise AssertionError('an empty generator was accepted')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
+    assert "ok" in result.stdout
