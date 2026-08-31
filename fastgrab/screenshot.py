@@ -1,6 +1,8 @@
 """
 Module that implements the object for taking screenshots
 """
+import numbers
+
 import numpy
 
 from fastgrab.backends import _resolve_backend
@@ -39,17 +41,137 @@ class Screenshot(object):
         else:
             return self._screensize
 
+    @staticmethod
+    def _as_pixels(name, value, bbox):
+        """
+        Return ``value`` as a plain :class:`int` count of device pixels
+
+        Anything that is exactly a whole number is accepted: :class:`int`,
+        ``numpy.int64`` and friends, and integral floats such as ``7.0``
+        (Python 3 division produces those readily, and they were already
+        usable on the Windows backend).
+
+        Fractional values are rejected rather than rounded — there is no
+        honest choice between floor, round and ceil, and any of them
+        silently returns a region the caller did not ask for.
+
+        The return value is deliberately a plain ``int``: backends do
+        pointer arithmetic with these numbers, and a ``numpy`` integer
+        both propagates into ``ctypes`` calls that reject it and wraps
+        silently on overflow instead of growing.
+        """
+        if isinstance(value, bool):
+            # bool is an Integral, but a boolean pixel count is always a
+            # mistake — and False would quietly mean zero.
+            msg = (
+                'bbox {} must be a number of device pixels, got the '
+                'boolean {!r}.\n'
+                'bbox={}'
+            ).format(name, value, bbox)
+            raise ValueError(msg)
+
+        if isinstance(value, numbers.Integral):
+            return int(value)
+
+        if isinstance(value, numbers.Real):
+            # Compare against int(value) directly instead of going
+            # through float(): float() silently rounds a near-integral
+            # Fraction to a whole number, and raises OverflowError on a
+            # large one, which would escape as the wrong exception type.
+            # int() is exact for every Real, and != then compares
+            # exactly.
+            try:
+                as_int = int(value)
+            except (ValueError, OverflowError, TypeError):
+                # nan raises ValueError, inf raises OverflowError.
+                msg = (
+                    'bbox {} must be a finite number of device pixels, '
+                    'got {!r}.\n'
+                    'bbox={}'
+                ).format(name, value, bbox)
+                raise ValueError(msg)
+            if value != as_int:
+                msg = (
+                    'bbox {} must be a whole number of device pixels, got '
+                    '{!r} — there is no half pixel to capture. Round it '
+                    'yourself to say which pixel you mean.\n'
+                    'bbox={}'
+                ).format(name, value, bbox)
+                raise ValueError(msg)
+            return as_int
+
+        msg = (
+            'bbox {} must be a number of device pixels, got {!r} of type '
+            '{}.\n'
+            'bbox={}'
+        ).format(name, value, type(value).__name__, bbox)
+        raise ValueError(msg)
+
     def check_bbox(self, bbox):
         """
-        Raise an exception of the bounding box is outside the screen bounds
+        Validate a bounding box and return it normalized
+
+        Raises :class:`ValueError` if the box is malformed or reaches
+        outside the screen bounds. All four components are **device
+        pixels**: ``x`` and ``y`` must not be negative, ``width`` and
+        ``height`` must be positive, and each must be a whole number
+        (see :meth:`_as_pixels` for what counts as one).
+
+        Validating here keeps every backend from having to defend itself
+        against a malformed box, which they otherwise report as
+        confusing low-level errors — or, on X11, not at all: a negative
+        origin reaches ``XGetImage`` as a ``BadMatch`` that the default
+        Xlib error handler turns into an outright process exit.
+
+        :param bbox: (x0, y0, width, height) in device pixels.
+        :return: the same box as a tuple of four plain :class:`int`
+         values, safe to hand to a backend.
         """
-        x, y, w, h = bbox
+        try:
+            components = tuple(bbox)
+        except TypeError:
+            msg = (
+                'bbox must be a sequence of four values '
+                '(x, y, width, height), got {!r}.'
+            ).format(bbox)
+            raise ValueError(msg)
+
+        if len(components) != 4:
+            msg = (
+                'bbox must have exactly four components '
+                '(x, y, width, height), got {}.\n'
+                'bbox={}'
+            ).format(len(components), bbox)
+            raise ValueError(msg)
+
+        x, y, w, h = (
+            self._as_pixels(name, value, bbox)
+            for name, value in zip(('x', 'y', 'width', 'height'), components)
+        )
+
+        if x < 0 or y < 0:
+            msg = (
+                'bbox x and y must not be negative, got x={}, y={}.\n'
+                'bbox={}'
+            ).format(x, y, bbox)
+            raise ValueError(msg)
+
+        if w <= 0 or h <= 0:
+            msg = (
+                'bbox width and height must be positive, got width={}, '
+                'height={} — an empty region has nothing to capture.\n'
+                'bbox={}'
+            ).format(w, h, bbox)
+            raise ValueError(msg)
+
         if (x + w) > self.screensize[0] or (y + h) > self.screensize[1]:
             msg = (
                 'bbox is outside the screen boarders.\n'
                 'bbox={} screen size={}'
             ).format(bbox, self.screensize)
             raise ValueError(msg)
+
+        return (x, y, w, h)
 
     def capture(self, bbox: tuple=None) -> numpy.ndarray:
         """
@@ -74,7 +196,12 @@ class Screenshot(object):
             plt.show()
 
         :param bbox: the upper left corner of the screenshot and the width
-         and heigh (x0, y0, width, height).
+         and heigh (x0, y0, width, height), in **device pixels**. Each
+         component must be a whole number — ``int``, a numpy integer, or
+         an integral float such as ``7.0``, which is coerced. A
+         fractional value such as ``7.5`` raises :class:`ValueError`;
+         round it yourself to say which pixel you mean. ``x``/``y`` must
+         not be negative and ``width``/``height`` must be positive.
         :return: The image as a numpy array of shape (height, width, 4) in
          BGRA byte order.
         """
@@ -83,10 +210,11 @@ class Screenshot(object):
         if bbox is None:
             width, height = self.screensize
             bbox = (0, 0, width, height)
-        else:
-            _, _, width, height = bbox
 
-        self.check_bbox(bbox)
+        # Normalized to plain ints — backends do pointer arithmetic with
+        # the origin, so a numpy integer or an integral float must not
+        # reach them unconverted.
+        x, y, width, height = self.check_bbox(bbox)
 
         bpp = self._backend.bytes_per_pixel()
 
@@ -102,6 +230,6 @@ class Screenshot(object):
                     (height, width, bpp), 'uint8'
                 )
 
-        self._backend.screenshot(bbox[0], bbox[1], self._img)
+        self._backend.screenshot(x, y, self._img)
 
         return self._img
