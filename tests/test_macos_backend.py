@@ -292,6 +292,25 @@ def test_degenerate_display_mode_raises_a_clear_error(dimension):
         backend.screenshot(1, 1, numpy.zeros((2, 2, 4), numpy.uint8))
 
 
+@pytest.mark.parametrize("x, y, w, h", [
+    (-1, 0, 8, 6),
+    (0, -1, 8, 6),
+    (36, 0, 8, 6),       # runs past the right edge
+    (0, 26, 8, 6),       # runs past the bottom edge
+    (0, 0, 0, 6),        # empty region
+])
+def test_out_of_range_region_is_refused_at_the_backend(x, y, w, h):
+    """The backend is reachable directly, not only via check_bbox.
+
+    CoreGraphics clips such a rect rather than refusing it, so without
+    this the caller gets a confusing "too small" error or, worse,
+    silently shifted pixels.
+    """
+    backend, _, _ = _backend()
+    with pytest.raises(ValueError, match="outside the"):
+        backend.screenshot(x, y, numpy.zeros((h, w, 4), numpy.uint8))
+
+
 def test_refresh_re_reads_the_main_display():
     """The display id is latched in __init__; refresh() must re-resolve."""
     backend, cg, _ = _backend()

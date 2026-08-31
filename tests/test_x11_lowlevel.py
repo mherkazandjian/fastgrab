@@ -66,6 +66,34 @@ def test_unreachable_display_raises_instead_of_segfaulting(monkeypatch):
         screenshot.Screenshot(backend="x11").capture()
 
 
+@pytest.mark.parametrize("x, y", [(-1, -1), (-1, 0), (0, -1)])
+def test_low_level_screenshot_rejects_negative_origin(x, y):
+    """Regression: a negative origin used to kill the interpreter.
+
+    It reaches XGetImage as a BadMatch, and X protocol errors are
+    delivered to Xlib's default error handler, which prints a
+    diagnostic and calls exit() — no exception, no traceback, and the
+    NULL check in the C code never gets a chance to run.
+    """
+    buf = numpy.zeros((8, 8, 4), dtype="uint8")
+    with pytest.raises(RuntimeError, match="outside the screen"):
+        _linux_x11.screenshot(x, y, buf)
+
+
+def test_low_level_screenshot_rejects_region_past_the_right_edge():
+    width, height = _linux_x11.resolution()
+    buf = numpy.zeros((8, 8, 4), dtype="uint8")
+    with pytest.raises(RuntimeError, match="outside the screen"):
+        _linux_x11.screenshot(width - 4, 0, buf)
+    with pytest.raises(RuntimeError, match="outside the screen"):
+        _linux_x11.screenshot(0, height - 4, buf)
+
+
+def test_low_level_screenshot_rejects_empty_region():
+    with pytest.raises(RuntimeError, match="non-positive"):
+        _linux_x11.screenshot(0, 0, numpy.zeros((0, 8, 4), dtype="uint8"))
+
+
 def test_screenshot_rejects_non_3d_buffer():
     with pytest.raises(ValueError, match="height, width, 4"):
         _linux_x11.screenshot(0, 0, numpy.zeros((8, 8), dtype=numpy.uint8))

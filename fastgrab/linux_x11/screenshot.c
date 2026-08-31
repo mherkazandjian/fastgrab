@@ -15,6 +15,7 @@
 #define FG_OK            0
 #define FG_ERR_DISPLAY  -1
 #define FG_ERR_GETIMAGE -2
+#define FG_ERR_BOUNDS   -3
 
 static const char *fg_strerror(int code)
 {
@@ -25,6 +26,9 @@ static const char *fg_strerror(int code)
     case FG_ERR_GETIMAGE:
         return "XGetImage failed: region outside the screen, or the X "
                "server refused the request";
+    case FG_ERR_BOUNDS:
+        return "requested region is outside the screen, or has a "
+               "non-positive width or height";
     default:
         return "unknown X11 error";
     }
@@ -53,10 +57,31 @@ static int screenshot(const int origin_x,
 {
     XImage *img;
     Display *display;
+    Screen *screen;
+
+    /* Bounds are checked here rather than left to the server: a region
+     * that reaches outside the root window is a BadMatch, and the NULL
+     * check below cannot catch it. X protocol errors are delivered
+     * asynchronously to Xlib's *default error handler*, which prints a
+     * diagnostic and calls exit() -- the interpreter dies with no
+     * exception and no traceback. The public API validates too, but
+     * this entry point is reachable directly, and
+     * examples/low_level_api_screenshot.py promotes exactly that. */
+    if (width <= 0 || height <= 0)
+        return FG_ERR_BOUNDS;
 
     display = XOpenDisplay(NULL);
     if (display == NULL)
         return FG_ERR_DISPLAY;
+
+    screen = ScreenOfDisplay(display, DefaultScreen(display));
+    /* Written as subtractions so a large origin cannot overflow int. */
+    if (origin_x < 0 || origin_y < 0 ||
+        origin_x > screen->width - width ||
+        origin_y > screen->height - height) {
+        XCloseDisplay(display);
+        return FG_ERR_BOUNDS;
+    }
 
     img = XGetImage(display,
                     RootWindow(display, DefaultScreen(display)),

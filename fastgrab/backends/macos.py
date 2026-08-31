@@ -211,6 +211,18 @@ class MacosBackend(BaseBackend):
         h, w, _ = img.shape
         pixel_w, pixel_h, point_w, point_h = self._display_geometry()
 
+        # Screenshot.check_bbox validates too, but this entry point is
+        # reachable directly. CoreGraphics clips a rect that reaches
+        # outside the display instead of refusing it, which would land
+        # as a confusing "CGImage too small" -- or, if the clipped image
+        # is still large enough, as silently shifted pixels.
+        if (w <= 0 or h <= 0 or x < 0 or y < 0
+                or x > pixel_w - w or y > pixel_h - h):
+            raise ValueError(
+                "region {}x{} at {},{} is outside the {}x{} display"
+                .format(w, h, x, y, pixel_w, pixel_h)
+            )
+
         # A full-screen grab predicts the returned size exactly; a snapped
         # sub-rect legitimately comes back larger than the region asked
         # for, so the two cases get different size checks below.
