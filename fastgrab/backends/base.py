@@ -18,6 +18,16 @@ class BaseBackend(ABC):
     def bytes_per_pixel(self):
         """Return the number of bytes per captured pixel (always 4 today)."""
 
+    def refresh(self):
+        """Re-resolve any display handle latched at construction time.
+
+        The default is a no-op, which is correct for backends that
+        resolve the display on every call. A backend that stores a
+        display id (macOS) overrides this so
+        :meth:`fastgrab.screenshot.Screenshot.refresh` can pick up a
+        change of main display.
+        """
+
     @abstractmethod
     def screenshot(self, x, y, img):
         """Fill ``img`` with the region starting at ``(x, y)``.

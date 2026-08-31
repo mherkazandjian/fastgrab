@@ -58,14 +58,18 @@ class _SpyBackend:
     """Minimal backend that records what ``capture()`` forwards to it."""
 
     def __init__(self, size=(200, 100)):
-        self._size = size
+        self.size = size
         self.calls = []
+        self.refreshed = 0
 
     def resolution(self):
-        return self._size
+        return self.size
 
     def bytes_per_pixel(self):
         return 4
+
+    def refresh(self):
+        self.refreshed += 1
 
     def screenshot(self, x, y, img):
         self.calls.append((x, y))
@@ -251,6 +255,40 @@ def test_invalid_bbox_never_reaches_the_backend(bbox):
     with pytest.raises(ValueError):
         grab.capture(bbox=bbox)
     assert grab._backend.calls == []
+
+
+def test_refresh_picks_up_a_new_resolution():
+    """The cache is deliberate; refresh() is how a mode switch lands.
+
+    Without it a full-screen capture keeps covering the old region and
+    boxes in the newly available area are rejected as out of bounds.
+    """
+    grab = _spying_screenshot()
+    assert grab.screensize == (200, 100)
+
+    grab._backend.size = (300, 150)
+    assert grab.screensize == (200, 100)  # still cached, by design
+    with pytest.raises(ValueError):
+        grab.check_bbox((0, 0, 300, 150))
+
+    grab.refresh()
+    assert grab.screensize == (300, 150)
+    assert grab.check_bbox((0, 0, 300, 150)) == (0, 0, 300, 150)
+
+
+def test_refresh_captures_the_new_full_screen_size():
+    grab = _spying_screenshot()
+    assert grab.capture().shape == (100, 200, 4)
+    grab._backend.size = (300, 150)
+    grab.refresh()
+    assert grab.capture().shape == (150, 300, 4)
+
+
+def test_refresh_asks_the_backend_to_re_resolve_its_display():
+    """macOS latches CGMainDisplayID at construction; it must re-read."""
+    grab = _spying_screenshot()
+    grab.refresh()
+    assert grab._backend.refreshed == 1
 
 
 def test_capture_full_screen_shape_and_dtype():

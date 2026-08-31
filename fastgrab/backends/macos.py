@@ -116,6 +116,8 @@ def _load_frameworks():
     cg.CGImageGetBytesPerRow.restype = ctypes.c_size_t
     cg.CGImageGetBitsPerPixel.argtypes = [ctypes.c_void_p]
     cg.CGImageGetBitsPerPixel.restype = ctypes.c_size_t
+    cg.CGImageGetBitsPerComponent.argtypes = [ctypes.c_void_p]
+    cg.CGImageGetBitsPerComponent.restype = ctypes.c_size_t
     cg.CGImageGetBitmapInfo.argtypes = [ctypes.c_void_p]
     cg.CGImageGetBitmapInfo.restype = ctypes.c_uint32
     cg.CGImageGetDataProvider.argtypes = [ctypes.c_void_p]
@@ -151,15 +153,32 @@ class MacosBackend(BaseBackend):
 
     # -------- BaseBackend API --------
 
+    def refresh(self):
+        """Re-read which display is the main one.
+
+        ``CGMainDisplayID`` is resolved once at construction, so
+        unplugging a monitor or promoting a different one to main is
+        otherwise never noticed.
+        """
+        display = self._cg.CGMainDisplayID()
+        if display == 0:
+            raise RuntimeError("CGMainDisplayID returned 0; no main display?")
+        self._display = display
+
     def _display_geometry(self):
-        """Return ``(pixel_w, pixel_h, point_w, point_h)``, read fresh
-        each call so a mode switch is picked up on the next capture.
+        """Return ``(pixel_w, pixel_h, point_w, point_h)``.
+
+        Read fresh on every call, so this backend itself never holds a
+        stale mode. Note that the size the *public* API reports is
+        cached by :attr:`fastgrab.screenshot.Screenshot.screensize`; a
+        mode switch is picked up on the next capture only after calling
+        :meth:`fastgrab.screenshot.Screenshot.refresh`.
         """
         mode = self._cg.CGDisplayCopyDisplayMode(self._display)
         if not mode:
             raise RuntimeError("CGDisplayCopyDisplayMode returned NULL")
         try:
-            return (
+            geometry = (
                 int(self._cg.CGDisplayModeGetPixelWidth(mode)),
                 int(self._cg.CGDisplayModeGetPixelHeight(mode)),
                 int(self._cg.CGDisplayModeGetWidth(mode)),
@@ -168,6 +187,18 @@ class MacosBackend(BaseBackend):
         finally:
             # Core Foundation *copy* rule: we own the +1 reference.
             self._cg.CGDisplayModeRelease(mode)
+
+        if not all(geometry):
+            # A mirrored, virtual or sleeping display can report zero for
+            # a dimension. Left alone it divides by zero inside the
+            # snapping arithmetic, which says nothing about the display.
+            raise RuntimeError(
+                "display mode reports a zero dimension: pixels={}x{} "
+                "points={}x{} — the display may be asleep, mirrored or "
+                "virtual.".format(*geometry)
+            )
+
+        return geometry
 
     def resolution(self):
         pixel_w, pixel_h, _, _ = self._display_geometry()
@@ -180,7 +211,11 @@ class MacosBackend(BaseBackend):
         h, w, _ = img.shape
         pixel_w, pixel_h, point_w, point_h = self._display_geometry()
 
-        if x == 0 and y == 0 and w == pixel_w and h == pixel_h:
+        # A full-screen grab predicts the returned size exactly; a snapped
+        # sub-rect legitimately comes back larger than the region asked
+        # for, so the two cases get different size checks below.
+        whole_screen = x == 0 and y == 0 and w == pixel_w and h == pixel_h
+        if whole_screen:
             image = self._cg.CGDisplayCreateImage(self._display)
             off_x = off_y = 0
         else:
@@ -206,6 +241,19 @@ class MacosBackend(BaseBackend):
                     "expected 32-bpp image from CGDisplayCreateImage, got "
                     "{} bpp".format(bpp)
                 )
+            bits_per_component = self._cg.CGImageGetBitsPerComponent(image)
+            if bits_per_component != 8:
+                # 32 bpp is not enough on its own: a wide-gamut/EDR
+                # surface is 32-bit 10-10-10-2, which passes the bpp and
+                # byte-order checks and copies the right number of bytes
+                # while scrambling every channel value.
+                raise RuntimeError(
+                    "expected 8 bits per component from "
+                    "CGDisplayCreateImage, got {} — this looks like a "
+                    "wide-gamut/EDR surface, which fastgrab cannot yet "
+                    "convert to BGRA8. Please open an issue."
+                    .format(bits_per_component)
+                )
             info = self._cg.CGImageGetBitmapInfo(image)
             if (info & _K_CG_BITMAP_BYTE_ORDER_MASK) != _K_CG_BITMAP_BYTE_ORDER_32_LITTLE:
                 # We've only ever observed 32-little (BGRA) on shipping
@@ -220,7 +268,23 @@ class MacosBackend(BaseBackend):
             row_stride = self._cg.CGImageGetBytesPerRow(image)
             img_w = self._cg.CGImageGetWidth(image)
             img_h = self._cg.CGImageGetHeight(image)
-            if img_w < off_x + w or img_h < off_y + h:
+            if whole_screen:
+                # The display mode said exactly how big this would be, so
+                # anything else means the mode changed under us or this
+                # display reports a scale factor we do not understand.
+                # Accepting a larger image here would silently return its
+                # top-left corner.
+                if img_w != pixel_w or img_h != pixel_h:
+                    raise RuntimeError(
+                        "CGImage {}x{} does not match the display mode's "
+                        "{}x{} pixel size — the mode changed mid-capture, "
+                        "or this display reports a scale factor fastgrab "
+                        "does not understand. Please open an issue."
+                        .format(img_w, img_h, pixel_w, pixel_h)
+                    )
+            elif img_w < off_x + w or img_h < off_y + h:
+                # Snapping to whole points legitimately over-provisions,
+                # so only a *short* image is wrong here.
                 raise RuntimeError(
                     "CGImage {}x{} too small for a {}x{} region at "
                     "offset {},{}".format(img_w, img_h, w, h, off_x, off_y)
@@ -235,6 +299,25 @@ class MacosBackend(BaseBackend):
                 src_ptr = self._cf.CFDataGetBytePtr(cf_data)
                 if not src_ptr:
                     raise RuntimeError("CFDataGetBytePtr returned NULL")
+
+                # The copy trusts that the provider bytes start at this
+                # image's own top-left with the stride reported above. A
+                # CGImage backed by a *parent* bitmap breaks that: the
+                # stride is the parent's and the data begins at the
+                # parent's origin. Bounding the read against the actual
+                # length turns that into a loud error instead of rows
+                # copied from the wrong place.
+                data_len = self._cf.CFDataGetLength(cf_data)
+                needed = (off_y + h - 1) * row_stride + (off_x + w) * 4
+                if data_len < needed:
+                    raise RuntimeError(
+                        "CFData holds {} bytes, but a {}x{} region at "
+                        "offset {},{} with a {}-byte row stride needs {} "
+                        "— the CGImage may be a view into a larger parent "
+                        "bitmap. Please open an issue.".format(
+                            data_len, w, h, off_x, off_y, row_stride, needed)
+                    )
+
                 dst_ptr = img.ctypes.data
                 base = src_ptr + off_y * row_stride + off_x * 4
                 if off_x == 0 and row_stride == w * 4:

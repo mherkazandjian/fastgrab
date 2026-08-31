@@ -41,6 +41,26 @@ class Screenshot(object):
         else:
             return self._screensize
 
+    def refresh(self):
+        """
+        Forget cached display geometry so the next capture re-reads it
+
+        :attr:`screensize` is cached after its first read — capture
+        loops ask for it on every frame, and re-querying the display
+        each time would put a round trip in the hot path. The cost is
+        that a resolution change, a monitor being plugged in, or a
+        different display becoming the main one goes unnoticed: full
+        screen captures keep covering the old region and boxes in the
+        newly available area are rejected as out of bounds.
+
+        Call this when the display setup changes. It drops the cached
+        size and the capture buffer, and asks the backend to re-resolve
+        whatever it latched onto at construction.
+        """
+        self._screensize = None
+        self._img = None
+        self._backend.refresh()
+
     @staticmethod
     def _as_pixels(name, value, bbox):
         """
