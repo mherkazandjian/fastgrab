@@ -259,6 +259,29 @@ def test_oversized_full_screen_image_is_rejected():
         _capture(backend, 0, 0, 20, 16)
 
 
+def test_oversized_cfdata_is_rejected():
+    """The parent-bitmap layout makes the provider *larger*, not shorter.
+
+    A short-buffer check alone never fires for it: a cropped CGImage
+    sharing its parent's storage reports the parent's stride and hands
+    back the parent's bytes, so every row is read from the wrong origin
+    while all the size checks pass.
+    """
+    backend, _, cf = _backend()
+    real = cf.CFDataGetLength
+    cf.CFDataGetLength = lambda data: real(data) + 4096
+    with pytest.raises(RuntimeError, match="unsupported provider extent"):
+        _capture(backend, 7, 5, 11, 9)
+
+
+def test_stride_narrower_than_a_row_is_rejected():
+    backend, cg, _ = _backend()
+    real = cg.CGImageGetBytesPerRow
+    cg.CGImageGetBytesPerRow = lambda image: real(image) - 4
+    with pytest.raises(RuntimeError, match="unsupported provider extent"):
+        _capture(backend, 7, 5, 11, 9)
+
+
 def test_short_cfdata_is_rejected_rather_than_over_read():
     """The provider bytes must cover what the stride arithmetic reads.
 

@@ -173,6 +173,25 @@ class WlrBackend(BaseBackend):
 
     # -------- BaseBackend API --------
 
+    def refresh(self):
+        """Re-read output geometry and re-select the output.
+
+        Unlike x11 and windows, this backend does not query the
+        compositor per call: ``resolution()`` returns ``wl_output`` mode
+        fields latched from events at connect time, so a mode change is
+        invisible until the display is dispatched again. Two round trips
+        let pending ``mode``/``name``/``done`` events settle, matching
+        what ``_connect_singleton`` does.
+
+        Mode changes and a different ``FASTGRAB_OUTPUT`` choice among the
+        already-bound outputs are picked up. An output that has since
+        been unplugged is *not*: that needs registry ``global_remove``
+        tracking, which this backend does not do.
+        """
+        self._display.roundtrip()
+        self._display.roundtrip()
+        self._output = self._select_output()
+
     def resolution(self):
         return (self._output.mode_w, self._output.mode_h)
 

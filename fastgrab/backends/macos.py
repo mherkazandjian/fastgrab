@@ -316,18 +316,29 @@ class MacosBackend(BaseBackend):
                 # image's own top-left with the stride reported above. A
                 # CGImage backed by a *parent* bitmap breaks that: the
                 # stride is the parent's and the data begins at the
-                # parent's origin. Bounding the read against the actual
-                # length turns that into a loud error instead of rows
-                # copied from the wrong place.
+                # parent's origin.
+                #
+                # Requiring the provider to hold exactly this image's rows
+                # catches the common shape of that layout, and bounds the
+                # read either way. It cannot *prove* the logical origin —
+                # only a provider of a different extent is detectable —
+                # and it is a deliberate fastgrab invariant rather than a
+                # documented CoreGraphics one: CGImageCreate takes the
+                # provider and the extent as separate inputs and only
+                # requires the buffer to be at least bytesPerRow*height,
+                # so an over-allocated provider is not forbidden. Failing
+                # closed is the right trade here — the alternative is
+                # returning someone else's pixels.
                 data_len = self._cf.CFDataGetLength(cf_data)
-                needed = (off_y + h - 1) * row_stride + (off_x + w) * 4
-                if data_len < needed:
+                expected = row_stride * img_h
+                if row_stride < img_w * 4 or data_len != expected:
                     raise RuntimeError(
-                        "CFData holds {} bytes, but a {}x{} region at "
-                        "offset {},{} with a {}-byte row stride needs {} "
-                        "— the CGImage may be a view into a larger parent "
-                        "bitmap. Please open an issue.".format(
-                            data_len, w, h, off_x, off_y, row_stride, needed)
+                        "unsupported provider extent: CFData holds {} bytes "
+                        "for a {}x{} image with a {}-byte row stride, where "
+                        "{} was expected. fastgrab reads the provider bytes "
+                        "directly and cannot locate the image inside a "
+                        "buffer of another size. Please open an issue."
+                        .format(data_len, img_w, img_h, row_stride, expected)
                     )
 
                 dst_ptr = img.ctypes.data

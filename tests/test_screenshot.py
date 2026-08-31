@@ -284,6 +284,28 @@ def test_refresh_captures_the_new_full_screen_size():
     assert grab.capture().shape == (150, 300, 4)
 
 
+def test_refresh_keeps_the_cache_when_the_backend_fails():
+    """A failed refresh must not leave the object worse than before.
+
+    The backend is asked first precisely so the cached size and buffer
+    survive when it raises, rather than being discarded in favour of
+    nothing.
+    """
+    grab = _spying_screenshot()
+    assert grab.screensize == (200, 100)
+    first = grab.capture()
+
+    def boom():
+        raise RuntimeError('display went away')
+
+    grab._backend.refresh = boom
+    with pytest.raises(RuntimeError, match='display went away'):
+        grab.refresh()
+
+    assert grab._screensize == (200, 100)
+    assert grab._img is first
+
+
 def test_refresh_asks_the_backend_to_re_resolve_its_display():
     """macOS latches CGMainDisplayID at construction; it must re-read."""
     grab = _spying_screenshot()

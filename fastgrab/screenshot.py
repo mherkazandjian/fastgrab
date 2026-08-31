@@ -53,13 +53,22 @@ class Screenshot(object):
         screen captures keep covering the old region and boxes in the
         newly available area are rejected as out of bounds.
 
-        Call this when the display setup changes. It drops the cached
-        size and the capture buffer, and asks the backend to re-resolve
-        whatever it latched onto at construction.
+        Call this when the display setup changes. It asks the backend to
+        re-resolve whatever it latched onto at construction, then drops
+        the cached size and the capture buffer.
+
+        What a backend can actually notice varies: x11 and windows query
+        the display on every call, so nothing is latched; macOS re-reads
+        which display is the main one; wlr re-reads output geometry and
+        re-selects its output, but does not track outputs disappearing.
+
+        The backend is asked first on purpose — if it raises, the cached
+        size and buffer are left intact rather than thrown away in
+        favour of nothing.
         """
+        self._backend.refresh()
         self._screensize = None
         self._img = None
-        self._backend.refresh()
 
     @staticmethod
     def _as_pixels(name, value, bbox):
