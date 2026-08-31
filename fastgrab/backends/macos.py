@@ -32,12 +32,32 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 
+import numpy
+
 from .base import BaseBackend
 
 
 # CGImageAlphaInfo bits — keep in sync with CoreGraphics/CGImage.h
 _K_CG_BITMAP_BYTE_ORDER_MASK = 0x7000
 _K_CG_BITMAP_BYTE_ORDER_32_LITTLE = 2 << 12  # kCGBitmapByteOrder32Little
+
+
+def _ceil_div(numerator, denominator):
+    """Ceiling of ``numerator / denominator`` for non-negative integers."""
+    return -(-numerator // denominator)
+
+
+def _snap_axis(start, length, pixels, points):
+    """Snap one axis of a device-pixel span out to whole points.
+
+    ``pixels``/``points`` are that axis' extent in each unit. Returns
+    ``(pt_start, pt_length, offset)``: where to ask in points, how much
+    to ask for in points, and how far into the returned image the
+    requested span begins, in pixels.
+    """
+    pt_start = (start * points) // pixels
+    pt_end = _ceil_div((start + length) * points, pixels)
+    return pt_start, pt_end - pt_start, start - (pt_start * pixels) // points
 
 
 def _snap_rect_to_points(x, y, w, h, pixel_w, pixel_h, point_w, point_h):
@@ -51,15 +71,9 @@ def _snap_rect_to_points(x, y, w, h, pixel_w, pixel_h, point_w, point_h):
     for, in points, and the pixel offset of the requested region inside
     the returned image.
     """
-    pt_x0 = (x * point_w) // pixel_w
-    pt_y0 = (y * point_h) // pixel_h
-    pt_x1 = -((-(x + w) * point_w) // pixel_w)
-    pt_y1 = -((-(y + h) * point_h) // pixel_h)
-    return (
-        pt_x0, pt_y0, pt_x1 - pt_x0, pt_y1 - pt_y0,
-        x - (pt_x0 * pixel_w) // point_w,
-        y - (pt_y0 * pixel_h) // point_h,
-    )
+    pt_x, pt_w, off_x = _snap_axis(x, w, pixel_w, point_w)
+    pt_y, pt_h, off_y = _snap_axis(y, h, pixel_h, point_h)
+    return (pt_x, pt_y, pt_w, pt_h, off_x, off_y)
 
 
 def _load_frameworks():
@@ -341,20 +355,21 @@ class MacosBackend(BaseBackend):
                         .format(data_len, img_w, img_h, row_stride, expected)
                     )
 
-                dst_ptr = img.ctypes.data
-                base = src_ptr + off_y * row_stride + off_x * 4
-                if off_x == 0 and row_stride == w * 4:
-                    # Tightly packed — single memmove.
-                    ctypes.memmove(dst_ptr, base, w * h * 4)
-                else:
-                    # Stride padding (Apple often aligns to 16 bytes) or
-                    # a snapped left edge — copy row by row.
-                    for row in range(h):
-                        ctypes.memmove(
-                            dst_ptr + row * w * 4,
-                            base + row * row_stride,
-                            w * 4,
-                        )
+                # One strided view over the provider bytes, sliced to the
+                # requested region and copied in a single C-level pass.
+                # Row padding (Apple often aligns to 16 bytes) and a
+                # snapped left edge are both just slicing here; done with
+                # per-row memmoves they cost an interpreter round trip
+                # per row, and a snapped left edge is the common case for
+                # sub-rect captures on a 2x display.
+                src = numpy.frombuffer(
+                    (ctypes.c_ubyte * (row_stride * img_h)).from_address(
+                        src_ptr),
+                    dtype=numpy.uint8,
+                ).reshape(img_h, row_stride)
+                img[:] = src[
+                    off_y:off_y + h, off_x * 4:(off_x + w) * 4
+                ].reshape(h, w, 4)
             finally:
                 self._cf.CFRelease(cf_data)
         finally:

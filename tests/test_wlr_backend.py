@@ -16,6 +16,9 @@ pytest.importorskip(
 
 from fastgrab.backends.wlr import WlrBackend  # noqa: E402
 
+# Hand-built output state only — no compositor, no display server.
+pytestmark = pytest.mark.no_display
+
 
 def _fake_backend(outputs, on_roundtrip=None):
     """A WlrBackend over fake output state, bypassing the connection."""

@@ -24,6 +24,9 @@ from fastgrab.backends.macos import (
     _K_CG_BITMAP_BYTE_ORDER_32_LITTLE,
 )
 
+# Everything here runs against fakes — no display server, on any platform.
+pytestmark = pytest.mark.no_display
+
 # a 40x30-pixel backing store; RETINA drives it from a 20x15-point desktop
 RETINA = dict(pixel_w=40, pixel_h=30, point_w=20, point_h=15)
 FLAT = dict(pixel_w=40, pixel_h=30, point_w=40, point_h=30)

@@ -5,6 +5,21 @@ buffer with a region of the screen, in BGRA byte order on
 little-endian Linux x86_64. The high-level
 :class:`fastgrab.screenshot.Screenshot` wrapper owns the buffer and
 calls into the backend.
+
+**Coordinates are device pixels, everywhere.** Every size and offset
+crossing this interface — what :meth:`BaseBackend.resolution` reports,
+the ``(x, y)`` given to :meth:`BaseBackend.screenshot`, and the ``bbox``
+accepted by :meth:`fastgrab.screenshot.Screenshot.capture` — counts
+physical pixels in the backing store, never logical/scaled units. On a
+2x Retina panel an 1800x1169-point desktop reports and captures
+3600x2338.
+
+A backend whose platform speaks logical coordinates (macOS points,
+Wayland's logical surface size, the portal's ScreenCast source) must
+convert at its own boundary rather than leaking those units upward.
+Callers that mix the two — sizing a GUI window in points from a capture
+measured in pixels, say — get a silently wrong region rather than an
+error, so the conversion belongs in one place.
 """
 from abc import ABC, abstractmethod
 
@@ -12,7 +27,10 @@ from abc import ABC, abstractmethod
 class BaseBackend(ABC):
     @abstractmethod
     def resolution(self):
-        """Return ``(width, height)`` of the primary screen/output."""
+        """Return ``(width, height)`` of the primary screen/output.
+
+        In device pixels — see the module docstring.
+        """
 
     @abstractmethod
     def bytes_per_pixel(self):
@@ -32,7 +50,13 @@ class BaseBackend(ABC):
     def screenshot(self, x, y, img):
         """Fill ``img`` with the region starting at ``(x, y)``.
 
+        ``x`` and ``y`` are device pixels — see the module docstring.
         ``img`` is a pre-allocated ``(H, W, 4)`` uint8 numpy ndarray
         whose shape implicitly carries the requested capture size. The
         backend must write the whole buffer in BGRA byte order.
+
+        :class:`fastgrab.screenshot.Screenshot` validates the region
+        before calling, but this method is public and reachable
+        directly, so a backend should refuse a region it cannot honour
+        rather than silently capturing a different one.
         """
