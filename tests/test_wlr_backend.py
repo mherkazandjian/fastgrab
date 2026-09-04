@@ -23,8 +23,8 @@ pytestmark = pytest.mark.no_display
 
 def _output(name="HDMI-1", mode_w=100, mode_h=50, scale=1, transform=0):
     """An output as ``_connect_singleton`` would have accumulated it."""
-    return SimpleNamespace(name=name, mode_w=mode_w, mode_h=mode_h,
-                           scale=scale, transform=transform)
+    return SimpleNamespace(proxy=object(), name=name, mode_w=mode_w,
+                           mode_h=mode_h, scale=scale, transform=transform)
 
 
 def _fake_backend(outputs, on_roundtrip=None):
@@ -115,3 +115,68 @@ def test_full_output_capture_is_never_blocked_by_the_guard(output):
     backend, _ = _fake_backend([output])
     with pytest.raises(AttributeError):
         backend.screenshot(0, 0, numpy.zeros((50, 100, 4), numpy.uint8))
+
+
+class _FakeFrame:
+    """A zwlr_screencopy_frame_v1 that reports a fixed buffer size."""
+
+    def __init__(self, w, h):
+        self.dispatcher = {}
+        self.w, self.h = w, h
+        self.destroyed = False
+
+    def deliver_buffer(self):
+        # wl_shm ARGB8888 is format 0.
+        self.dispatcher["buffer"](self, 0, self.w, self.h, self.w * 4)
+        self.dispatcher["buffer_done"](self)
+
+    def destroy(self):
+        self.destroyed = True
+
+
+def _capture_backend(output, frame_w, frame_h):
+    """A backend faked just far enough to reach the frame-size check."""
+    backend, _ = _fake_backend([output])
+    frame = _FakeFrame(frame_w, frame_h)
+    backend._display = SimpleNamespace(
+        dispatch=lambda block=True: frame.deliver_buffer(),
+        roundtrip=lambda: None,
+    )
+    backend._screencopy = SimpleNamespace(
+        capture_output=lambda overlay, out: frame,
+        capture_output_region=lambda overlay, out, x, y, w, h: frame,
+    )
+    return backend, frame
+
+
+def test_frame_smaller_than_the_request_is_refused_before_the_copy():
+    """A fractionally scaled output cannot be caught by the up-front guard.
+
+    wl_output.scale is an integer event and wlroots reports ceil() of
+    the real scale, so an output at 0.75 announces scale 1 and looks
+    like identity. The compositor returns a smaller frame, and
+    ``img[:] = arr`` would *broadcast* a 1x1 frame across the 2x2
+    destination rather than failing — silently wrong pixels.
+    """
+    backend, frame = _capture_backend(_output(), frame_w=1, frame_h=1)
+    with pytest.raises(NotImplementedError, match="returned a 1x1 frame"):
+        backend.screenshot(0, 0, numpy.zeros((2, 2, 4), numpy.uint8))
+    assert frame.destroyed, "the frame must be released on the error path"
+
+
+def test_frame_size_is_checked_for_full_output_capture_too():
+    """The full-output path predicts the size exactly, so it can check it."""
+    backend, frame = _capture_backend(_output(), frame_w=50, frame_h=25)
+    with pytest.raises(NotImplementedError, match="returned a 50x25 frame"):
+        backend.screenshot(0, 0, numpy.zeros((50, 100, 4), numpy.uint8))
+    assert frame.destroyed
+
+
+def test_matching_frame_size_passes_the_check():
+    """The guard must not fire when the compositor returns what was asked."""
+    backend, _ = _capture_backend(_output(), frame_w=2, frame_h=2)
+    # Passing the size check, the capture goes on to _ensure_buffer,
+    # which needs a real wl_shm pool — reaching it proves the check
+    # allowed this through.
+    with pytest.raises(AttributeError):
+        backend.screenshot(0, 0, numpy.zeros((2, 2, 4), numpy.uint8))

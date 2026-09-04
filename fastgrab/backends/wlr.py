@@ -266,6 +266,27 @@ class WlrBackend(BaseBackend):
             frame.destroy()
             raise RuntimeError("wlr-screencopy frame failed before buffer info")
 
+        # The up-front guard cannot catch every non-identity mapping:
+        # wl_output.scale is an *integer* event and wlroots reports
+        # ceil() of the real scale, so an output at 0.75 announces scale
+        # 1 and looks like identity. The compositor then returns a
+        # smaller frame, and `img[:] = arr` would broadcast it over the
+        # destination instead of failing -- a 1x1 frame silently filling
+        # a 2x2 request. Checking what actually came back catches that,
+        # and any other cause, before a single byte is copied.
+        if state.w != w or state.h != h:
+            frame.destroy()
+            raise NotImplementedError(
+                "compositor returned a {}x{} frame for a {}x{} request on "
+                "output {!r} (reported scale {}, transform {}): the region "
+                "is interpreted in logical coordinates, and wl_output.scale "
+                "is an integer, so a fractionally scaled output reports 1 "
+                "and cannot be detected up front. Capture the full output "
+                "and slice the returned array instead."
+                .format(state.w, state.h, w, h, self._output.name,
+                        self._output.scale, self._output.transform)
+            )
+
         wl_buffer, mm = self._ensure_buffer(state.fmt, state.w, state.h, state.stride)
 
         frame.copy(wl_buffer)
