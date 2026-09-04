@@ -8,6 +8,7 @@ state instead.
 """
 from types import SimpleNamespace
 
+import numpy
 import pytest
 
 pytest.importorskip(
@@ -62,6 +63,30 @@ def test_refresh_reselects_the_requested_output(monkeypatch):
     backend.refresh()
     assert backend._output is second
     assert backend.resolution() == (300, 150)
+
+
+def test_subregion_capture_is_refused_on_a_scaled_output():
+    """Device pixels and wlr-screencopy logical coordinates agree at 1x only.
+
+    The protocol takes the region in logical coordinates, so a 20x10
+    device-pixel request on a scale-2 output would be sent as 20x10
+    logical, come back as a 40x20 frame, and be displaced at the origin
+    too. Refusing beats returning the wrong pixels.
+    """
+    output = SimpleNamespace(name="HDMI-1", mode_w=100, mode_h=50, scale=2)
+    backend, _ = _fake_backend([output])
+    with pytest.raises(NotImplementedError, match="logical coordinates"):
+        backend.screenshot(0, 0, numpy.zeros((10, 20, 4), numpy.uint8))
+
+
+def test_full_output_capture_is_not_blocked_by_scale():
+    """Full-output capture goes via capture_output and takes no region."""
+    output = SimpleNamespace(name="HDMI-1", mode_w=100, mode_h=50, scale=2)
+    backend, _ = _fake_backend([output])
+    # No _screencopy on the fake, so reaching the capture call raises
+    # AttributeError -- which proves the scale guard did not fire.
+    with pytest.raises(AttributeError):
+        backend.screenshot(0, 0, numpy.zeros((50, 100, 4), numpy.uint8))
 
 
 def test_refresh_raises_for_an_unknown_requested_output(monkeypatch):

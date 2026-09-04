@@ -204,6 +204,23 @@ class WlrBackend(BaseBackend):
         if x == 0 and y == 0 and w == full_w and h == full_h:
             frame = self._screencopy.capture_output(0, self._output.proxy)
         else:
+            # capture_output_region takes the region in *logical*
+            # coordinates -- the protocol XML says so explicitly -- while
+            # a fastgrab bbox is device pixels. The two coincide only at
+            # scale 1. On a scale-2 output a 20x10 pixel request would be
+            # sent as 20x10 logical, the compositor would return a 40x20
+            # frame, and the origin would be displaced as well. Refuse
+            # rather than hand back the wrong region; full-output capture
+            # goes through capture_output above and is unaffected.
+            if self._output.scale != 1:
+                raise NotImplementedError(
+                    "sub-region capture is not supported on output {!r} at "
+                    "scale {}: wlr-screencopy takes the region in logical "
+                    "coordinates while fastgrab bboxes are device pixels, "
+                    "so they agree only at scale 1. Capture the full "
+                    "output and slice the returned array instead."
+                    .format(self._output.name, self._output.scale)
+                )
             frame = self._screencopy.capture_output_region(
                 0, self._output.proxy, x, y, w, h
             )
