@@ -1,10 +1,10 @@
 """Fake-state tests for the wlr backend that need no compositor.
 
 ``docker compose run --rm test-wayland`` exercises the real thing under
-headless ``cage``, but that session has a single output and never
-changes mode, so the paths :meth:`WlrBackend.refresh` exists for are
-unreachable there. These drive the same code over hand-built output
-state instead.
+headless ``cage``, but that session has a single unscaled, untransformed
+output and never changes mode, so the paths :meth:`WlrBackend.refresh`
+and the sub-region guard exist for are unreachable there. These drive
+the same code over hand-built output state instead.
 """
 from types import SimpleNamespace
 
@@ -19,6 +19,12 @@ from fastgrab.backends.wlr import WlrBackend  # noqa: E402
 
 # Hand-built output state only — no compositor, no display server.
 pytestmark = pytest.mark.no_display
+
+
+def _output(name="HDMI-1", mode_w=100, mode_h=50, scale=1, transform=0):
+    """An output as ``_connect_singleton`` would have accumulated it."""
+    return SimpleNamespace(name=name, mode_w=mode_w, mode_h=mode_h,
+                           scale=scale, transform=transform)
 
 
 def _fake_backend(outputs, on_roundtrip=None):
@@ -39,7 +45,7 @@ def _fake_backend(outputs, on_roundtrip=None):
 
 def test_refresh_picks_up_a_mode_change():
     """resolution() reads fields latched from events, not live state."""
-    output = SimpleNamespace(name="HDMI-1", mode_w=100, mode_h=50)
+    output = _output()
 
     def new_mode_arrives():
         output.mode_w, output.mode_h = 200, 120
@@ -54,8 +60,8 @@ def test_refresh_picks_up_a_mode_change():
 
 
 def test_refresh_reselects_the_requested_output(monkeypatch):
-    first = SimpleNamespace(name="HDMI-1", mode_w=100, mode_h=50)
-    second = SimpleNamespace(name="DP-1", mode_w=300, mode_h=150)
+    first = _output()
+    second = _output(name="DP-1", mode_w=300, mode_h=150)
     backend, _ = _fake_backend([first, second])
     assert backend._output is first
 
@@ -65,34 +71,47 @@ def test_refresh_reselects_the_requested_output(monkeypatch):
     assert backend.resolution() == (300, 150)
 
 
-def test_subregion_capture_is_refused_on_a_scaled_output():
-    """Device pixels and wlr-screencopy logical coordinates agree at 1x only.
+def test_refresh_raises_for_an_unknown_requested_output(monkeypatch):
+    backend, _ = _fake_backend([_output()])
 
-    The protocol takes the region in logical coordinates, so a 20x10
-    device-pixel request on a scale-2 output would be sent as 20x10
-    logical, come back as a 40x20 frame, and be displaced at the origin
-    too. Refusing beats returning the wrong pixels.
+    monkeypatch.setenv("FASTGRAB_OUTPUT", "DP-9")
+    with pytest.raises(RuntimeError, match="not found"):
+        backend.refresh()
+
+
+@pytest.mark.parametrize("output, why", [
+    (_output(scale=2), "a scale of 2 doubles the frame"),
+    (_output(transform=1), "a 90 degree rotation transposes it"),
+    (_output(transform=3), "270 degrees likewise"),
+    (_output(scale=2, transform=1), "both at once"),
+])
+def test_subregion_capture_is_refused_off_the_identity_mapping(output, why):
+    """The region is logical; device pixels match only at scale 1, no transform.
+
+    wlroots applies the output transform *before* the scale, so a
+    rotation breaks the correspondence even on an unscaled output — a
+    20x10 request comes back 10x20. Refusing beats returning the wrong
+    pixels, which is what a scale-only guard would have done here.
     """
-    output = SimpleNamespace(name="HDMI-1", mode_w=100, mode_h=50, scale=2)
     backend, _ = _fake_backend([output])
     with pytest.raises(NotImplementedError, match="logical coordinates"):
         backend.screenshot(0, 0, numpy.zeros((10, 20, 4), numpy.uint8))
 
 
-def test_full_output_capture_is_not_blocked_by_scale():
-    """Full-output capture goes via capture_output and takes no region."""
-    output = SimpleNamespace(name="HDMI-1", mode_w=100, mode_h=50, scale=2)
-    backend, _ = _fake_backend([output])
+def test_subregion_capture_is_allowed_on_an_identity_output():
+    """The guard must not block the case that actually works."""
+    backend, _ = _fake_backend([_output()])
     # No _screencopy on the fake, so reaching the capture call raises
-    # AttributeError -- which proves the scale guard did not fire.
+    # AttributeError — which proves the guard did not fire.
+    with pytest.raises(AttributeError):
+        backend.screenshot(0, 0, numpy.zeros((10, 20, 4), numpy.uint8))
+
+
+@pytest.mark.parametrize("output", [
+    _output(scale=2), _output(transform=1),
+])
+def test_full_output_capture_is_never_blocked_by_the_guard(output):
+    """capture_output takes no region, so scale and transform cannot bite."""
+    backend, _ = _fake_backend([output])
     with pytest.raises(AttributeError):
         backend.screenshot(0, 0, numpy.zeros((50, 100, 4), numpy.uint8))
-
-
-def test_refresh_raises_for_an_unknown_requested_output(monkeypatch):
-    output = SimpleNamespace(name="HDMI-1", mode_w=100, mode_h=50)
-    backend, _ = _fake_backend([output])
-
-    monkeypatch.setenv("FASTGRAB_OUTPUT", "DP-9")
-    with pytest.raises(RuntimeError, match="not found"):
-        backend.refresh()

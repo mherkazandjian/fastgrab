@@ -27,9 +27,11 @@ promise the code keeps:
 * ``x11`` and ``macos`` honour it.
 * ``wlr`` honours it for full-output capture. Sub-region capture takes
   the region in *logical* coordinates (a ``wlr-screencopy`` protocol
-  requirement), which matches device pixels only at scale 1; the
-  backend refuses a sub-region request on a scaled output rather than
-  returning the wrong one. See issue #38.
+  requirement), which matches device pixels only on an output that is
+  both unscaled and untransformed — wlroots applies the transform
+  before the scale, so a rotation transposes the frame even at scale 1.
+  The backend refuses a sub-region request on any other output rather
+  than returning the wrong one. See issue #38.
 * ``windows`` reports and captures in whatever DPI context the host
   process happens to have. Windows virtualizes screen metrics for
   DPI-unaware threads and ``BitBlt`` takes logical units, and neither

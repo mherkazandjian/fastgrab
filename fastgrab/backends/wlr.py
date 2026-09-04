@@ -33,7 +33,8 @@ _FRAME_VERSION = 3
 
 class _OutputState:
     """Mutable accumulator for a single ``wl_output``'s geometry events."""
-    __slots__ = ("proxy", "name", "mode_w", "mode_h", "scale", "done")
+    __slots__ = ("proxy", "name", "mode_w", "mode_h", "scale", "transform",
+                 "done")
 
     def __init__(self, proxy):
         self.proxy = proxy
@@ -41,6 +42,9 @@ class _OutputState:
         self.mode_w = 0
         self.mode_h = 0
         self.scale = 1
+        # WL_OUTPUT_TRANSFORM_NORMAL; anything else rotates or flips the
+        # logical coordinate space relative to the backing store.
+        self.transform = 0
         self.done = False
 
 
@@ -109,6 +113,10 @@ class WlrBackend(BaseBackend):
                 proxy.dispatcher["scale"] = lambda p, factor, s=state: (
                     WlrBackend._on_output_scale(s, factor)
                 )
+                proxy.dispatcher["geometry"] = lambda p, gx, gy, pw, ph, \
+                    subpixel, make, model, transform, s=state: (
+                    WlrBackend._on_output_geometry(s, transform)
+                )
                 proxy.dispatcher["done"] = lambda p, s=state: (
                     WlrBackend._on_output_done(s)
                 )
@@ -153,6 +161,10 @@ class WlrBackend(BaseBackend):
     @staticmethod
     def _on_output_scale(state, factor):
         state.scale = factor
+
+    @staticmethod
+    def _on_output_geometry(state, transform):
+        state.transform = transform
 
     @staticmethod
     def _on_output_done(state):
@@ -206,20 +218,24 @@ class WlrBackend(BaseBackend):
         else:
             # capture_output_region takes the region in *logical*
             # coordinates -- the protocol XML says so explicitly -- while
-            # a fastgrab bbox is device pixels. The two coincide only at
-            # scale 1. On a scale-2 output a 20x10 pixel request would be
-            # sent as 20x10 logical, the compositor would return a 40x20
-            # frame, and the origin would be displaced as well. Refuse
-            # rather than hand back the wrong region; full-output capture
-            # goes through capture_output above and is unaffected.
-            if self._output.scale != 1:
+            # a fastgrab bbox is device pixels. The identity mapping
+            # between them needs BOTH an unscaled and an untransformed
+            # output: wlroots applies the output transform before the
+            # scale, so a 90-degree rotation transposes the frame even at
+            # scale 1 (a 20x10 request comes back 10x20), and a scale of
+            # 2 doubles it. Refuse anything but the identity case rather
+            # than hand back the wrong region; full-output capture goes
+            # through capture_output above and is unaffected.
+            if self._output.scale != 1 or self._output.transform != 0:
                 raise NotImplementedError(
-                    "sub-region capture is not supported on output {!r} at "
-                    "scale {}: wlr-screencopy takes the region in logical "
-                    "coordinates while fastgrab bboxes are device pixels, "
-                    "so they agree only at scale 1. Capture the full "
+                    "sub-region capture is not supported on output {!r} "
+                    "(scale {}, transform {}): wlr-screencopy takes the "
+                    "region in logical coordinates while fastgrab bboxes "
+                    "are device pixels, and the two agree only on an "
+                    "unscaled, untransformed output. Capture the full "
                     "output and slice the returned array instead."
-                    .format(self._output.name, self._output.scale)
+                    .format(self._output.name, self._output.scale,
+                            self._output.transform)
                 )
             frame = self._screencopy.capture_output_region(
                 0, self._output.proxy, x, y, w, h
