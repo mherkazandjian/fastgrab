@@ -54,7 +54,12 @@ static int screen_resolution(int *resolution)
     display = XOpenDisplay(NULL);
     if (display == NULL)
         return FG_ERR_DISPLAY;
-    screen = ScreenOfDisplay(display, 0);
+    /* DefaultScreen(), not 0: capture and its bounds check both use
+     * RootWindow(display, DefaultScreen(display)), and on a DISPLAY of
+     * the form :N.1 those are different screens. Reporting one screen's
+     * size while capturing another makes the high-level bbox check
+     * disagree with what the server will actually allow. */
+    screen = ScreenOfDisplay(display, DefaultScreen(display));
     resolution[0] = screen->width;
     resolution[1] = screen->height;
     XCloseDisplay(display);

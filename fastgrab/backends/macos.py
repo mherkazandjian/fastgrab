@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import numbers
 
 import numpy
 
@@ -225,6 +226,21 @@ class MacosBackend(BaseBackend):
         h, w, _ = img.shape
         pixel_w, pixel_h, point_w, point_h = self._display_geometry()
 
+        # Reject a non-integer origin before the comparisons below, not
+        # after: every one of them is False for nan, so nan would sail
+        # through the region guard and reach the snapping arithmetic,
+        # and a float origin produces a float source address that
+        # ctypes.memmove rejects. Screenshot.capture normalizes integral
+        # floats to int before this point, so nothing valid is refused.
+        for _name, _value in (("x", x), ("y", y)):
+            if isinstance(_value, bool) or not isinstance(
+                    _value, numbers.Integral):
+                raise ValueError(
+                    "{} must be an integer number of device pixels, got "
+                    "{!r}".format(_name, _value)
+                )
+        x, y = int(x), int(y)
+
         # Screenshot.check_bbox validates too, but this entry point is
         # reachable directly. CoreGraphics clips a rect that reaches
         # outside the display instead of refusing it, which would land
@@ -343,9 +359,17 @@ class MacosBackend(BaseBackend):
                 # so an over-allocated provider is not forbidden. Failing
                 # closed is the right trade here — the alternative is
                 # returning someone else's pixels.
+                if row_stride < img_w * 4:
+                    raise RuntimeError(
+                        "unsupported row stride: CGImage reports {} bytes "
+                        "per row for a {}-pixel-wide 32-bit image, which "
+                        "needs at least {}. Please open an issue."
+                        .format(row_stride, img_w, img_w * 4)
+                    )
+
                 data_len = self._cf.CFDataGetLength(cf_data)
                 expected = row_stride * img_h
-                if row_stride < img_w * 4 or data_len != expected:
+                if data_len != expected:
                     raise RuntimeError(
                         "unsupported provider extent: CFData holds {} bytes "
                         "for a {}x{} image with a {}-byte row stride, where "

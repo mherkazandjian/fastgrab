@@ -278,11 +278,36 @@ def test_oversized_cfdata_is_rejected():
 
 
 def test_stride_narrower_than_a_row_is_rejected():
+    """Reported separately from the extent, so the message cannot lie.
+
+    Sharing one error with the extent check let it claim the data length
+    matched expectations in the very case where it did.
+    """
     backend, cg, _ = _backend()
     real = cg.CGImageGetBytesPerRow
     cg.CGImageGetBytesPerRow = lambda image: real(image) - 4
-    with pytest.raises(RuntimeError, match="unsupported provider extent"):
+    with pytest.raises(RuntimeError, match="unsupported row stride"):
         _capture(backend, 7, 5, 11, 9)
+
+
+@pytest.mark.parametrize("x, y", [
+    (float("nan"), 0),
+    (0, float("nan")),
+    (7.0, 0),
+    (0, 7.5),
+    (True, 0),
+])
+def test_non_integer_origin_is_refused_at_the_backend(x, y):
+    """nan defeats the region guard: every comparison against it is False.
+
+    A float origin also produces a float source address that
+    ctypes.memmove rejects. Screenshot.capture() normalizes integral
+    floats before this point, so only direct callers see this.
+    """
+    backend, _, _ = _backend()
+    img = numpy.zeros((6, 8, 4), numpy.uint8)
+    with pytest.raises(ValueError, match="must be an integer"):
+        backend.screenshot(x, y, img)
 
 
 def test_short_cfdata_is_rejected_rather_than_over_read():
