@@ -153,7 +153,10 @@ Per-platform extras:
    GDI ``BitBlt`` via ``ctypes``.
  - **macOS**: nothing beyond Python + numpy. macOS 10.15+ requires
    *Screen Recording* permission for the running app (System Settings →
-   Privacy & Security).
+   Privacy & Security). Captures are in **device pixels**, so a Retina
+   display reports (and returns) the full backing store — a 1800x1169
+   desktop captures as 3600x2338. ``bbox`` rectangles are in device
+   pixels too.
 
 note that ``fastgrab`` could work with lower versions but I have not tested it
 (and probaby will not). 

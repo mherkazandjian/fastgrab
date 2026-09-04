@@ -66,6 +66,71 @@ def test_unreachable_display_raises_instead_of_segfaulting(monkeypatch):
         screenshot.Screenshot(backend="x11").capture()
 
 
+@pytest.mark.parametrize("x, y", [(-1, -1), (-1, 0), (0, -1)])
+def test_low_level_screenshot_rejects_negative_origin(x, y):
+    """Regression: a negative origin used to kill the interpreter.
+
+    It reaches XGetImage as a BadMatch, and X protocol errors are
+    delivered to Xlib's default error handler, which prints a
+    diagnostic and calls exit() — no exception, no traceback, and the
+    NULL check in the C code never gets a chance to run.
+    """
+    buf = numpy.zeros((8, 8, 4), dtype="uint8")
+    with pytest.raises(RuntimeError, match="outside the screen"):
+        _linux_x11.screenshot(x, y, buf)
+
+
+def test_low_level_screenshot_rejects_region_past_the_right_edge():
+    width, height = _linux_x11.resolution()
+    buf = numpy.zeros((8, 8, 4), dtype="uint8")
+    with pytest.raises(RuntimeError, match="outside the screen"):
+        _linux_x11.screenshot(width - 4, 0, buf)
+    with pytest.raises(RuntimeError, match="outside the screen"):
+        _linux_x11.screenshot(0, height - 4, buf)
+
+
+def test_low_level_screenshot_rejects_empty_region():
+    with pytest.raises(ValueError, match="must be positive"):
+        _linux_x11.screenshot(0, 0, numpy.zeros((0, 8, 4), dtype="uint8"))
+
+
 def test_screenshot_rejects_non_3d_buffer():
     with pytest.raises(ValueError, match="height, width, 4"):
         _linux_x11.screenshot(0, 0, numpy.zeros((8, 8), dtype=numpy.uint8))
+
+
+def test_screenshot_rejects_buffer_without_four_channels():
+    """Regression: this used to overrun the destination buffer.
+
+    Only ``ndim == 3`` was checked, so an (8, 8, 3) array was accepted
+    and the 32-bpp copy wrote 8*8*4 = 256 bytes into a 192-byte
+    allocation — a heap overflow through the advertised low-level API.
+    """
+    with pytest.raises(ValueError, match="height, width, 4"):
+        _linux_x11.screenshot(0, 0, numpy.zeros((8, 8, 3), dtype=numpy.uint8))
+
+
+def test_screenshot_rejects_wrong_dtype():
+    """Rejected, not coerced: a coerced copy would be filled and dropped."""
+    with pytest.raises(ValueError, match="dtype uint8"):
+        _linux_x11.screenshot(0, 0, numpy.zeros((8, 8, 4), dtype=numpy.float64))
+
+
+def test_screenshot_rejects_non_contiguous_buffer():
+    """A strided view cannot be filled in place, so it must not be taken."""
+    view = numpy.zeros((8, 16, 4), dtype=numpy.uint8)[:, ::2]
+    assert not view.flags["C_CONTIGUOUS"]  # sanity: the case under test
+    with pytest.raises(ValueError, match="C-contiguous"):
+        _linux_x11.screenshot(0, 0, view)
+
+
+def test_screenshot_rejects_read_only_buffer():
+    buf = numpy.zeros((8, 8, 4), dtype=numpy.uint8)
+    buf.flags.writeable = False
+    with pytest.raises(ValueError, match="C-contiguous|writable"):
+        _linux_x11.screenshot(0, 0, buf)
+
+
+def test_screenshot_rejects_non_array_buffer():
+    with pytest.raises(TypeError, match="ndarray"):
+        _linux_x11.screenshot(0, 0, [[0, 0, 0, 0]])

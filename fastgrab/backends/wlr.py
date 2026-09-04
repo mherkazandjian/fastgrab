@@ -33,7 +33,8 @@ _FRAME_VERSION = 3
 
 class _OutputState:
     """Mutable accumulator for a single ``wl_output``'s geometry events."""
-    __slots__ = ("proxy", "name", "mode_w", "mode_h", "scale", "done")
+    __slots__ = ("proxy", "name", "mode_w", "mode_h", "scale", "transform",
+                 "done")
 
     def __init__(self, proxy):
         self.proxy = proxy
@@ -41,6 +42,9 @@ class _OutputState:
         self.mode_w = 0
         self.mode_h = 0
         self.scale = 1
+        # WL_OUTPUT_TRANSFORM_NORMAL; anything else rotates or flips the
+        # logical coordinate space relative to the backing store.
+        self.transform = 0
         self.done = False
 
 
@@ -109,6 +113,10 @@ class WlrBackend(BaseBackend):
                 proxy.dispatcher["scale"] = lambda p, factor, s=state: (
                     WlrBackend._on_output_scale(s, factor)
                 )
+                proxy.dispatcher["geometry"] = lambda p, gx, gy, pw, ph, \
+                    subpixel, make, model, transform, s=state: (
+                    WlrBackend._on_output_geometry(s, transform)
+                )
                 proxy.dispatcher["done"] = lambda p, s=state: (
                     WlrBackend._on_output_done(s)
                 )
@@ -155,6 +163,10 @@ class WlrBackend(BaseBackend):
         state.scale = factor
 
     @staticmethod
+    def _on_output_geometry(state, transform):
+        state.transform = transform
+
+    @staticmethod
     def _on_output_done(state):
         state.done = True
 
@@ -173,6 +185,25 @@ class WlrBackend(BaseBackend):
 
     # -------- BaseBackend API --------
 
+    def refresh(self):
+        """Re-read output geometry and re-select the output.
+
+        Unlike x11 and windows, this backend does not query the
+        compositor per call: ``resolution()`` returns ``wl_output`` mode
+        fields latched from events at connect time, so a mode change is
+        invisible until the display is dispatched again. Two round trips
+        let pending ``mode``/``name``/``done`` events settle, matching
+        what ``_connect_singleton`` does.
+
+        Mode changes and a different ``FASTGRAB_OUTPUT`` choice among the
+        already-bound outputs are picked up. An output that has since
+        been unplugged is *not*: that needs registry ``global_remove``
+        tracking, which this backend does not do.
+        """
+        self._display.roundtrip()
+        self._display.roundtrip()
+        self._output = self._select_output()
+
     def resolution(self):
         return (self._output.mode_w, self._output.mode_h)
 
@@ -185,6 +216,27 @@ class WlrBackend(BaseBackend):
         if x == 0 and y == 0 and w == full_w and h == full_h:
             frame = self._screencopy.capture_output(0, self._output.proxy)
         else:
+            # capture_output_region takes the region in *logical*
+            # coordinates -- the protocol XML says so explicitly -- while
+            # a fastgrab bbox is device pixels. The identity mapping
+            # between them needs BOTH an unscaled and an untransformed
+            # output: wlroots applies the output transform before the
+            # scale, so a 90-degree rotation transposes the frame even at
+            # scale 1 (a 20x10 request comes back 10x20), and a scale of
+            # 2 doubles it. Refuse anything but the identity case rather
+            # than hand back the wrong region; full-output capture goes
+            # through capture_output above and is unaffected.
+            if self._output.scale != 1 or self._output.transform != 0:
+                raise NotImplementedError(
+                    "sub-region capture is not supported on output {!r} "
+                    "(scale {}, transform {}): wlr-screencopy takes the "
+                    "region in logical coordinates while fastgrab bboxes "
+                    "are device pixels, and the two agree only on an "
+                    "unscaled, untransformed output. Capture the full "
+                    "output and slice the returned array instead."
+                    .format(self._output.name, self._output.scale,
+                            self._output.transform)
+                )
             frame = self._screencopy.capture_output_region(
                 0, self._output.proxy, x, y, w, h
             )
@@ -213,6 +265,27 @@ class WlrBackend(BaseBackend):
         if state.failed:
             frame.destroy()
             raise RuntimeError("wlr-screencopy frame failed before buffer info")
+
+        # The up-front guard cannot catch every non-identity mapping:
+        # wl_output.scale is an *integer* event and wlroots reports
+        # ceil() of the real scale, so an output at 0.75 announces scale
+        # 1 and looks like identity. The compositor then returns a
+        # smaller frame, and `img[:] = arr` would broadcast it over the
+        # destination instead of failing -- a 1x1 frame silently filling
+        # a 2x2 request. Checking what actually came back catches that,
+        # and any other cause, before a single byte is copied.
+        if state.w != w or state.h != h:
+            frame.destroy()
+            raise NotImplementedError(
+                "compositor returned a {}x{} frame for a {}x{} request on "
+                "output {!r} (reported scale {}, transform {}): the region "
+                "is interpreted in logical coordinates, and wl_output.scale "
+                "is an integer, so a fractionally scaled output reports 1 "
+                "and cannot be detected up front. Capture the full output "
+                "and slice the returned array instead."
+                .format(state.w, state.h, w, h, self._output.name,
+                        self._output.scale, self._output.transform)
+            )
 
         wl_buffer, mm = self._ensure_buffer(state.fmt, state.w, state.h, state.stride)
 

@@ -176,6 +176,8 @@ immediately; the entrypoint rebuilds the C extension in place on start.
 | `tests/test_integration.py` | `@pytest.mark.integration` — pixel-level: paints the X root via python-xlib `XFillRectangle`, asserts captured BGRA bytes. |
 | `tests/test_integration_wlr.py` | `@pytest.mark.wayland` — pixel-level via the `wayland_painter.py` kiosk client under headless `cage`. |
 | `tests/test_recording.py` | codec inference, ffmpeg argv/drawtext, click patterns, cursor stamping, subtitles, CLI parsing; a few `skipif(not X11)` recorder smoke tests that really invoke ffmpeg. |
+| `tests/test_macos_backend.py` | `@pytest.mark.no_display` — the points-vs-pixels snapping as a pure function, plus the copy path over a fake CoreGraphics/CoreFoundation pair. The only place `off_x`/`off_y` run, since CI Macs are 1x. Runs everywhere. |
+| `tests/test_wlr_backend.py` | `@pytest.mark.no_display` — `WlrBackend.refresh()` over hand-built output state; covers the mode-change and output-reselection paths the single-output `cage` session cannot. Skipped without pywayland. |
 | `tests/conftest.py` | `paint_root` (X11) and `paint_wayland` fixtures; autouse `require_some_display` (no-op on Windows/macOS); `_x11_available()` / `_wayland_available()` helpers; `FASTGRAB_TEST_BACKEND` env selects the backend under test. |
 | `tests/_run_pytest_clean_exit.py` | runs pytest then `os._exit` — bypasses pywayland cffi finalizers segfaulting at interpreter shutdown. Use it instead of bare `pytest` in containers. |
 
@@ -194,8 +196,13 @@ Test-writing rules:
   write into `tmp_path`.
 - Overlay/subtitle logic is pure numpy / pure string building — test it
   without a display.
-- Keep `test_screenshot.py` platform-agnostic; it is the only suite that
-  runs on the Windows and macOS runners.
+- Keep `test_screenshot.py` platform-agnostic. It is not the only suite
+  on the Windows and macOS runners any more — `test_macos_backend.py`
+  and `test_wlr_backend.py` collect there too, because they drive fakes
+  rather than a real display. Anything that reaches a display server
+  needs a marker (`integration`, `wayland`) or a `skipif`, and anything
+  importing a platform-only module needs a `collect_ignore` entry in
+  `tests/conftest.py`, since marker filters do not prevent imports.
 
 ## 7. CI (`.github/workflows/test.yml`)
 
@@ -305,7 +312,10 @@ containers — say so.
 - [ ] BGRA contract preserved; buffer reuse preserved.
 - [ ] `docker compose run --rm test` passes; wayland suite run if backends
       touched.
-- [ ] `test_screenshot.py` still platform-agnostic.
+- [ ] `test_screenshot.py` still platform-agnostic; anything else that
+      collects on the Windows/macOS runners still runs without a display.
+- [ ] Coordinates crossing the backend interface are still device pixels
+      (see `backends/base.py`).
 - [ ] README and `backends/__init__.py` docstring updated for user-visible
       changes; `poetry.lock` regenerated if `pyproject.toml` deps changed.
 - [ ] No host-only assumptions (fonts, display numbers, paths) baked in;

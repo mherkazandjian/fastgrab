@@ -9,6 +9,10 @@ V1 captures from the **main** display only (``CGMainDisplayID``).
 Multi-display capture via ``CGGetActiveDisplayList`` is a future
 ``Screenshot(display=N)`` extension.
 
+**Coordinates are device pixels**, matching X11 and wlr, and so are
+``bbox`` rectangles: a 2x panel with an 1800x1169-point desktop reports
+and captures 3600x2338.
+
 Byte order matches the rest of fastgrab: ``CGDisplayCreateImage``
 returns 32-bit-per-pixel little-endian BGRA on both Intel and Apple
 Silicon, so the captured numpy array is BGRA — same contract as X11
@@ -27,6 +31,9 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import numbers
+
+import numpy
 
 from .base import BaseBackend
 
@@ -34,6 +41,40 @@ from .base import BaseBackend
 # CGImageAlphaInfo bits — keep in sync with CoreGraphics/CGImage.h
 _K_CG_BITMAP_BYTE_ORDER_MASK = 0x7000
 _K_CG_BITMAP_BYTE_ORDER_32_LITTLE = 2 << 12  # kCGBitmapByteOrder32Little
+
+
+def _ceil_div(numerator, denominator):
+    """Ceiling of ``numerator / denominator`` for non-negative integers."""
+    return -(-numerator // denominator)
+
+
+def _snap_axis(start, length, pixels, points):
+    """Snap one axis of a device-pixel span out to whole points.
+
+    ``pixels``/``points`` are that axis' extent in each unit. Returns
+    ``(pt_start, pt_length, offset)``: where to ask in points, how much
+    to ask for in points, and how far into the returned image the
+    requested span begins, in pixels.
+    """
+    pt_start = (start * points) // pixels
+    pt_end = _ceil_div((start + length) * points, pixels)
+    return pt_start, pt_end - pt_start, start - (pt_start * pixels) // points
+
+
+def _snap_rect_to_points(x, y, w, h, pixel_w, pixel_h, point_w, point_h):
+    """Map a device-pixel rect to the whole-point rect containing it.
+
+    ``CGDisplayCreateImageForRect`` takes points but returns pixels, and
+    rounds a fractional rect *outward* — 400.5 points yields 802 pixels,
+    not 801 — so round outward ourselves.
+
+    Returns ``(pt_x, pt_y, pt_w, pt_h, off_x, off_y)``: the rect to ask
+    for, in points, and the pixel offset of the requested region inside
+    the returned image.
+    """
+    pt_x, pt_w, off_x = _snap_axis(x, w, pixel_w, point_w)
+    pt_y, pt_h, off_y = _snap_axis(y, h, pixel_h, point_h)
+    return (pt_x, pt_y, pt_w, pt_h, off_x, off_y)
 
 
 def _load_frameworks():
@@ -54,10 +95,19 @@ def _load_frameworks():
     cg.CGMainDisplayID.argtypes = []
     cg.CGMainDisplayID.restype = ctypes.c_uint32
 
-    cg.CGDisplayPixelsWide.argtypes = [ctypes.c_uint32]
-    cg.CGDisplayPixelsWide.restype = ctypes.c_size_t
-    cg.CGDisplayPixelsHigh.argtypes = [ctypes.c_uint32]
-    cg.CGDisplayPixelsHigh.restype = ctypes.c_size_t
+    cg.CGDisplayCopyDisplayMode.argtypes = [ctypes.c_uint32]
+    cg.CGDisplayCopyDisplayMode.restype = ctypes.c_void_p
+
+    cg.CGDisplayModeGetWidth.argtypes = [ctypes.c_void_p]
+    cg.CGDisplayModeGetWidth.restype = ctypes.c_size_t
+    cg.CGDisplayModeGetHeight.argtypes = [ctypes.c_void_p]
+    cg.CGDisplayModeGetHeight.restype = ctypes.c_size_t
+    cg.CGDisplayModeGetPixelWidth.argtypes = [ctypes.c_void_p]
+    cg.CGDisplayModeGetPixelWidth.restype = ctypes.c_size_t
+    cg.CGDisplayModeGetPixelHeight.argtypes = [ctypes.c_void_p]
+    cg.CGDisplayModeGetPixelHeight.restype = ctypes.c_size_t
+    cg.CGDisplayModeRelease.argtypes = [ctypes.c_void_p]
+    cg.CGDisplayModeRelease.restype = None
 
     class CGPoint(ctypes.Structure):
         _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
@@ -81,6 +131,8 @@ def _load_frameworks():
     cg.CGImageGetBytesPerRow.restype = ctypes.c_size_t
     cg.CGImageGetBitsPerPixel.argtypes = [ctypes.c_void_p]
     cg.CGImageGetBitsPerPixel.restype = ctypes.c_size_t
+    cg.CGImageGetBitsPerComponent.argtypes = [ctypes.c_void_p]
+    cg.CGImageGetBitsPerComponent.restype = ctypes.c_size_t
     cg.CGImageGetBitmapInfo.argtypes = [ctypes.c_void_p]
     cg.CGImageGetBitmapInfo.restype = ctypes.c_uint32
     cg.CGImageGetDataProvider.argtypes = [ctypes.c_void_p]
@@ -116,24 +168,105 @@ class MacosBackend(BaseBackend):
 
     # -------- BaseBackend API --------
 
+    def refresh(self):
+        """Re-read which display is the main one.
+
+        ``CGMainDisplayID`` is resolved once at construction, so
+        unplugging a monitor or promoting a different one to main is
+        otherwise never noticed.
+        """
+        display = self._cg.CGMainDisplayID()
+        if display == 0:
+            raise RuntimeError("CGMainDisplayID returned 0; no main display?")
+        self._display = display
+
+    def _display_geometry(self):
+        """Return ``(pixel_w, pixel_h, point_w, point_h)``.
+
+        Read fresh on every call, so this backend itself never holds a
+        stale mode. Note that the size the *public* API reports is
+        cached by :attr:`fastgrab.screenshot.Screenshot.screensize`; a
+        mode switch is picked up on the next capture only after calling
+        :meth:`fastgrab.screenshot.Screenshot.refresh`.
+        """
+        mode = self._cg.CGDisplayCopyDisplayMode(self._display)
+        if not mode:
+            raise RuntimeError("CGDisplayCopyDisplayMode returned NULL")
+        try:
+            geometry = (
+                int(self._cg.CGDisplayModeGetPixelWidth(mode)),
+                int(self._cg.CGDisplayModeGetPixelHeight(mode)),
+                int(self._cg.CGDisplayModeGetWidth(mode)),
+                int(self._cg.CGDisplayModeGetHeight(mode)),
+            )
+        finally:
+            # Core Foundation *copy* rule: we own the +1 reference.
+            self._cg.CGDisplayModeRelease(mode)
+
+        if not all(geometry):
+            # A mirrored, virtual or sleeping display can report zero for
+            # a dimension. Left alone it divides by zero inside the
+            # snapping arithmetic, which says nothing about the display.
+            raise RuntimeError(
+                "display mode reports a zero dimension: pixels={}x{} "
+                "points={}x{} — the display may be asleep, mirrored or "
+                "virtual.".format(*geometry)
+            )
+
+        return geometry
+
     def resolution(self):
-        w = self._cg.CGDisplayPixelsWide(self._display)
-        h = self._cg.CGDisplayPixelsHigh(self._display)
-        return (int(w), int(h))
+        pixel_w, pixel_h, _, _ = self._display_geometry()
+        return (pixel_w, pixel_h)
 
     def bytes_per_pixel(self):
         return 4
 
     def screenshot(self, x, y, img):
         h, w, _ = img.shape
-        full_w, full_h = self.resolution()
+        pixel_w, pixel_h, point_w, point_h = self._display_geometry()
 
-        if x == 0 and y == 0 and w == full_w and h == full_h:
+        # Reject a non-integer origin before the comparisons below, not
+        # after: every one of them is False for nan, so nan would sail
+        # through the region guard and reach the snapping arithmetic,
+        # and a float origin produces a float source address that
+        # ctypes.memmove rejects. Screenshot.capture normalizes integral
+        # floats to int before this point, so nothing valid is refused.
+        for _name, _value in (("x", x), ("y", y)):
+            if isinstance(_value, bool) or not isinstance(
+                    _value, numbers.Integral):
+                raise ValueError(
+                    "{} must be an integer number of device pixels, got "
+                    "{!r}".format(_name, _value)
+                )
+        x, y = int(x), int(y)
+
+        # Screenshot.check_bbox validates too, but this entry point is
+        # reachable directly. CoreGraphics clips a rect that reaches
+        # outside the display instead of refusing it, which would land
+        # as a confusing "CGImage too small" -- or, if the clipped image
+        # is still large enough, as silently shifted pixels.
+        if (w <= 0 or h <= 0 or x < 0 or y < 0
+                or x > pixel_w - w or y > pixel_h - h):
+            raise ValueError(
+                "region {}x{} at {},{} is outside the {}x{} display"
+                .format(w, h, x, y, pixel_w, pixel_h)
+            )
+
+        # A full-screen grab predicts the returned size exactly; a snapped
+        # sub-rect legitimately comes back larger than the region asked
+        # for, so the two cases get different size checks below.
+        whole_screen = x == 0 and y == 0 and w == pixel_w and h == pixel_h
+        if whole_screen:
             image = self._cg.CGDisplayCreateImage(self._display)
+            off_x = off_y = 0
         else:
+            pt_x, pt_y, pt_w, pt_h, off_x, off_y = _snap_rect_to_points(
+                x, y, w, h, pixel_w, pixel_h, point_w, point_h
+            )
             rect = self._CGRect(
-                origin=self._CGPoint(x=float(x), y=float(y)),
-                size=self._CGSize(width=float(w), height=float(h)),
+                origin=self._CGPoint(x=float(pt_x), y=float(pt_y)),
+                size=self._CGSize(width=float(pt_w), height=float(pt_h)),
             )
             image = self._cg.CGDisplayCreateImageForRect(self._display, rect)
         if not image:
@@ -150,6 +283,19 @@ class MacosBackend(BaseBackend):
                     "expected 32-bpp image from CGDisplayCreateImage, got "
                     "{} bpp".format(bpp)
                 )
+            bits_per_component = self._cg.CGImageGetBitsPerComponent(image)
+            if bits_per_component != 8:
+                # 32 bpp is not enough on its own: a wide-gamut/EDR
+                # surface is 32-bit 10-10-10-2, which passes the bpp and
+                # byte-order checks and copies the right number of bytes
+                # while scrambling every channel value.
+                raise RuntimeError(
+                    "expected 8 bits per component from "
+                    "CGDisplayCreateImage, got {} — this looks like a "
+                    "wide-gamut/EDR surface, which fastgrab cannot yet "
+                    "convert to BGRA8. Please open an issue."
+                    .format(bits_per_component)
+                )
             info = self._cg.CGImageGetBitmapInfo(image)
             if (info & _K_CG_BITMAP_BYTE_ORDER_MASK) != _K_CG_BITMAP_BYTE_ORDER_32_LITTLE:
                 # We've only ever observed 32-little (BGRA) on shipping
@@ -164,10 +310,26 @@ class MacosBackend(BaseBackend):
             row_stride = self._cg.CGImageGetBytesPerRow(image)
             img_w = self._cg.CGImageGetWidth(image)
             img_h = self._cg.CGImageGetHeight(image)
-            if img_w != w or img_h != h:
+            if whole_screen:
+                # The display mode said exactly how big this would be, so
+                # anything else means the mode changed under us or this
+                # display reports a scale factor we do not understand.
+                # Accepting a larger image here would silently return its
+                # top-left corner.
+                if img_w != pixel_w or img_h != pixel_h:
+                    raise RuntimeError(
+                        "CGImage {}x{} does not match the display mode's "
+                        "{}x{} pixel size — the mode changed mid-capture, "
+                        "or this display reports a scale factor fastgrab "
+                        "does not understand. Please open an issue."
+                        .format(img_w, img_h, pixel_w, pixel_h)
+                    )
+            elif img_w < off_x + w or img_h < off_y + h:
+                # Snapping to whole points legitimately over-provisions,
+                # so only a *short* image is wrong here.
                 raise RuntimeError(
-                    "CGImage size {}x{} does not match requested {}x{}; "
-                    "Retina scale-factor mismatch?".format(img_w, img_h, w, h)
+                    "CGImage {}x{} too small for a {}x{} region at "
+                    "offset {},{}".format(img_w, img_h, w, h, off_x, off_y)
                 )
 
             provider = self._cg.CGImageGetDataProvider(image)
@@ -179,19 +341,59 @@ class MacosBackend(BaseBackend):
                 src_ptr = self._cf.CFDataGetBytePtr(cf_data)
                 if not src_ptr:
                     raise RuntimeError("CFDataGetBytePtr returned NULL")
-                dst_ptr = img.ctypes.data
-                if row_stride == w * 4:
-                    # Tightly packed — single memmove.
-                    ctypes.memmove(dst_ptr, src_ptr, w * h * 4)
-                else:
-                    # Stride padding (Apple often aligns to 16 bytes) —
-                    # copy row by row.
-                    for row in range(h):
-                        ctypes.memmove(
-                            dst_ptr + row * w * 4,
-                            src_ptr + row * row_stride,
-                            w * 4,
-                        )
+
+                # The copy trusts that the provider bytes start at this
+                # image's own top-left with the stride reported above. A
+                # CGImage backed by a *parent* bitmap breaks that: the
+                # stride is the parent's and the data begins at the
+                # parent's origin.
+                #
+                # Requiring the provider to hold exactly this image's rows
+                # catches the common shape of that layout, and bounds the
+                # read either way. It cannot *prove* the logical origin —
+                # only a provider of a different extent is detectable —
+                # and it is a deliberate fastgrab invariant rather than a
+                # documented CoreGraphics one: CGImageCreate takes the
+                # provider and the extent as separate inputs and only
+                # requires the buffer to be at least bytesPerRow*height,
+                # so an over-allocated provider is not forbidden. Failing
+                # closed is the right trade here — the alternative is
+                # returning someone else's pixels.
+                if row_stride < img_w * 4:
+                    raise RuntimeError(
+                        "unsupported row stride: CGImage reports {} bytes "
+                        "per row for a {}-pixel-wide 32-bit image, which "
+                        "needs at least {}. Please open an issue."
+                        .format(row_stride, img_w, img_w * 4)
+                    )
+
+                data_len = self._cf.CFDataGetLength(cf_data)
+                expected = row_stride * img_h
+                if data_len != expected:
+                    raise RuntimeError(
+                        "unsupported provider extent: CFData holds {} bytes "
+                        "for a {}x{} image with a {}-byte row stride, where "
+                        "{} was expected. fastgrab reads the provider bytes "
+                        "directly and cannot locate the image inside a "
+                        "buffer of another size. Please open an issue."
+                        .format(data_len, img_w, img_h, row_stride, expected)
+                    )
+
+                # One strided view over the provider bytes, sliced to the
+                # requested region and copied in a single C-level pass.
+                # Row padding (Apple often aligns to 16 bytes) and a
+                # snapped left edge are both just slicing here; done with
+                # per-row memmoves they cost an interpreter round trip
+                # per row, and a snapped left edge is the common case for
+                # sub-rect captures on a 2x display.
+                src = numpy.frombuffer(
+                    (ctypes.c_ubyte * (row_stride * img_h)).from_address(
+                        src_ptr),
+                    dtype=numpy.uint8,
+                ).reshape(img_h, row_stride)
+                img[:] = src[
+                    off_y:off_y + h, off_x * 4:(off_x + w) * 4
+                ].reshape(h, w, 4)
             finally:
                 self._cf.CFRelease(cf_data)
         finally:

@@ -46,17 +46,37 @@ def _wayland_available() -> bool:
     return os.path.exists(os.path.join(rd, wd))
 
 
-@pytest.fixture(scope="session", autouse=True)
-def require_some_display():
+_SOME_DISPLAY = None
+
+
+def _some_display_available() -> bool:
+    # Cached: the gate is consulted once per test, and _x11_available()
+    # shells out to xdpyinfo.
+    global _SOME_DISPLAY
+    if _SOME_DISPLAY is None:
+        _SOME_DISPLAY = _x11_available() or _wayland_available()
+    return _SOME_DISPLAY
+
+
+@pytest.fixture(autouse=True)
+def require_some_display(request):
+    """Skip tests that need a display when there is not one.
+
+    Per-test rather than per-session, and skippable with the
+    ``no_display`` marker: suites that drive fakes (the macOS and wlr
+    backend unit tests) need no display at all, and a session-wide skip
+    took them down with everything else — losing exactly the coverage a
+    contributor gets when running pytest on a headless box, which is
+    also the only place ``off_x``/``off_y`` are ever exercised.
+    """
     # On Windows/macOS the system always has a desktop available to capture;
     # the display-server gate is a Linux-only concept.
     if sys.platform != "linux":
         return
-    if not (_x11_available() or _wayland_available()):
-        pytest.skip(
-            "no usable display server (need DISPLAY or WAYLAND_DISPLAY)",
-            allow_module_level=True,
-        )
+    if request.node.get_closest_marker("no_display"):
+        return
+    if not _some_display_available():
+        pytest.skip("no usable display server (need DISPLAY or WAYLAND_DISPLAY)")
 
 
 @pytest.fixture
