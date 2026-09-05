@@ -25,13 +25,15 @@ backend honours it yet. Known gaps, so this docstring is not read as a
 promise the code keeps:
 
 * ``x11`` and ``macos`` honour it.
-* ``wlr`` honours it for full-output capture. Sub-region capture takes
-  the region in *logical* coordinates (a ``wlr-screencopy`` protocol
-  requirement), which matches device pixels only on an output that is
-  both unscaled and untransformed — wlroots applies the transform
-  before the scale, so a rotation transposes the frame even at scale 1.
-  The backend refuses a sub-region request on any other output rather
-  than returning the wrong one. See issue #38.
+* ``wlr`` honours it. ``wlr-screencopy`` takes a sub-region in *logical*
+  coordinates, so the backend converts the device-pixel bbox through
+  the output's ``xdg_output`` logical size, rounds the region outward,
+  and crops the returned frame back to the exact bbox. One gap is left:
+  wlroots applies the output transform *before* the scale, so on a
+  rotated or flipped output the region lands on a transposed backing
+  store — the backend refuses a sub-region request there rather than
+  returning the wrong one. Full-output capture is unaffected either
+  way. See issue #38.
 * ``windows`` reports and captures in whatever DPI context the host
   process happens to have. Windows virtualizes screen metrics for
   DPI-unaware threads and ``BitBlt`` takes logical units, and neither
