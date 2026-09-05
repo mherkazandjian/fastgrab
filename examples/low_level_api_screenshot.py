@@ -13,5 +13,6 @@ screenshot(x, y, img)
 
 # (optional) view the screenshot
 # import pylab
-# pylab.imshow(img[:, :, 0:3], interpolation='none', cmap='Greys_r')
+# matplotlib expects RGB, so reverse the BGR channels
+# pylab.imshow(img[:, :, 2::-1], interpolation='none')
 # pylab.show()

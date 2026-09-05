@@ -221,7 +221,8 @@ class Screenshot(object):
             img = grab.capture()
 
             from matplotlib import pyplot as plt
-            plt.imshow(img[:, :, 0:3], interpolation='none', cmap='Greys_r')
+            # matplotlib expects RGB, so reverse the BGR channels
+            plt.imshow(img[:, :, 2::-1], interpolation='none')
             plt.show()
 
         :param bbox: the upper left corner of the screenshot and the width
