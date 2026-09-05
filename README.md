@@ -24,7 +24,7 @@ resolution    | fps
   from fastgrab import screenshot
   # take a full screen screenshot
   img = screenshot.Screenshot().capture()
-  # >> img is a numpy ndarray of shape (height, width, 4) in BGRA byte order,
+  # >> img is a numpy ndarray of shape (height, width, 4) in BGRA byte order
   # >> do whatever you want with it
   # (optional)
   # e.g it can be displayed with matplotlib (install matplotlib first)

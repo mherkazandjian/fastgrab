@@ -221,7 +221,7 @@ class Screenshot(object):
             img = grab.capture()
 
             from matplotlib import pyplot as plt
-            # matplotlib expects RGB, so reverse the BGR channels
+            # matplotlib expects RGB, so reverse the BGR channels and drop alpha
             plt.imshow(img[:, :, 2::-1], interpolation='none')
             plt.show()
 
