@@ -1,12 +1,14 @@
 """``fastgrab-record`` CLI — argparse around :class:`Recorder`."""
 import argparse
 import math
+import os
 import re
 import signal
 import sys
 import threading
 
 from .clicks import CLICK_PATTERNS, ClickStyle
+from .encoder import SUBTITLE_BACKENDS
 from .recorder import Recorder
 from .subtitles import Subtitle, SubtitleStyle
 
@@ -99,6 +101,19 @@ def _parse_subtitle(value: str):
         )
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc))
+
+
+def _resolve_sidecar(value, output: str):
+    """Resolve ``--subtitle-sidecar`` into a path, or ``None``.
+
+    The flag is optional-valued: absent is ``None``, a bare
+    ``--subtitle-sidecar`` arrives as ``""`` (its ``const``) and means
+    "name it after the video", so ``demo.mp4`` gives ``demo.ass`` — the
+    pairing mpv and VLC look for when they auto-load a subtitle track.
+    """
+    if value is None:
+        return None
+    return value or os.path.splitext(output)[0] + ".ass"
 
 
 def build_parser():
@@ -194,6 +209,24 @@ def build_parser():
     p.add_argument(
         "--subtitle-position", default="bottom", choices=["top", "bottom"],
         help="where subtitles are placed (default: bottom)",
+    )
+    p.add_argument(
+        "--subtitle-backend", default="drawtext", choices=list(SUBTITLE_BACKENDS),
+        help="how subtitles are rendered: 'drawtext' (default) draws each "
+             "line with ffmpeg, 'ass' generates an Advanced SubStation Alpha "
+             "script and burns it in with libass",
+    )
+    p.add_argument(
+        "--subtitle-font-name", default=None, metavar="FAMILY",
+        help="font family for --subtitle-backend ass, e.g. 'DejaVu Sans'. "
+             "libass resolves families, not file paths (default: guessed "
+             "from --subtitle-font)",
+    )
+    p.add_argument(
+        "--subtitle-sidecar", nargs="?", const="", default=None, metavar="PATH",
+        help="also write the subtitles as an editable .ass file; without a "
+             "PATH it is named after the output (demo.mp4 -> demo.ass), "
+             "which players such as mpv and VLC load as a toggleable track",
     )
     p.add_argument(
         "--gui", action="store_true",
@@ -345,7 +378,9 @@ def main(argv=None):
         font_color=args.subtitle_color,
         box_color=args.subtitle_box_color,
         position=args.subtitle_position,
+        font_name=args.subtitle_font_name,
     )
+    sidecar = _resolve_sidecar(args.subtitle_sidecar, args.output)
 
     recorder = Recorder(
         output_path=args.output,
@@ -359,6 +394,8 @@ def main(argv=None):
         show_cursor=args.show_cursor,
         subtitles=args.subtitle,
         subtitle_style=subtitle_style,
+        subtitle_backend=args.subtitle_backend,
+        subtitle_sidecar=sidecar,
     )
 
     stop_event = threading.Event()

@@ -2,11 +2,18 @@
 import os
 import shutil
 import subprocess
+import tempfile
 
 import numpy
 
 
 SUPPORTED_CODECS = ("mp4", "webm", "gif")
+
+# How timed subtitles are rendered: a drawtext chain built in this module,
+# or an ASS script burned in by libass. Lives here rather than in
+# subtitles.py (where it belongs conceptually) because that module imports
+# helpers from this one, and the import has to stay one-directional.
+SUBTITLE_BACKENDS = ("drawtext", "ass")
 
 # Codecs that encode to yuv420p and therefore need even width/height.
 # gif goes through a palette filter and has no such constraint.
@@ -28,6 +35,21 @@ def validate_fps(fps) -> int:
             "fps must be a positive integer, got {!r}".format(fps)
         )
     return int(fps)
+
+
+def validate_subtitle_backend(backend: str) -> str:
+    """Return ``backend`` if it names a subtitle renderer, else raise.
+
+    Checked at construction so a typo fails before the display is opened
+    and ffmpeg is spawned, like :func:`validate_fps`.
+    """
+    if backend not in SUBTITLE_BACKENDS:
+        raise ValueError(
+            "subtitle_backend must be one of {}, got {!r}".format(
+                ", ".join(repr(b) for b in SUBTITLE_BACKENDS), backend
+            )
+        )
+    return backend
 
 
 def validate_dimensions(codec: str, width: int, height: int) -> None:
@@ -101,6 +123,34 @@ def _escape_drawtext(text: str) -> str:
             out.append("\\" + ch)
         else:
             out.append(ch)
+    return "".join(out)
+
+
+def _escape_filter_value(value: str) -> str:
+    r"""Escape one level of ffmpeg filtergraph syntax.
+
+    ffmpeg unescapes a filter option value **twice** on its way in: once
+    when the graph parser splits the description into filters and their
+    argument blobs, and again when the argument blob is split into
+    ``key=value`` pairs. Both passes run ``av_get_token``, which turns
+    ``\x`` into ``x`` for any ``x`` and treats ``'`` as a quote. So a
+    value containing filter syntax has to be run through this function
+    twice — see :func:`fastgrab.recording.subtitles.build_ass_filter`.
+
+    Escaping once is the trap: ffmpeg accepts the string and then opens
+    the *wrong* file, because the surviving ``'`` is read as an opening
+    quote and silently swallowed (``/tmp/it's.ass`` → ``/tmp/its.ass``).
+
+    Over-escaping is harmless — ``\x`` always collapses to ``x`` — so we
+    escape the union of what matters at either level: the escape and
+    quote characters, the ``:`` and ``=`` that separate options, and the
+    ``,``, ``;``, ``[`` and ``]`` that separate filters.
+    """
+    out = []
+    for char in str(value):
+        if char in "\\':,;[]=":
+            out.append("\\")
+        out.append(char)
     return "".join(out)
 
 
@@ -219,14 +269,22 @@ class FfmpegEncoder:
 
     ``subtitles`` is a list of :class:`fastgrab.recording.subtitles.Subtitle`
     rendered (bottom-centre by default, see ``subtitle_style``) during
-    each entry's start/end window via additional drawtext filters.
+    each entry's start/end window. ``subtitle_backend`` picks how:
+    ``"drawtext"`` (the default) builds one drawtext filter per line,
+    ``"ass"`` writes an Advanced SubStation Alpha script to a temporary
+    file and burns it in with libass. ``subtitle_sidecar`` is a path to
+    write that ASS script to and keep — it works with either backend, and
+    naming it after the video (``demo.mp4`` → ``demo.ass``) is enough for
+    mpv or VLC to offer it as a toggleable track.
     """
 
     def __init__(self, output_path: str, width: int, height: int,
                  fps: int = 30, codec: str = None,
                  title: str = None, overlay_text: str = None,
                  font_path: str = None, title_seconds: float = 3.0,
-                 subtitles=None, subtitle_style=None):
+                 subtitles=None, subtitle_style=None,
+                 subtitle_backend: str = "drawtext",
+                 subtitle_sidecar: str = None):
         self.output_path = output_path
         self.width = width
         self.height = height
@@ -239,7 +297,12 @@ class FfmpegEncoder:
         self.title_seconds = title_seconds
         self.subtitles = subtitles
         self.subtitle_style = subtitle_style
+        self.subtitle_backend = validate_subtitle_backend(subtitle_backend)
+        self.subtitle_sidecar = subtitle_sidecar
         self._proc = None
+        # Temporary ASS script to delete on close(); a caller-supplied
+        # sidecar is never recorded here, because it is theirs to keep.
+        self._ass_path = None
 
     def _build_argv(self):
         vf = _build_drawtext_filter(
@@ -248,18 +311,77 @@ class FfmpegEncoder:
             title_seconds=self.title_seconds,
             font_path=self.font_path,
         )
-        if self.subtitles:
-            # Imported here to keep the module cycle (subtitles reuses
-            # helpers from this module) one-directional at import time.
-            from .subtitles import build_subtitle_filters
-            sub_vf = build_subtitle_filters(self.subtitles,
-                                            self.subtitle_style)
-            if sub_vf:
-                vf = "{},{}".format(vf, sub_vf) if vf else sub_vf
+        sub_vf = self._build_subtitle_filter()
+        if sub_vf:
+            vf = "{},{}".format(vf, sub_vf) if vf else sub_vf
         return _ffmpeg_args(
             self.codec, self.width, self.height, self.fps, self.output_path,
             vf_extra=vf,
         )
+
+    def _build_subtitle_filter(self):
+        """Render the subtitles, writing the ASS script when one is needed.
+
+        Returns the filter string to append to ``-vf``, or ``None``. The
+        ASS document is built whenever the ``ass`` backend is selected
+        *or* a sidecar was requested, so ``subtitle_sidecar`` can be
+        combined with burned-in drawtext.
+        """
+        if not self.subtitles:
+            return None
+        # Imported here to keep the module cycle (subtitles reuses
+        # helpers from this module) one-directional at import time.
+        from .subtitles import (
+            ass_fonts_dir, build_ass_document, build_ass_filter,
+            build_subtitle_filters,
+        )
+        burn_ass = self.subtitle_backend == "ass"
+        path = None
+        if burn_ass or self.subtitle_sidecar:
+            path = self._write_ass(
+                build_ass_document(
+                    self.subtitles, self.subtitle_style,
+                    width=self.width, height=self.height,
+                )
+            )
+        if not burn_ass:
+            return build_subtitle_filters(self.subtitles, self.subtitle_style)
+        return build_ass_filter(
+            path, fontsdir=ass_fonts_dir(self.subtitle_style)
+        )
+
+    def _write_ass(self, document: str) -> str:
+        """Write ``document`` to the sidecar path or a temp file, return it."""
+        self._cleanup_ass()
+        if self.subtitle_sidecar:
+            path = self.subtitle_sidecar
+            try:
+                with open(path, "w", encoding="utf-8") as fobj:
+                    fobj.write(document)
+            except OSError as exc:
+                # The sidecar path comes straight from the user, so give
+                # the CLI a message it can print instead of a traceback.
+                raise RuntimeError(
+                    "cannot write the subtitle sidecar {!r}: {}".format(
+                        path, exc
+                    )
+                ) from exc
+            return path
+        handle, path = tempfile.mkstemp(prefix="fastgrab-", suffix=".ass")
+        with os.fdopen(handle, "w", encoding="utf-8") as fobj:
+            fobj.write(document)
+        self._ass_path = path
+        return path
+
+    def _cleanup_ass(self) -> None:
+        """Delete the temporary ASS script, if we wrote one."""
+        path, self._ass_path = self._ass_path, None
+        if path is None:
+            return
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
     def start(self):
         if self._proc is not None:
@@ -270,12 +392,19 @@ class FfmpegEncoder:
                 "'apt-get install ffmpeg' or 'brew install ffmpeg') "
                 "to use fastgrab.recording"
             )
-        self._proc = subprocess.Popen(
-            self._build_argv(),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
+        try:
+            argv = self._build_argv()
+            self._proc = subprocess.Popen(
+                argv,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+        except Exception:
+            # Nothing will call close(), so drop the temporary ASS script
+            # here rather than leaving it in the system temp directory.
+            self._cleanup_ass()
+            raise
 
     def write_frame(self, frame) -> None:
         """Write one BGRA frame to ffmpeg's stdin.
@@ -310,6 +439,7 @@ class FfmpegEncoder:
 
     def close(self, timeout: float = 30.0) -> None:
         if self._proc is None:
+            self._cleanup_ass()
             return
         try:
             if self._proc.stdin is not None:
@@ -322,6 +452,8 @@ class FfmpegEncoder:
         finally:
             err = self._drain_stderr()
             self._proc = None
+            # ffmpeg has exited, so libass is done with the script.
+            self._cleanup_ass()
         if rc != 0:
             raise RuntimeError(
                 "ffmpeg exited with status {}: {}".format(rc, err)

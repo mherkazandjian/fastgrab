@@ -87,6 +87,46 @@ Click/cursor tracking and ``--gui`` need the ``[gui]`` extra
 polling and ``Pillow`` for the selector's preview); subtitles need a font
 file (``$FASTGRAB_FONT`` or the bundled DejaVu search paths).
 
+### ASS subtitles
+
+By default every subtitle becomes an ffmpeg ``drawtext`` filter.
+``--subtitle-backend ass`` instead generates an Advanced SubStation Alpha
+script from the same ``--subtitle`` lines and burns it in with libass
+(needs an ffmpeg built ``--enable-libass``, which the Debian/Ubuntu one
+is). ``--subtitle-sidecar`` keeps that script as an editable file —
+named after the video when no path is given, so ``demo.mp4`` gets
+``demo.ass``, which mpv and VLC pick up on their own as a track the
+viewer can switch off. The two flags are independent: a sidecar can
+accompany drawtext burn-in just as well.
+
+````bash
+  fastgrab-record --fullscreen -o demo.mp4 \
+      --subtitle "0.5-3.0:Hello world" --subtitle "4.0-6.5:Second line" \
+      --subtitle-backend ass --subtitle-sidecar \
+      --subtitle-font-name "DejaVu Sans" --subtitle-color yellow
+````
+
+From Python the same options are ``Recorder(..., subtitle_backend="ass",
+subtitle_sidecar="demo.ass")``, and ``build_ass_document(subtitles,
+style)`` returns the script as a string when the file is all you want.
+
+Both backends read the same ``SubtitleStyle``, which the ASS one maps
+onto a ``[V4+ Styles]`` row: font size, colours (converted to
+``&HAABBGGRR``, where the alpha byte is inverted), ``border`` as the
+opaque box's padding, and ``position`` as the alignment plus vertical
+margin. Three differences are worth knowing about:
+
+- libass resolves fonts by *family name*, not by path, so the family is
+  guessed from ``--subtitle-font``'s filename — pass
+  ``--subtitle-font-name`` when that guess is wrong. Unlike drawtext,
+  the ASS backend still renders when no font file is found at all.
+- the colour converter understands ``0xRRGGBB[AA]``, ``#RRGGBB[AA]`` and
+  ~25 common colour names, not ffmpeg's full ~150-name table; anything
+  else is refused before the encode starts rather than silently
+  mis-coloured.
+- long lines wrap inside the margins instead of running off the edge the
+  way drawtext does.
+
 Interactive use: ``fastgrab-record --gui`` opens a drag-to-select region
 picker followed by a small settings dialog (needs ``tkinter``), and
 ``fastgrab-record --print-xbindkeys`` prints a snippet for binding that to
