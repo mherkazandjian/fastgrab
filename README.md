@@ -24,11 +24,13 @@ resolution    | fps
   from fastgrab import screenshot
   # take a full screen screenshot
   img = screenshot.Screenshot().capture()
-  # >> img is a numpy ndarray, do whatever you want with it
+  # >> img is a numpy ndarray of shape (height, width, 4) in BGRA byte order
+  # >> do whatever you want with it
   # (optional)
   # e.g it can be displayed with matplotlib (install matplotlib first)
   from matplotlib import pyplot as plt
-  plt.imshow(img[:, :, 0:3], interpolation='none', cmap='Greys_r')
+  # matplotlib expects RGB, so reverse the BGR channels and drop alpha
+  plt.imshow(img[:, :, 2::-1], interpolation='none')
   plt.show()
 ````
 
