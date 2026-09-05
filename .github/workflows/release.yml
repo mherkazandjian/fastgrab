@@ -1,0 +1,100 @@
+name: release
+
+# Publishing runs from a published GitHub Release -- the release is the
+# deliberate human step, so a plain push can never ship a version.
+# workflow_dispatch is the rehearsal path: it targets TestPyPI by default so
+# the whole pipeline can be exercised without burning a version number, which
+# matters because PyPI never allows a filename to be reused, even after the
+# release is deleted.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Index to publish to"
+        type: choice
+        options:
+          - testpypi
+          - pypi
+        default: testpypi
+
+jobs:
+  build:
+    name: build sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install poetry and twine
+        run: |
+          pipx install poetry
+          pipx install twine
+
+      # Deliberately NOT `python -m build`. The repo root holds build.py
+      # (poetry's build hook) and `-m` puts the cwd on sys.path, so that name
+      # shadows the build frontend: the command compiles the extension
+      # in-place and exits 0 having produced no sdist at all.
+      - name: Build sdist
+        run: poetry build --format sdist
+
+      # Only an sdist is published, matching 0.1.0 and 0.2.0. A wheel built
+      # here would carry this runner's glibc in its manylinux tag without
+      # having been through auditwheel, and poetry-core emits a portable
+      # py3-none-any wheel on any non-Linux host -- which pip would prefer
+      # over the sdist on Linux and hand those users a package with no C
+      # extension. Real manylinux wheels need cibuildwheel + auditwheel.
+      - name: Check package metadata
+        run: twine check dist/*
+
+      # A tag that disagrees with pyproject.toml ships the wrong version
+      # under a filename that can never be reused.
+      - name: Verify the tag matches the packaged version
+        if: github.event_name == 'release'
+        run: |
+          packaged=$(python -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['tool']['poetry']['version'])")
+          tag="${GITHUB_REF_NAME#v}"
+          echo "packaged=${packaged}  tag=${tag}"
+          if [ "${packaged}" != "${tag}" ]; then
+            echo "::error::tag ${tag} does not match pyproject version ${packaged}"
+            exit 1
+          fi
+
+      # if-no-files-found defaults to `warn`, which would let an empty
+      # dist/ sail past and fail later, further from the cause -- exactly
+      # the shape of the `python -m build` trap above.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sdist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: publish to ${{ github.event_name == 'release' && 'pypi' || inputs.target }}
+    needs: build
+    runs-on: ubuntu-latest
+
+    # The environment is what PyPI's trusted publisher config is pinned to,
+    # and it is where a required-reviewer rule can gate the upload.
+    environment: ${{ github.event_name == 'release' && 'pypi' || inputs.target }}
+
+    permissions:
+      # Mints the short-lived OIDC token that PyPI exchanges for an upload
+      # token. This is the whole point of trusted publishing: no long-lived
+      # API key exists to leak.
+      id-token: write
+
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: sdist
+          path: dist/
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: ${{ (github.event_name == 'release' || inputs.target == 'pypi') && 'https://upload.pypi.org/legacy/' || 'https://test.pypi.org/legacy/' }}
