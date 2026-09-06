@@ -1,13 +1,9 @@
 import os
-import shutil
 import socket
-import subprocess
 import sys
 import time
 
 import pytest
-
-from fastgrab.backends._display import probe_display
 
 
 SOCKET_NAME = "fastgrab-painter.sock"
@@ -28,20 +24,28 @@ if sys.platform != "linux":
 
 
 def _x11_available() -> bool:
-    display = os.environ.get("DISPLAY")
-    if not display:
+    """Whether an X display can actually be opened.
+
+    Asks the extension the tests themselves will use, rather than
+    shelling out to xdpyinfo or reimplementing Xlib's address parsing.
+    Xlib accepts transport prefixes, socket pathnames, bracketed IPv6
+    literals and address-family pins; anything that reinterprets DISPLAY
+    by hand gets some of those wrong and mis-gates the suite. The old
+    xdpyinfo check also degraded to a bare "DISPLAY is set" whenever
+    xdpyinfo was not installed, which is the hole behind #44.
+    """
+    if not os.environ.get("DISPLAY"):
         return False
-    if not shutil.which("xdpyinfo"):
-        # Probe the server socket rather than trusting the variable.
-        # Returning True here waved the display tests through against a
-        # server that was not listening, turning what should be a clean
-        # skip into a "cannot open X display" failure — issue #44.
-        return probe_display(display)
-    return subprocess.run(
-        ["xdpyinfo", "-display", display],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    ).returncode == 0
+    try:
+        from fastgrab import _linux_x11
+    except ImportError:
+        # No compiled extension means nothing here can capture anyway.
+        return False
+    try:
+        _linux_x11.resolution()
+    except Exception:
+        return False
+    return True
 
 
 def _wayland_available() -> bool:
