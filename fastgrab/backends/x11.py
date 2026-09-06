@@ -1,4 +1,16 @@
-"""X11 backend — thin shim over the ``fastgrab._linux_x11`` C extension."""
+"""X11 backend — thin shim over the ``fastgrab._linux_x11`` C extension.
+
+The extension keeps **one X connection per process**, keyed on
+``DISPLAY``. It used to open and close a connection around every single
+request — two per ``capture()``, since ``bytes_per_pixel`` opens one of
+its own — which is the churn issue #44 blames for the intermittent
+"cannot open X display". Nothing on this side has to manage that: a
+caller who repoints ``DISPLAY`` is served by a new connection on the
+next call, a forked child connects for itself, and a server that goes
+away is reported as an exception rather than exiting the interpreter.
+The extension's ``_display_cache_info()`` and ``_close_display()`` are
+private and exist for ``tests/test_x11_lowlevel.py``.
+"""
 import functools
 import os
 
