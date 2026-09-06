@@ -112,7 +112,13 @@ static const char *fg_strerror(int code)
  *    fg_io_error_handler() below longjmps back out instead, the dead
  *    connection is dropped, and the call is retried once on a fresh one
  *    so that a restarted server keeps behaving the way it did when every
- *    call opened its own connection.
+ *    call opened its own connection. Two things this depends on are easy
+ *    to get subtly wrong, and both were: the handler has to be armed
+ *    around *every* Xlib call on a connection that might be dead --
+ *    XCloseDisplay included, since dropping a stale connection on a
+ *    DISPLAY switch is itself I/O -- and it has to be (re)installed per
+ *    armed region, because Xlib's handler is process-global and any
+ *    other Xlib user can replace it between two of our calls.
  *
  * Nothing tears the connection down at interpreter shutdown, on purpose.
  * The repo already avoids finalizer-ordering hazards (the wlr and
@@ -152,40 +158,47 @@ static int fg_display_name_matches(const char *env)
     return strcmp(env, fg_display_name) == 0;
 }
 
-/* Forget the cached connection.
+/* Reclaim just the descriptor of a connection we are giving up on.
  *
- * close_connection tells XCloseDisplay whether it may talk to the
- * server. It may not when the socket is shared with a parent process
- * (post-fork) or is already dead (I/O error): in both cases the protocol
- * write would either corrupt someone else's stream or re-enter the I/O
- * error path. The Display struct is then leaked -- once per fork and
- * once per server death, never per call -- and only the descriptor is
- * reclaimed. Closing our own descriptor sends nothing to the server and
- * leaves the parent's copy of the socket untouched. */
-static void fg_drop_display(int close_connection)
+ * Sends nothing to the server, so it is safe on a socket shared with a
+ * parent process (post-fork) and on one that is already dead. The
+ * Display struct is leaked in exchange -- once per fork and once per
+ * server death, never per call. */
+static void fg_close_connection_fd(Display *dpy)
 {
-    if (fg_display != NULL) {
-        if (close_connection) {
-            XCloseDisplay(fg_display);
-        } else {
-            int fd = ConnectionNumber(fg_display);
-            if (fd >= 0)
-                close(fd);
-        }
-    }
-    fg_display = NULL;
-    free(fg_display_name);
-    fg_display_name = NULL;
-    fg_display_pid = 0;
+    int fd = ConnectionNumber(dpy);
+
+    if (fd >= 0)
+        close(fd);
 }
 
 /* ------------------------------------------------------------------ *
  * I/O error recovery
  *
- * Installed lazily, on the first successful connect, so merely importing
- * fastgrab does not change process-global Xlib state. Re-installed on
- * every connect so that a host application which set its own handler in
- * the meantime is chained to rather than clobbered.
+ * Xlib's default I/O error handler prints and calls exit(), so any Xlib
+ * call on a connection whose server has gone away takes the interpreter
+ * with it -- no exception, no traceback. Every such call therefore runs
+ * inside an armed region: the handler below longjmps back out, and the
+ * caller drops the connection and reports an error.
+ *
+ * "Every such call" includes XCloseDisplay. It sends a KillClient and
+ * XSyncs before disconnecting, which is real I/O on a socket that may
+ * already be dead. Switching DISPLAY away from a server that had died
+ * while idle used to close that stale connection outside any armed
+ * region, so the fault reached Xlib's fatal handler and exited the
+ * interpreter -- even though the newly named display was perfectly
+ * healthy and the call was about to succeed.
+ *
+ * The handler is installed at the top of every armed region rather than
+ * once per connection. Xlib keeps a single process-global handler, so
+ * any other Xlib user in the process -- Tk under recording/gui, for one
+ * -- can replace or clear it at any time; installing only on connect
+ * left every later cache hit running under someone else's fatal handler
+ * with the setjmp below inert. Re-installing is a pointer swap, and the
+ * prev != ours test keeps the chain honest: it never records this
+ * handler as its own predecessor (which would recurse instead of
+ * longjmping), and it picks up a third-party handler installed since
+ * the previous region.
  * ------------------------------------------------------------------ */
 
 static jmp_buf fg_io_jmp;
@@ -199,7 +212,7 @@ static int fg_io_error_handler(Display *dpy)
         fg_io_armed = 0;
         longjmp(fg_io_jmp, 1);  /* does not return */
     }
-    /* Not our connection, or not inside a protected call: an I/O error
+    /* Not our connection, or not inside an armed region: an I/O error
      * handler is not allowed to return, so hand it to whoever was
      * installed before us. */
     if (fg_io_prev != NULL)
@@ -215,6 +228,62 @@ static void fg_install_io_handler(void)
 
     if (prev != fg_io_error_handler)
         fg_io_prev = prev;
+}
+
+/* Arm a region: until fg_io_disarm(), a fatal I/O error on dpy longjmps
+ * to the most recent setjmp(fg_io_jmp) instead of exiting. */
+static void fg_io_arm(Display *dpy)
+{
+    fg_install_io_handler();
+    fg_io_display = dpy;
+    fg_io_armed = 1;
+}
+
+static void fg_io_disarm(void)
+{
+    fg_io_armed = 0;
+}
+
+/* XCloseDisplay inside an armed region.
+ *
+ * On a fault Xlib has not reached _XDisconnectDisplay yet -- it dies in
+ * the sync it does first -- so the descriptor is still open and ours to
+ * reclaim, while the struct is abandoned because a close cannot be
+ * retried. The recovery path reads fg_io_display rather than the
+ * parameter: a local written before setjmp() is indeterminate after a
+ * longjmp, a file static is not. */
+static void fg_close_display_guarded(Display *dpy)
+{
+    if (setjmp(fg_io_jmp) != 0) {
+        fg_io_disarm();
+        fg_close_connection_fd(fg_io_display);
+        return;
+    }
+    fg_io_arm(dpy);
+    XCloseDisplay(dpy);
+    fg_io_disarm();
+}
+
+/* Forget the cached connection.
+ *
+ * close_connection says whether XCloseDisplay may be attempted at all.
+ * It may not when the socket is shared with a parent process
+ * (post-fork), where the protocol write would corrupt the parent's
+ * stream, nor when the connection has just faulted, where Xlib is
+ * already mid-teardown. Everywhere else the close goes through the
+ * guarded path above rather than raw. */
+static void fg_drop_display(int close_connection)
+{
+    if (fg_display != NULL) {
+        if (close_connection)
+            fg_close_display_guarded(fg_display);
+        else
+            fg_close_connection_fd(fg_display);
+    }
+    fg_display = NULL;
+    free(fg_display_name);
+    fg_display_name = NULL;
+    fg_display_pid = 0;
 }
 
 /* Return the cached connection, opening one if needed.
@@ -249,12 +318,11 @@ static int fg_acquire_display(Display **out, int *reused)
     if (env != NULL) {
         name = fg_dup(env);
         if (name == NULL) {
-            XCloseDisplay(dpy);
+            fg_close_display_guarded(dpy);
             return FG_ERR_NOMEM;
         }
     }
 
-    fg_install_io_handler();
     fg_display = dpy;
     fg_display_name = name;
     fg_display_pid = getpid();
@@ -286,15 +354,14 @@ static int fg_try_once(fg_display_op op, void *ctx, int *reused)
         return rc;
 
     if (setjmp(fg_io_jmp) != 0) {
-        fg_io_armed = 0;
+        fg_io_disarm();
         fg_drop_display(0);
         return FG_ERR_LOST;
     }
 
-    fg_io_display = dpy;
-    fg_io_armed = 1;
+    fg_io_arm(dpy);
     rc = op(dpy, ctx);
-    fg_io_armed = 0;
+    fg_io_disarm();
     return rc;
 }
 
