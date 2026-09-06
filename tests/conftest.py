@@ -7,6 +7,8 @@ import time
 
 import pytest
 
+from fastgrab.backends._display import probe_display
+
 
 SOCKET_NAME = "fastgrab-painter.sock"
 
@@ -30,7 +32,11 @@ def _x11_available() -> bool:
     if not display:
         return False
     if not shutil.which("xdpyinfo"):
-        return True
+        # Probe the server socket rather than trusting the variable.
+        # Returning True here waved the display tests through against a
+        # server that was not listening, turning what should be a clean
+        # skip into a "cannot open X display" failure — issue #44.
+        return probe_display(display)
     return subprocess.run(
         ["xdpyinfo", "-display", display],
         stdout=subprocess.DEVNULL,

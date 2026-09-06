@@ -134,3 +134,50 @@ def test_screenshot_rejects_read_only_buffer():
 def test_screenshot_rejects_non_array_buffer():
     with pytest.raises(TypeError, match="ndarray"):
         _linux_x11.screenshot(0, 0, [[0, 0, 0, 0]])
+
+
+def test_display_failure_names_the_display_it_tried(monkeypatch):
+    # The extension reports every XOpenDisplay failure with one sentence,
+    # so an intermittent CI failure used to be uninvestigable: the log
+    # could not say whether DISPLAY was unset, pointed somewhere dead, or
+    # had simply been refused that once. The backend appends that state.
+    # Regression for issue #44.
+    from fastgrab.backends.x11 import X11Backend
+
+    monkeypatch.setenv("DISPLAY", ":77")
+    backend = X11Backend()
+    with pytest.raises(RuntimeError, match=r"cannot open X display.*DISPLAY=':77'"):
+        backend.resolution()
+    with pytest.raises(RuntimeError, match=r"not reachable"):
+        backend.screenshot(0, 0, numpy.zeros((2, 2, 4), dtype=numpy.uint8))
+
+    # The original error stays reachable as the cause rather than being
+    # swallowed and reworded.
+    try:
+        backend.resolution()
+    except RuntimeError as exc:
+        assert isinstance(exc.__cause__, RuntimeError)
+        assert "cannot open X display" in str(exc.__cause__)
+
+
+def test_non_display_errors_pass_through_unchanged():
+    # Only the open-display error is annotated. Driven through the
+    # decorator directly because the extension's other RuntimeErrors
+    # (a failed XGetImage) cannot be provoked from a healthy server.
+    from fastgrab.backends.x11 import _with_display_context
+
+    @_with_display_context
+    def boom():
+        raise RuntimeError("XGetImage returned NULL")
+
+    with pytest.raises(RuntimeError) as excinfo:
+        boom()
+    assert "DISPLAY=" not in str(excinfo.value)
+    assert str(excinfo.value) == "XGetImage returned NULL"
+
+
+def test_display_context_preserves_the_wrapped_signature():
+    from fastgrab.backends.x11 import X11Backend
+
+    assert X11Backend.resolution.__name__ == "resolution"
+    assert X11Backend.screenshot.__name__ == "screenshot"
