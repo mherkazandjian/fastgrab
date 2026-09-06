@@ -133,3 +133,40 @@ def test_probe_survives_running_out_of_descriptors(monkeypatch):
     assert probe_display("box:0", timeout=0.5) is False
     # And the human-readable wrapper stays a string rather than throwing.
     assert "not reachable" in describe_display(":0")
+
+
+@pytest.mark.parametrize("spec", [":²", ":².0", "127.0.0.1:²"])
+def test_parse_rejects_digits_int_cannot_read(spec):
+    # "²".isdigit() is True but int("²") raises, so the narrower
+    # isdecimal() is what keeps a malformed DISPLAY from turning into a
+    # ValueError escaping the display gate.
+    assert parse_display(spec) is None
+    assert probe_display(spec) is False
+
+
+def test_probe_survives_an_absurd_display_number():
+    # 6000 + N stops being a port long before int stops being an int.
+    # A numeric host keeps this off the resolver — an unresolvable name
+    # here costs seconds of DNS timeout and measures nothing.
+    assert probe_display("127.0.0.1:999999999", timeout=0.5) is False
+
+
+def test_implicit_local_display_falls_back_to_localhost_tcp():
+    # A bare ":N" names a display, not a transport — Xlib will try
+    # localhost TCP when the unix socket is absent, so the probe must
+    # too, or it reports a working display as unreachable.
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        if port < 6000:  # pragma: no cover
+            pytest.skip("ephemeral port below the X TCP base")
+        number = port - 6000
+        assert probe_display(":{:d}".format(number), timeout=0.5) is True
+        # An explicit unix transport pins the socket and must NOT fall back.
+        assert probe_display(
+            "unix/:{:d}".format(number), timeout=0.5
+        ) is False
+    finally:
+        listener.close()

@@ -51,7 +51,15 @@ def parse_display(spec):
     if not sep:
         return None
     number = tail.split(".", 1)[0]
-    if not number.isdigit():
+    # isdecimal(), not isdigit(): the latter also accepts characters like
+    # the superscript "²", which int() then refuses — turning a
+    # malformed DISPLAY into a ValueError escaping the display gate
+    # instead of a clean "unusable, skip".
+    if not number.isdecimal():
+        return None
+    try:
+        number = int(number)
+    except ValueError:  # pragma: no cover - isdecimal() should preclude this
         return None
     host = head
     if host.startswith("[") and host.endswith("]"):
@@ -61,7 +69,7 @@ def parse_display(spec):
         host = ""
     elif host in _LOCAL_NAMES:
         host = ""
-    return host, int(number)
+    return host, number
 
 
 def _probe_unix(number, timeout):
@@ -91,13 +99,22 @@ def _probe_unix(number, timeout):
     return False
 
 
+def _explicit_local_transport(spec):
+    """Whether *spec* pins the transport to the local socket."""
+    if not spec or "/" not in spec:
+        return False
+    return spec.partition("/")[0] in ("unix", "local")
+
+
 def _probe_tcp(host, port, timeout):
     try:
         with socket.create_connection((host, port), timeout=timeout):
             return True
-    except OSError:
+    except (OSError, OverflowError, ValueError):
         # Covers refusal, timeout, unresolvable host (gaierror) and the
-        # out-of-descriptors case, all of which mean "not reachable here".
+        # out-of-descriptors case, all of which mean "not reachable
+        # here". OverflowError/ValueError catch a display number so large
+        # that 6000 + N is not a port at all.
         return False
 
 
@@ -117,7 +134,16 @@ def probe_display(spec=None, timeout=1.0):
     host, number = parsed
     if host:
         return _probe_tcp(host, _X_TCP_BASE + number, timeout)
-    return _probe_unix(number, timeout)
+    if _probe_unix(number, timeout):
+        return True
+    # A bare ":N" names a display, not a transport: Xlib falls back to a
+    # localhost TCP connection when the local socket is not there, so
+    # stopping at the unix probe would call a working display
+    # unreachable. An explicit "unix/" does pin the transport, and must
+    # not fall back.
+    if _explicit_local_transport(spec):
+        return False
+    return _probe_tcp("localhost", _X_TCP_BASE + number, timeout)
 
 
 def describe_display(spec=None):
