@@ -9,6 +9,7 @@ import argparse
 import os
 import shutil
 import subprocess
+import threading
 import time
 
 import numpy
@@ -425,8 +426,6 @@ def test_recorder_rejects_region_too_small_after_alignment(tmp_path):
 
 @pytest.mark.skipif(not _x11_available(), reason="needs X11 DISPLAY")
 def test_recorder_countdown_cancelled_records_nothing(tmp_path):
-    import threading
-
     out = tmp_path / "never.mp4"
     rec = Recorder(
         output_path=str(out), bbox=(0, 0, 120, 90), fps=10, backend="x11",
@@ -450,9 +449,28 @@ def test_recorder_smoke_mp4(tmp_path):
         fps=10,
         backend="x11",
     )
+    # Stop on a frame count, not on a clock. This used to record for a
+    # fixed 0.6 s and assert >= 4 frames, which at fps=10 demands the host
+    # sustain ~7 fps of capture-plus-encode — a statement about how fast
+    # the machine is rather than about the recorder, and one a loaded CI
+    # runner does not honour (issue #50; seen failing with `assert 1 >= 4`).
+    # record() checks stop_event at the top of every iteration and calls
+    # on_progress after each captured frame, so asking for the frames we
+    # want is exact. `duration` stays only as a generous backstop, so a
+    # genuinely broken capture loop fails the suite instead of hanging it.
+    wanted = 4
+    stop = threading.Event()
     seen = []
-    stats = rec.record(duration=0.6, on_progress=lambda n, _e: seen.append(n))
-    assert stats["frames"] >= 4
+
+    def progress(n, _elapsed):
+        seen.append(n)
+        if n >= wanted:
+            stop.set()
+
+    stats = rec.record(duration=30.0, stop_event=stop, on_progress=progress)
+    # A slow host now takes longer rather than failing; only a host that
+    # cannot manage 4 frames in 30 s trips this, which is a real problem.
+    assert stats["frames"] >= wanted
     # ffmpeg receives at least one frame per captured frame; any extras
     # are duplicates written to hold the target rate.
     assert stats["written_frames"] >= stats["frames"]
