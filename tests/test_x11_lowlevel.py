@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 
 import numpy
 import pytest
@@ -414,17 +415,32 @@ def test_a_forked_child_connects_for_itself():
     _linux_x11.resolution()
 
 
+def _display_number_in_use(number):
+    # Both artefacts matter: Xvfb unlinks its socket *and* its lock file
+    # on a clean exit, and leaves both behind when it is SIGKILLed.
+    return (os.path.exists("/tmp/.X11-unix/X%d" % number)
+            or os.path.exists("/tmp/.X%d-lock" % number))
+
+
 def _free_display_numbers(count):
     numbers = []
     for number in range(90, 130):
-        if os.path.exists("/tmp/.X11-unix/X%d" % number):
-            continue
-        if os.path.exists("/tmp/.X%d-lock" % number):
+        if _display_number_in_use(number):
             continue
         numbers.append(number)
         if len(numbers) == count:
             return numbers
     return None
+
+
+def _displays_still_in_use(numbers, timeout=15.0):
+    """Bounded wait for the disposable servers to release their numbers."""
+    deadline = time.time() + timeout
+    while True:
+        still = [n for n in numbers if _display_number_in_use(n)]
+        if not still or time.time() > deadline:
+            return still
+        time.sleep(0.1)
 
 
 def _run_x_fault_script(script, displays=1, timeout=180):
@@ -447,59 +463,141 @@ def _run_x_fault_script(script, displays=1, timeout=180):
         [sys.executable, "-c", script] + [":%d" % n for n in numbers],
         capture_output=True, text=True, timeout=timeout,
     )
-    report = "exit={}\nstdout:\n{}\nstderr:\n{}".format(
-        result.returncode, result.stdout, result.stderr,
+    leaked = _displays_still_in_use(numbers)
+    report = "exit={}\nstdout:\n{}\nstderr:\n{}\nleaked displays: {}".format(
+        result.returncode, result.stdout, result.stderr, leaked,
     )
+    # A surviving X server fails nothing by itself -- it just keeps a
+    # display number. Once the pool is used up these tests start
+    # skipping, and a skipped test reads as green, which is the exact
+    # failure mode this whole change exists to remove. Fail loudly
+    # instead. The report carries the run's own output either way, so
+    # this assertion firing first never hides the real problem.
+    assert not leaked, report
     return result, report
 
 
-# Run out-of-process on purpose. The failure this guards against is the
-# interpreter *exiting*, which an in-process test cannot report — it
-# would take the whole pytest session down with it. Out here a
-# regression shows up as a non-zero exit status plus Xlib's "XIO: fatal
-# IO error" on stderr, both of which the assertion prints.
-_DEAD_SERVER_SCRIPT = r'''
+# Shared by every fault-injection script below. Each one starts throwaway
+# X servers, and the three ways that goes wrong are all lifecycle bugs
+# rather than bugs in what is being tested, so they are solved once here:
+#
+#   * a server must be waited for before anything connects to it, or a
+#     one-shot XOpenDisplay races Xvfb's startup and fails against a
+#     perfectly correct extension;
+#   * a server must be SIGTERMed and reaped, not SIGKILLed, or it cannot
+#     unlink its socket and lock file and the display number looks
+#     occupied to every later run;
+#   * every exit path must clean up -- including os._exit() from inside
+#     an X I/O error handler, which cannot return and so cannot rely on
+#     a finally block.
+_XVFB_PRELUDE = r'''
 import os
 import subprocess
 import sys
 import time
 
-import numpy
-
 from fastgrab import _linux_x11
 
-display = sys.argv[1]
-server = subprocess.Popen(
-    ["Xvfb", display, "-screen", "0", "320x240x24", "-ac"],
-    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-)
-os.environ["DISPLAY"] = display
-try:
-    deadline = time.time() + 15.0
-    while True:
+_servers = []
+
+
+def say(text):
+    # os.write rather than print: os._exit() does not flush Python's
+    # buffers, and half these scripts exit from inside an X I/O error
+    # handler.
+    os.write(1, (text + "\n").encode())
+
+
+def socket_path(display):
+    return "/tmp/.X11-unix/X" + display.lstrip(":").split(".")[0]
+
+
+def start(display):
+    proc = subprocess.Popen(
+        ["Xvfb", display, "-screen", "0", "320x240x24", "-ac"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    _servers.append(proc)
+    return proc
+
+
+def wait_for_socket(display, timeout=20.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(socket_path(display)):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def wait_for_extension(display, timeout=20.0):
+    """Bounded wait until the extension can talk to `display`."""
+    os.environ["DISPLAY"] = display
+    deadline = time.time() + timeout
+    while time.time() < deadline:
         try:
-            _linux_x11.resolution()
-            break
+            return _linux_x11.resolution()
         except RuntimeError:
-            if time.time() > deadline:
-                print("SETUP-FAILED: Xvfb never became reachable")
-                raise SystemExit(2)
             time.sleep(0.05)
+    return None
+
+
+def stop(proc, timeout=15.0):
+    """Terminate and reap; SIGKILL only as a bounded fallback.
+
+    SIGTERM lets Xvfb unlink its socket and lock file. SIGKILL does not,
+    and the leftovers make that display number look occupied to every
+    later run.
+    """
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                pass
+    else:
+        proc.wait()
+
+
+def cleanup():
+    while _servers:
+        stop(_servers.pop())
+
+
+def finish(code, *messages):
+    """The one exit path. Nothing may leave a server behind."""
+    for message in messages:
+        say(message)
+    cleanup()
+    os._exit(code)
+'''
+
+
+_DEAD_SERVER_SCRIPT = _XVFB_PRELUDE + r'''
+import numpy
+
+display = sys.argv[1]
+server = start(display)
+try:
+    if not wait_for_socket(display) or wait_for_extension(display) is None:
+        finish(2, "SETUP-FAILED: Xvfb never became reachable")
 
     buf = numpy.zeros((16, 16, 4), "uint8")
-    # Every one of these arms a region and reinstalls the handler. If
-    # reinstalling ever recorded the handler as its own predecessor, a
+    # Every one of these arms a region and installs the handler. If
+    # installing ever recorded the handler as its own predecessor, a
     # fault would recurse instead of longjmping; 50 rounds makes that
     # show up as a crash rather than a pass.
     for _ in range(50):
         _linux_x11.screenshot(0, 0, buf)
     live = _linux_x11._display_cache_info()
     if not (live["connected"] and live["display"] == display):
-        print("SETUP-FAILED: not connected to the private server:", live)
-        raise SystemExit(2)
+        finish(2, "SETUP-FAILED: not connected to the private server: %r" % live)
 
-    server.terminate()
-    server.wait(timeout=15)
+    stop(server)
     time.sleep(0.2)
 
     # The cached connection is now a dead socket. Xlib's default I/O
@@ -509,16 +607,12 @@ try:
     except RuntimeError as exc:
         dead = _linux_x11._display_cache_info()
         if dead["connected"]:
-            print("KEPT-DEAD-CONNECTION:", dead)
-            raise SystemExit(3)
-        print("RAISED:", exc)
-        print("SURVIVED")
+            finish(3, "KEPT-DEAD-CONNECTION: %r" % dead)
+        finish(0, "RAISED: %s" % exc, "SURVIVED")
     else:
-        print("NO-ERROR: captured from a server that is gone")
-        raise SystemExit(3)
+        finish(3, "NO-ERROR: captured from a server that is gone")
 finally:
-    if server.poll() is None:
-        server.kill()
+    cleanup()
 '''
 
 
@@ -554,51 +648,28 @@ def test_a_dead_server_raises_instead_of_exiting_the_interpreter():
 # --------------------------------------------------------------------
 
 
-_SWITCHED_DISPLAY_SCRIPT = r'''
-import os
-import subprocess
-import sys
-import time
-
-from fastgrab import _linux_x11
-
+_SWITCHED_DISPLAY_SCRIPT = _XVFB_PRELUDE + r'''
 dead_display, live_display = sys.argv[1], sys.argv[2]
-
-
-def start(display):
-    return subprocess.Popen(
-        ["Xvfb", display, "-screen", "0", "320x240x24", "-ac"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-
-
-def connect(display):
-    os.environ["DISPLAY"] = display
-    deadline = time.time() + 15.0
-    while True:
-        try:
-            return _linux_x11.resolution()
-        except RuntimeError:
-            if time.time() > deadline:
-                print("SETUP-FAILED: %s never became reachable" % display)
-                raise SystemExit(2)
-            time.sleep(0.05)
-
 
 dead = start(dead_display)
 live = start(live_display)
 try:
+    for display in (dead_display, live_display):
+        if not wait_for_socket(display):
+            finish(2, "SETUP-FAILED: %s never appeared" % display)
+
     # Touch the survivor first so both servers are known good, then
     # leave the cache pointing at the one about to be killed.
-    connect(live_display)
-    connect(dead_display)
+    if wait_for_extension(live_display) is None:
+        finish(2, "SETUP-FAILED: %s never became reachable" % live_display)
+    if wait_for_extension(dead_display) is None:
+        finish(2, "SETUP-FAILED: %s never became reachable" % dead_display)
+
     cached = _linux_x11._display_cache_info()
     if cached["display"] != dead_display or not cached["connected"]:
-        print("SETUP-FAILED: cache holds", cached)
-        raise SystemExit(2)
+        finish(2, "SETUP-FAILED: cache holds %r" % cached)
 
-    dead.terminate()
-    dead.wait(timeout=15)
+    stop(dead)
     time.sleep(0.2)
 
     # Now name the healthy display. The cache has to drop the stale
@@ -609,14 +680,10 @@ try:
     size = _linux_x11.resolution()
     after = _linux_x11._display_cache_info()
     if not after["connected"] or after["display"] != live_display:
-        print("WRONG-DISPLAY:", after)
-        raise SystemExit(3)
-    print("SWITCHED: %r on %s" % (size, after["display"]))
-    print("SURVIVED")
+        finish(3, "WRONG-DISPLAY: %r" % after)
+    finish(0, "SWITCHED: %r on %s" % (size, after["display"]), "SURVIVED")
 finally:
-    for proc in (dead, live):
-        if proc.poll() is None:
-            proc.kill()
+    cleanup()
 '''
 
 
@@ -637,50 +704,30 @@ def test_switching_away_from_a_dead_display_does_not_exit():
     assert "SWITCHED:" in result.stdout, report
 
 
-_STOLEN_HANDLER_SCRIPT = r'''
+_STOLEN_HANDLER_SCRIPT = _XVFB_PRELUDE + r'''
 import ctypes
-import os
-import subprocess
-import sys
-import time
 
 import numpy
 
-from fastgrab import _linux_x11
-
 display = sys.argv[1]
-server = subprocess.Popen(
-    ["Xvfb", display, "-screen", "0", "320x240x24", "-ac"],
-    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-)
-os.environ["DISPLAY"] = display
+server = start(display)
 try:
-    deadline = time.time() + 15.0
-    while True:
-        try:
-            _linux_x11.resolution()
-            break
-        except RuntimeError:
-            if time.time() > deadline:
-                print("SETUP-FAILED: Xvfb never became reachable")
-                raise SystemExit(2)
-            time.sleep(0.05)
+    if not wait_for_socket(display) or wait_for_extension(display) is None:
+        finish(2, "SETUP-FAILED: Xvfb never became reachable")
 
     # Another Xlib user in the process clears the process-global I/O
     # error handler -- which is what a toolkit does when it tears its
     # own connection down, and Tk runs in-process under recording/gui.
-    # The extension is now covered by Xlib's fatal default unless it
-    # reinstalls for every protected call rather than once per connect.
+    # The extension is covered by Xlib's fatal default unless it
+    # installs for every protected call rather than once per connect.
     libX11 = ctypes.CDLL("libX11.so.6")
     libX11.XSetIOErrorHandler.restype = ctypes.c_void_p
     libX11.XSetIOErrorHandler.argtypes = [ctypes.c_void_p]
     stolen_from = libX11.XSetIOErrorHandler(None)
     if not stolen_from:
-        print("SETUP-FAILED: there was no handler installed to displace")
-        raise SystemExit(2)
+        finish(2, "SETUP-FAILED: there was no handler installed to displace")
 
-    server.terminate()
-    server.wait(timeout=15)
+    stop(server)
     time.sleep(0.2)
 
     buf = numpy.zeros((16, 16, 4), "uint8")
@@ -689,24 +736,18 @@ try:
     except RuntimeError as exc:
         dead = _linux_x11._display_cache_info()
         if dead["connected"]:
-            print("KEPT-DEAD-CONNECTION:", dead)
-            raise SystemExit(3)
-        print("RAISED:", exc)
+            finish(3, "KEPT-DEAD-CONNECTION: %r" % dead)
         # Surviving is not proof on its own -- reclaim the handler again
         # and check the extension had put the same function back, rather
         # than having got lucky some other way.
         reinstalled = libX11.XSetIOErrorHandler(None)
         if reinstalled != stolen_from:
-            print("NOT-REINSTALLED: %r vs %r" % (reinstalled, stolen_from))
-            raise SystemExit(3)
-        print("REINSTALLED")
-        print("SURVIVED")
+            finish(3, "NOT-REINSTALLED: %r vs %r" % (reinstalled, stolen_from))
+        finish(0, "RAISED: %s" % exc, "REINSTALLED", "SURVIVED")
     else:
-        print("NO-ERROR: captured from a server that is gone")
-        raise SystemExit(3)
+        finish(3, "NO-ERROR: captured from a server that is gone")
 finally:
-    if server.poll() is None:
-        server.kill()
+    cleanup()
 '''
 
 
@@ -781,14 +822,8 @@ def test_unread_events_do_not_pile_up_on_the_cached_connection():
     )
 
 
-_HANDLER_CYCLE_SCRIPT = r'''
+_HANDLER_CYCLE_SCRIPT = _XVFB_PRELUDE + r'''
 import ctypes
-import os
-import subprocess
-import sys
-import time
-
-from fastgrab import _linux_x11
 
 our_display, other_display = sys.argv[1], sys.argv[2]
 
@@ -802,16 +837,14 @@ libX11.XSync.restype = ctypes.c_int
 libX11.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
 
 
-def say(text):
-    os.write(1, (text + "\n").encode())
-
-
 # The handler that was there first. Reaching it is the whole point: a
 # delegation chain has to end somewhere.
 @HANDLER
 def base_handler(dpy):
-    say("BASE-REACHED")
-    os._exit(0)
+    # finish() rather than a bare os._exit: an X I/O error handler must
+    # not return, so this is the only chance to stop the servers this
+    # script started. The successful path used to leak one here.
+    finish(0, "BASE-REACHED")
     return 0
 
 
@@ -825,42 +858,36 @@ entries = [0]
 def delegating_handler(dpy):
     entries[0] += 1
     if entries[0] > 1:
-        say("CYCLE: delegation came back round to this handler")
-        os._exit(9)
+        finish(9, "CYCLE: delegation came back round to this handler")
     displaced_by_us(dpy)
-    say("UNREACHABLE: a delegate returned")
-    os._exit(4)
+    finish(4, "UNREACHABLE: a delegate returned")
     return 0
-
-
-def start(display):
-    return subprocess.Popen(
-        ["Xvfb", display, "-screen", "0", "320x240x24", "-ac"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
 
 
 ours = start(our_display)
 other = start(other_display)
 try:
+    for display in (our_display, other_display):
+        if not wait_for_socket(display):
+            finish(2, "SETUP-FAILED: %s never appeared" % display)
+
     libX11.XSetIOErrorHandler(base_handler)
 
-    os.environ["DISPLAY"] = our_display
-    deadline = time.time() + 15.0
-    while True:
-        try:
-            _linux_x11.resolution()
-            break
-        except RuntimeError:
-            if time.time() > deadline:
-                say("SETUP-FAILED: %s never became reachable" % our_display)
-                raise SystemExit(2)
-            time.sleep(0.05)
+    if wait_for_extension(our_display) is None:
+        finish(2, "SETUP-FAILED: %s never became reachable" % our_display)
 
-    unrelated = libX11.XOpenDisplay(other_display.encode())
+    # Bounded retry rather than one shot: the socket existing does not
+    # quite mean the server is accepting yet, and a lost race here would
+    # fail the test against a correct extension.
+    unrelated = None
+    deadline = time.time() + 20.0
+    while time.time() < deadline:
+        unrelated = libX11.XOpenDisplay(other_display.encode())
+        if unrelated:
+            break
+        time.sleep(0.05)
     if not unrelated:
-        say("SETUP-FAILED: could not open %s" % other_display)
-        raise SystemExit(2)
+        finish(2, "SETUP-FAILED: could not open %s" % other_display)
 
     # A third party installs its delegating handler between two
     # captures. Whatever it displaces becomes its predecessor.
@@ -871,19 +898,15 @@ try:
     # its own predecessor and closes the loop.
     _linux_x11.resolution()
 
-    other.terminate()
-    other.wait(timeout=15)
+    stop(other)
     time.sleep(0.2)
 
     # A fatal I/O error on a connection that has nothing to do with the
     # cache. It must reach base_handler.
     libX11.XSync(unrelated, 0)
-    say("NO-FAULT: the dead connection did not raise an I/O error")
-    raise SystemExit(5)
+    finish(5, "NO-FAULT: the dead connection did not raise an I/O error")
 finally:
-    for proc in (ours, other):
-        if proc.poll() is None:
-            proc.kill()
+    cleanup()
 '''
 
 
