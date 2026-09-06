@@ -19,9 +19,15 @@ _DISPLAY_ERROR = "cannot open X display"
 def _with_display_context(func):
     """Append the DISPLAY state to a failed-to-open-display error.
 
-    Only that one error is touched; every other RuntimeError from the
-    extension already names its own cause and passes through untouched.
-    The probe runs on the failure path only, so the capture path is
+    Applied to every entry point that opens a display of its own — which
+    is all three, ``bytes_per_pixel`` included. That one matters more
+    than it looks: once ``Screenshot`` has cached the screen size, it is
+    the first server call a subsequent ``capture()`` makes, and so the
+    likeliest place to meet a server that went away between captures.
+
+    Only the open-display error is touched; every other RuntimeError from
+    the extension already names its own cause and passes through
+    untouched. The probe runs on the failure path only, so capture is
     unaffected.
     """
     @functools.wraps(func)
@@ -31,7 +37,17 @@ def _with_display_context(func):
         except RuntimeError as exc:
             if _DISPLAY_ERROR not in str(exc):
                 raise
-            raise RuntimeError("{} [{}]".format(exc, describe_display())) from exc
+            try:
+                hint = describe_display()
+            except Exception:
+                # A diagnostic must never displace the error it exists to
+                # describe. Callers catch RuntimeError; handing them
+                # something else instead would break them at the worst
+                # possible moment — and the likeliest reason this probe
+                # fails is the same descriptor exhaustion that just took
+                # XOpenDisplay down.
+                raise exc
+            raise RuntimeError("{} [{}]".format(exc, hint)) from exc
 
     return wrapper
 
@@ -41,6 +57,7 @@ class X11Backend(BaseBackend):
     def resolution(self):
         return _linux_x11.resolution()
 
+    @_with_display_context
     def bytes_per_pixel(self):
         return _linux_x11.bytes_per_pixel()
 

@@ -181,3 +181,29 @@ def test_display_context_preserves_the_wrapped_signature():
 
     assert X11Backend.resolution.__name__ == "resolution"
     assert X11Backend.screenshot.__name__ == "screenshot"
+
+
+def test_bytes_per_pixel_also_reports_the_display(monkeypatch):
+    # It opens a display of its own, and once Screenshot has cached the
+    # screen size it is the first server call a later capture() makes —
+    # so it is the likeliest entry point to meet a vanished server.
+    from fastgrab.backends.x11 import X11Backend
+
+    monkeypatch.setenv("DISPLAY", ":77")
+    with pytest.raises(RuntimeError, match=r"DISPLAY=':77'"):
+        X11Backend().bytes_per_pixel()
+
+
+def test_a_failing_diagnostic_does_not_replace_the_real_error(monkeypatch):
+    # Callers catch RuntimeError. If describing DISPLAY blows up, the
+    # original error must still be what comes out.
+    import fastgrab.backends.x11 as x11_mod
+
+    def boom():
+        raise OSError(24, "Too many open files")
+
+    monkeypatch.setattr(x11_mod, "describe_display", boom)
+    monkeypatch.setenv("DISPLAY", ":77")
+    with pytest.raises(RuntimeError, match="cannot open X display") as excinfo:
+        x11_mod.X11Backend().resolution()
+    assert "DISPLAY=" not in str(excinfo.value)

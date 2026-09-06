@@ -101,3 +101,35 @@ def test_probe_falls_back_to_the_environment(monkeypatch):
     assert probe_display() is False
     monkeypatch.setenv("DISPLAY", ":77")
     assert probe_display(timeout=0.5) is False
+
+
+@pytest.mark.parametrize("spec, expected", [
+    # Xlib's full form is [protocol/][host]:number[.screen].
+    ("unix/:0", ("", 0)),
+    ("local/:0", ("", 0)),
+    ("unix/somehost:3", ("", 3)),   # explicit local transport wins
+    ("tcp/box:0", ("box", 0)),
+    ("tcp/box:0.1", ("box", 0)),
+    # IPv6 literals arrive bracketed and must reach the socket bare.
+    ("[::1]:0", ("::1", 0)),
+    ("tcp/[fe80::1]:2", ("fe80::1", 2)),
+])
+def test_parse_display_handles_transports_and_ipv6(spec, expected):
+    assert parse_display(spec) == expected
+
+
+def test_probe_survives_running_out_of_descriptors(monkeypatch):
+    # Descriptor exhaustion is exactly when XOpenDisplay fails, and this
+    # probe runs on that failure path. If it raised EMFILE of its own it
+    # would replace the caller's RuntimeError with an OSError.
+    import fastgrab.backends._display as display_mod
+
+    def no_more_fds(*args, **kwargs):
+        raise OSError(24, "Too many open files")
+
+    monkeypatch.setattr(display_mod.socket, "socket", no_more_fds)
+    monkeypatch.setattr(display_mod.socket, "create_connection", no_more_fds)
+    assert probe_display(":0", timeout=0.5) is False
+    assert probe_display("box:0", timeout=0.5) is False
+    # And the human-readable wrapper stays a string rather than throwing.
+    assert "not reachable" in describe_display(":0")
