@@ -34,12 +34,17 @@ promise the code keeps:
   store — the backend refuses a sub-region request there rather than
   returning the wrong one. Full-output capture is unaffected either
   way. See issue #38.
-* ``windows`` reports and captures in whatever DPI context the host
-  process happens to have. Windows virtualizes screen metrics for
-  DPI-unaware threads and ``BitBlt`` takes logical units, and neither
-  the backend nor CPython's manifest establishes per-monitor awareness,
-  so at a display scale other than 100% these are not physical pixels.
-  See issue #39.
+* ``windows`` honours it on Windows 10 1607 and later, where the
+  backend temporarily gives its own thread per-monitor-v2 DPI
+  awareness around the metrics query, the screen-DC acquisition and
+  the blit, so neither the host process's DPI context nor the display
+  scale changes what it reports or captures. On older Windows
+  ``SetThreadDpiAwarenessContext`` does not exist; there the backend
+  falls back to the host's context and, at a display scale other than
+  100%, back to logical units. Primary monitor only in either case —
+  the desktop DC's origin is the primary monitor's top-left, and
+  reaching a second monitor at its own scale is the future
+  ``Screenshot(display=N)`` feature, not a DPI question.
 * ``portal`` is a placeholder that raises ``NotImplementedError``.
 """
 from abc import ABC, abstractmethod
