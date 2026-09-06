@@ -12,7 +12,7 @@ try:
     from importlib.metadata import version as _dist_version
     version = _dist_version(package)
 except Exception:  # PackageNotFoundError when not installed
-    version = '0.3.0'
+    version = '0.4.0'
 description = 'Low level screen capture package with a numpy interface'
 authors = ['Mher Kazandjian']
 authors_string = ', '.join(authors)
