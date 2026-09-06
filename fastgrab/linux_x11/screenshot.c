@@ -116,9 +116,11 @@ static const char *fg_strerror(int code)
  *    to get subtly wrong, and both were: the handler has to be armed
  *    around *every* Xlib call on a connection that might be dead --
  *    XCloseDisplay included, since dropping a stale connection on a
- *    DISPLAY switch is itself I/O -- and it has to be (re)installed per
- *    armed region, because Xlib's handler is process-global and any
- *    other Xlib user can replace it between two of our calls.
+ *    DISPLAY switch is itself I/O -- and it has to be installed *and
+ *    removed* per armed region. Xlib's handler is process-global, so
+ *    leaving ours installed between calls both let another Xlib user
+ *    replace it unnoticed and let one chain to it, closing a delegation
+ *    loop that no I/O error could ever escape.
  *
  * Nothing tears the connection down at interpreter shutdown, on purpose.
  * The repo already avoids finalizer-ordering hazards (the wlr and
@@ -137,6 +139,10 @@ static pid_t fg_display_pid = 0;
  * _display_cache_info() below, which is how the tests observe that a
  * capture loop reuses one connection instead of opening one per frame. */
 static unsigned long fg_display_opens = 0;
+/* Unsolicited events thrown away since import. Read by the private
+ * _display_cache_info() so a test can tell a drained queue from a queue
+ * nothing ever arrived on. */
+static unsigned long fg_events_discarded = 0;
 
 /* strdup() is POSIX and this file is compiled with -std=c11; rather than
  * depend on which feature-test macros happen to be in force, duplicate
@@ -222,19 +228,33 @@ static int fg_io_error_handler(Display *dpy)
     exit(1);
 }
 
-static void fg_install_io_handler(void)
-{
-    XIOErrorHandler prev = XSetIOErrorHandler(fg_io_error_handler);
-
-    if (prev != fg_io_error_handler)
-        fg_io_prev = prev;
-}
-
 /* Arm a region: until fg_io_disarm(), a fatal I/O error on dpy longjmps
- * to the most recent setjmp(fg_io_jmp) instead of exiting. */
+ * to the most recent setjmp(fg_io_jmp) instead of exiting.
+ *
+ * The displaced handler is put back on the way out, so this one is
+ * installed only while a protected call is actually running. Staying
+ * installed between calls is what let a chain close into a loop: a
+ * third party installing a delegating handler in the gap would capture
+ * *this* handler as its predecessor, and the next arm would then record
+ * that wrapper as fg_io_prev -- two handlers each delegating to the
+ * other, and an I/O error on an unrelated connection bouncing between
+ * them forever instead of reaching the handler that was there first.
+ * Testing prev != ours only ever caught the direct case.
+ *
+ * Swapping in and out per region is safe because the GIL is held across
+ * the whole call and nothing inside a region runs Python, so no other
+ * Xlib user in this process can install a handler while we are swapped
+ * in. (A non-Python thread calling XSetIOErrorHandler in that window
+ * would have its install overwritten on disarm. That is a narrower race
+ * than the cycle it replaces, and Xlib's single global handler offers
+ * nothing better.)
+ *
+ * fg_io_display is deliberately not cleared here: the recovery path in
+ * fg_close_display_guarded() reads it straight after a fault to find
+ * the descriptor to reclaim. It is only ever compared while armed. */
 static void fg_io_arm(Display *dpy)
 {
-    fg_install_io_handler();
+    fg_io_prev = XSetIOErrorHandler(fg_io_error_handler);
     fg_io_display = dpy;
     fg_io_armed = 1;
 }
@@ -242,6 +262,35 @@ static void fg_io_arm(Display *dpy)
 static void fg_io_disarm(void)
 {
     fg_io_armed = 0;
+    XSetIOErrorHandler(fg_io_prev);
+    fg_io_prev = NULL;
+}
+
+/* Discard events the server sent that nobody asked for.
+ *
+ * MappingNotify reaches every client whatever its event mask, so any
+ * other client changing a keyboard or pointer mapping queues an event
+ * on this connection. The synchronous calls here pull those into Xlib's
+ * queue while waiting for their own replies, and nothing ever consumes
+ * them. A per-call connection reclaimed the queue at XCloseDisplay; a
+ * cached one grows for the life of the process -- worst in exactly the
+ * long-running recording loop this cache exists to speed up.
+ *
+ * QueuedAlready is a queue-length read and never a socket read, so this
+ * cannot block or fault; anything still in the socket buffer is pulled
+ * into the queue by the next call's reply processing and discarded
+ * then. It runs inside the armed region anyway, because that is where
+ * every Xlib call on this connection belongs. */
+static void fg_drain_events(Display *dpy)
+{
+    int queued = XEventsQueued(dpy, QueuedAlready);
+
+    while (queued-- > 0) {
+        XEvent event;
+
+        XNextEvent(dpy, &event);
+        fg_events_discarded++;
+    }
 }
 
 /* XCloseDisplay inside an armed region.
@@ -255,8 +304,15 @@ static void fg_io_disarm(void)
 static void fg_close_display_guarded(Display *dpy)
 {
     if (setjmp(fg_io_jmp) != 0) {
+        /* Read before disarming rather than after: the connection to
+         * reclaim is the one the handler faulted on, and depending on
+         * disarm leaving fg_io_display alone would be a trap for the
+         * next person to touch it. */
+        Display *faulted = fg_io_display;
+
         fg_io_disarm();
-        fg_close_connection_fd(fg_io_display);
+        if (faulted != NULL)
+            fg_close_connection_fd(faulted);
         return;
     }
     fg_io_arm(dpy);
@@ -361,6 +417,7 @@ static int fg_try_once(fg_display_op op, void *ctx, int *reused)
 
     fg_io_arm(dpy);
     rc = op(dpy, ctx);
+    fg_drain_events(dpy);
     fg_io_disarm();
     return rc;
 }
@@ -660,11 +717,18 @@ static PyObject *linux_x11_display_cache_info(PyObject *self, PyObject *args)
         if (name == NULL)
             return NULL;
     }
-    return Py_BuildValue("{s:O,s:N,s:k,s:l}",
+    /* QueuedAlready is a queue-length read, not a socket read: it does
+     * no I/O, so it needs no armed region and cannot fault. */
+    return Py_BuildValue("{s:O,s:N,s:k,s:l,s:l,s:k}",
                          "connected", fg_display != NULL ? Py_True : Py_False,
                          "display", name,
                          "opens", fg_display_opens,
-                         "pid", (long)fg_display_pid);
+                         "pid", (long)fg_display_pid,
+                         "queued",
+                         fg_display != NULL
+                             ? (long)XEventsQueued(fg_display, QueuedAlready)
+                             : 0L,
+                         "events_discarded", fg_events_discarded);
 }
 
 static PyObject *linux_x11_close_display(PyObject *self, PyObject *args)
@@ -686,9 +750,12 @@ static PyMethodDef linux_x11_methods[] = {
      "capture a screenshot using X11"},
     {"_display_cache_info", linux_x11_display_cache_info, METH_NOARGS,
      "private, for the tests: report the cached X connection as a dict "
-     "of connected / display / opens / pid. 'opens' counts connections "
-     "made since import, which is how a test tells connection reuse from "
-     "one connection per frame."},
+     "of connected / display / opens / pid / queued / events_discarded. "
+     "'opens' counts connections made since import, which is how a test "
+     "tells connection reuse from one connection per frame. 'queued' is "
+     "the unread event queue length and 'events_discarded' the running "
+     "total thrown away, which together tell a drained queue from one "
+     "nothing ever arrived on."},
     {"_close_display", linux_x11_close_display, METH_NOARGS,
      "private, for the tests: drop the cached X connection. The next "
      "call reconnects."},

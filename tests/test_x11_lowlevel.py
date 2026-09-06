@@ -723,3 +723,189 @@ def test_a_stolen_io_error_handler_is_reinstalled():
     assert "SURVIVED" in result.stdout, report
     assert "REINSTALLED" in result.stdout, report
     assert "cannot open X display" in result.stdout, report
+
+
+# --------------------------------------------------------------------
+# Two consequences of the connection being persistent rather than
+# per-call: a delegation chain that can close into a loop, and an event
+# queue that nothing reclaims.
+# --------------------------------------------------------------------
+
+
+def test_unread_events_do_not_pile_up_on_the_cached_connection():
+    """MappingNotify reaches every client, and nothing here reads events.
+
+    A per-call connection reclaimed its queue at XCloseDisplay. A cached
+    one does not, so whatever the server pushes accumulates for the life
+    of the process -- worst in exactly the long-running recording loop
+    this cache exists to speed up.
+    """
+    xdisplay = pytest.importorskip("Xlib.display")
+
+    _linux_x11.resolution()
+    before = _linux_x11._display_cache_info()
+
+    other = xdisplay.Display()
+    try:
+        mapping = other.get_pointer_mapping()
+        for _ in range(25):
+            # Every SetPointerMapping makes the server send a
+            # MappingNotify to every client on the display, ours
+            # included, whatever event mask it selected. Setting the
+            # mapping it already has keeps the display untouched.
+            other.set_pointer_mapping(mapping)
+            other.sync()
+            _linux_x11.resolution()
+    finally:
+        other.close()
+
+    # One more call, so anything still sitting in the socket is pulled
+    # into the queue and discarded rather than counted as a leak below.
+    _linux_x11.resolution()
+    after = _linux_x11._display_cache_info()
+
+    # Count arrivals in a way that does not presuppose the fix: an event
+    # that reached this connection was either discarded or is still
+    # sitting in the queue. Asserting only on the discard counter would
+    # make the guard fire first when the drain is removed, and the test
+    # would never get to show the queue growing -- which is the symptom.
+    arrived = (after["events_discarded"] - before["events_discarded"]
+               + after["queued"])
+    assert arrived > 0, (
+        "no MappingNotify reached the cached connection, so this test "
+        "cannot tell a drained queue from one nothing ever arrived on"
+    )
+    assert after["queued"] == 0, (
+        "unread events are accumulating on the cached connection: "
+        "{} still queued after {} arrived".format(after["queued"], arrived)
+    )
+
+
+_HANDLER_CYCLE_SCRIPT = r'''
+import ctypes
+import os
+import subprocess
+import sys
+import time
+
+from fastgrab import _linux_x11
+
+our_display, other_display = sys.argv[1], sys.argv[2]
+
+libX11 = ctypes.CDLL("libX11.so.6")
+HANDLER = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p)
+libX11.XSetIOErrorHandler.restype = HANDLER
+libX11.XSetIOErrorHandler.argtypes = [HANDLER]
+libX11.XOpenDisplay.restype = ctypes.c_void_p
+libX11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+libX11.XSync.restype = ctypes.c_int
+libX11.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+
+def say(text):
+    os.write(1, (text + "\n").encode())
+
+
+# The handler that was there first. Reaching it is the whole point: a
+# delegation chain has to end somewhere.
+@HANDLER
+def base_handler(dpy):
+    say("BASE-REACHED")
+    os._exit(0)
+    return 0
+
+
+entries = [0]
+
+
+# What a third party installs: it captures whatever handler is current
+# and passes faults along to it. Harmless in itself -- unless the
+# handler it captured is one that will hand the fault straight back.
+@HANDLER
+def delegating_handler(dpy):
+    entries[0] += 1
+    if entries[0] > 1:
+        say("CYCLE: delegation came back round to this handler")
+        os._exit(9)
+    displaced_by_us(dpy)
+    say("UNREACHABLE: a delegate returned")
+    os._exit(4)
+    return 0
+
+
+def start(display):
+    return subprocess.Popen(
+        ["Xvfb", display, "-screen", "0", "320x240x24", "-ac"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+ours = start(our_display)
+other = start(other_display)
+try:
+    libX11.XSetIOErrorHandler(base_handler)
+
+    os.environ["DISPLAY"] = our_display
+    deadline = time.time() + 15.0
+    while True:
+        try:
+            _linux_x11.resolution()
+            break
+        except RuntimeError:
+            if time.time() > deadline:
+                say("SETUP-FAILED: %s never became reachable" % our_display)
+                raise SystemExit(2)
+            time.sleep(0.05)
+
+    unrelated = libX11.XOpenDisplay(other_display.encode())
+    if not unrelated:
+        say("SETUP-FAILED: could not open %s" % other_display)
+        raise SystemExit(2)
+
+    # A third party installs its delegating handler between two
+    # captures. Whatever it displaces becomes its predecessor.
+    displaced_by_us = libX11.XSetIOErrorHandler(delegating_handler)
+
+    # The second capture. If the extension leaves itself installed
+    # globally, this is where it records the third party's wrapper as
+    # its own predecessor and closes the loop.
+    _linux_x11.resolution()
+
+    other.terminate()
+    other.wait(timeout=15)
+    time.sleep(0.2)
+
+    # A fatal I/O error on a connection that has nothing to do with the
+    # cache. It must reach base_handler.
+    libX11.XSync(unrelated, 0)
+    say("NO-FAULT: the dead connection did not raise an I/O error")
+    raise SystemExit(5)
+finally:
+    for proc in (ours, other):
+        if proc.poll() is None:
+            proc.kill()
+'''
+
+
+def test_the_delegation_chain_cannot_close_into_a_loop():
+    """Staying installed between calls let a chain become a cycle.
+
+    A third party that installs a delegating handler in the gap between
+    two captures captures *this* extension's handler as its predecessor.
+    If the extension then re-installs and records that wrapper as its
+    own predecessor, the two delegate to each other and an I/O error on
+    an unrelated connection never reaches the handler that was there
+    first. Testing "the handler I displaced is not literally me" only
+    ever caught the direct case.
+
+    The subprocess counts how many times the third-party handler is
+    entered, so a cycle terminates the run with a marker instead of
+    recursing without bound; the subprocess timeout is a second
+    backstop.
+    """
+    result, report = _run_x_fault_script(_HANDLER_CYCLE_SCRIPT, displays=2)
+    assert result.returncode == 0, report
+    # Not just "it stopped" -- the fault has to have arrived at the
+    # handler that was installed before any of this started.
+    assert "BASE-REACHED" in result.stdout, report
+    assert "CYCLE" not in result.stdout, report
