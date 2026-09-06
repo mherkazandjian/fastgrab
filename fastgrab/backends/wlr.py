@@ -8,6 +8,14 @@ intended fallback.
 V1 captures from a single output. Selection order:
 ``$FASTGRAB_OUTPUT`` (if set, matches output ``name``) → first output
 advertised. Multi-monitor composition is out of scope for this version.
+
+``capture_output_region`` takes its region in **output logical
+coordinates**, while a fastgrab bbox is device pixels and
+:meth:`WlrBackend.resolution` reports the ``wl_output`` mode size. Those
+agree only on an unscaled output. The gap is closed by tracking the
+output's logical geometry through ``zxdg_output_manager_v1`` and
+converting at this boundary — see :func:`_plan_region` for the
+conversion and exactly what it is allowed to assume.
 """
 import mmap
 import os
@@ -17,6 +25,14 @@ import numpy as np
 
 from pywayland.client import Display
 from pywayland.protocol.wayland import WlOutput, WlShm
+
+try:
+    from pywayland.protocol.xdg_output_unstable_v1 import ZxdgOutputManagerV1
+except ImportError:  # pragma: no cover — older than the pywayland the extra pins
+    # Without xdg_output the output's logical size is unknowable, and
+    # sub-region capture degrades to a full-output capture plus a crop.
+    # See WlrBackend._subregion_plan.
+    ZxdgOutputManagerV1 = None
 
 from .base import BaseBackend
 from .protocols.wlr_screencopy_unstable_v1 import ZwlrScreencopyManagerV1
@@ -30,11 +46,16 @@ _WL_SHM_FORMAT_XRGB8888 = 1
 
 _FRAME_VERSION = 3
 
+# zxdg_output_manager_v1 is at version 3; logical_position and
+# logical_size have been there since version 1, so binding low is safe.
+_XDG_OUTPUT_VERSION = 3
+
 
 class _OutputState:
     """Mutable accumulator for a single ``wl_output``'s geometry events."""
     __slots__ = ("proxy", "name", "mode_w", "mode_h", "scale", "transform",
-                 "done")
+                 "logical_x", "logical_y", "logical_w", "logical_h",
+                 "xdg", "done")
 
     def __init__(self, proxy):
         self.proxy = proxy
@@ -45,6 +66,14 @@ class _OutputState:
         # WL_OUTPUT_TRANSFORM_NORMAL; anything else rotates or flips the
         # logical coordinate space relative to the backing store.
         self.transform = 0
+        # xdg_output's logical geometry, the unit capture_output_region
+        # speaks. 0 means "never told": a compositor need not advertise
+        # zxdg_output_manager_v1 at all.
+        self.logical_x = 0
+        self.logical_y = 0
+        self.logical_w = 0
+        self.logical_h = 0
+        self.xdg = None
         self.done = False
 
 
@@ -62,6 +91,103 @@ class _FrameState:
         self.flags = 0
         self.ready = False
         self.failed = False
+
+
+class _RegionPlan:
+    """How to ask for a device-pixel bbox, and what to do with the answer.
+
+    ``region`` is the ``(x, y, width, height)`` to hand to
+    ``capture_output_region`` in output *logical* coordinates, or
+    ``None`` to capture the whole output instead. ``crop_x``/``crop_y``
+    say where the requested bbox starts inside the frame that comes
+    back, in device pixels. ``exp_w``/``exp_h`` is the device-pixel frame
+    size the mapping predicts; it is checked against what the compositor
+    actually returned before a byte is copied, which is what makes the
+    rest of the plan trustworthy rather than merely plausible.
+    """
+    __slots__ = ("region", "crop_x", "crop_y", "exp_w", "exp_h")
+
+    def __init__(self, region, crop_x, crop_y, exp_w, exp_h):
+        self.region = region
+        self.crop_x = crop_x
+        self.crop_y = crop_y
+        self.exp_w = exp_w
+        self.exp_h = exp_h
+
+
+def _ceil_div(numerator, denominator):
+    """Integer ceiling division, for non-negative operands."""
+    return -(-numerator // denominator)
+
+
+def _uniform_integer_scale(mode_w, mode_h, logical_w, logical_h):
+    """Return ``k`` when ``device == logical * k`` exactly on both axes.
+
+    ``None`` when the logical geometry is unknown, or when the ratio is
+    not one and the same whole number on both axes — a fractionally
+    scaled output, or one whose logical size the compositor rounded.
+    """
+    if logical_w <= 0 or logical_h <= 0:
+        return None
+    if mode_w % logical_w or mode_h % logical_h:
+        return None
+    scale = mode_w // logical_w
+    if scale < 1 or mode_h // logical_h != scale:
+        return None
+    return scale
+
+
+def _plan_region(x, y, w, h, mode_w, mode_h, logical_w, logical_h):
+    """Map a device-pixel bbox onto a logical region plus a crop.
+
+    Two cases, and the split is about what can be *proved*, not about
+    what is likely.
+
+    **Exact integer scale.** wlroots turns a region request into a
+    device-pixel box by multiplying each component by the output scale
+    and truncating (``buffer_box.x *= output->scale``, an ``int``
+    left-hand side and a ``float`` right-hand side). Truncation is a
+    no-op for a whole-number scale, so the frame that comes back starts
+    at exactly ``logical_origin * k``: floor the requested origin into
+    logical units, ceil the far edge so every requested pixel stays
+    covered, and crop the surplus off the returned frame.
+
+    That ``k`` is derived, not observed. ``wl_output.scale`` is a
+    ``ceil()``'d integer, and xdg_output's logical size is itself
+    ``trunc(mode / scale)``, which only bounds the true scale ``s`` from
+    above (``s <= mode / logical == k``). The frame-size check in
+    :meth:`WlrBackend.screenshot` closes the gap: the compositor returns
+    ``trunc(lw * s)`` where this plan predicts ``lw * k``, and those
+    agree only when ``s >= k``. A matching size therefore *proves*
+    ``s == k``, and with it the origin. An output at, say, 1.999 on a
+    mode whose logical size happens to divide evenly returns a short
+    frame and is rejected rather than silently mis-cropped.
+
+    **Anything else** — a fractional scale, or axes that disagree. There
+    the device origin of a region frame is ``trunc(lx * s)`` for a float
+    ``s`` that cannot be recovered exactly from the integers the
+    protocol hands us, so any origin but zero risks being off by a
+    pixel. Rather than guess, capture the whole output — which is
+    ``mode_w x mode_h`` device pixels by definition, with no scale
+    arithmetic involved — and crop the bbox out of it. Correct, at the
+    cost of copying the whole output for a small bbox: the same trade
+    this backend used to ask callers to make by hand.
+    """
+    scale = _uniform_integer_scale(mode_w, mode_h, logical_w, logical_h)
+    if scale is None:
+        return _RegionPlan(None, x, y, mode_w, mode_h)
+
+    lx = x // scale
+    ly = y // scale
+    lw = _ceil_div(x + w, scale) - lx
+    lh = _ceil_div(y + h, scale) - ly
+    return _RegionPlan(
+        (lx, ly, lw, lh),
+        crop_x=x - lx * scale,
+        crop_y=y - ly * scale,
+        exp_w=lw * scale,
+        exp_h=lh * scale,
+    )
 
 
 # The wayland connection + globals are shared across all WlrBackend
@@ -99,6 +225,7 @@ class WlrBackend(BaseBackend):
         outputs = []
         shm = [None]
         screencopy = [None]
+        xdg_output_manager = [None]
 
         def _on_global(registry, name, interface, version):
             if interface == "wl_output":
@@ -127,11 +254,26 @@ class WlrBackend(BaseBackend):
                 screencopy[0] = registry.bind(
                     name, ZwlrScreencopyManagerV1, min(version, _FRAME_VERSION)
                 )
+            elif (interface == "zxdg_output_manager_v1"
+                    and ZxdgOutputManagerV1 is not None):
+                xdg_output_manager[0] = registry.bind(
+                    name, ZxdgOutputManagerV1,
+                    min(version, _XDG_OUTPUT_VERSION),
+                )
 
         registry = display.get_registry()
         registry.dispatcher["global"] = _on_global
         display.roundtrip()
-        display.roundtrip()  # let wl_output mode/name/done events settle
+
+        # xdg_output has to be a second pass: get_xdg_output needs the
+        # manager *and* the wl_output, and the registry is free to
+        # announce them in either order.
+        if xdg_output_manager[0] is not None:
+            for state in outputs:
+                WlrBackend._bind_xdg_output(xdg_output_manager[0], state)
+
+        display.roundtrip()
+        display.roundtrip()  # let mode/name/done + logical_size settle
 
         if screencopy[0] is None:
             raise RuntimeError(
@@ -146,6 +288,19 @@ class WlrBackend(BaseBackend):
         return display, shm[0], screencopy[0], outputs
 
     # -------- output state event handlers --------
+
+    @staticmethod
+    def _bind_xdg_output(manager, state):
+        """Create an ``xdg_output`` for ``state`` and wire up its events."""
+        xdg = manager.get_xdg_output(state.proxy)
+        xdg.dispatcher["logical_position"] = lambda o, lx, ly, s=state: (
+            WlrBackend._on_xdg_logical_position(s, lx, ly)
+        )
+        xdg.dispatcher["logical_size"] = lambda o, lw, lh, s=state: (
+            WlrBackend._on_xdg_logical_size(s, lw, lh)
+        )
+        state.xdg = xdg
+        return xdg
 
     @staticmethod
     def _on_output_mode(state, flags, width, height):
@@ -170,6 +325,16 @@ class WlrBackend(BaseBackend):
     def _on_output_done(state):
         state.done = True
 
+    @staticmethod
+    def _on_xdg_logical_position(state, x, y):
+        state.logical_x = x
+        state.logical_y = y
+
+    @staticmethod
+    def _on_xdg_logical_size(state, width, height):
+        state.logical_w = width
+        state.logical_h = height
+
     def _select_output(self):
         wanted = os.environ.get("FASTGRAB_OUTPUT")
         if wanted:
@@ -193,12 +358,14 @@ class WlrBackend(BaseBackend):
         fields latched from events at connect time, so a mode change is
         invisible until the display is dispatched again. Two round trips
         let pending ``mode``/``name``/``done`` events settle, matching
-        what ``_connect_singleton`` does.
+        what ``_connect_singleton`` does. The ``xdg_output`` objects are
+        long-lived, so a scale change re-sends ``logical_size`` over the
+        same round trips.
 
-        Mode changes and a different ``FASTGRAB_OUTPUT`` choice among the
-        already-bound outputs are picked up. An output that has since
-        been unplugged is *not*: that needs registry ``global_remove``
-        tracking, which this backend does not do.
+        Mode changes, scale changes and a different ``FASTGRAB_OUTPUT``
+        choice among the already-bound outputs are picked up. An output
+        that has since been unplugged is *not*: that needs registry
+        ``global_remove`` tracking, which this backend does not do.
         """
         self._display.roundtrip()
         self._display.roundtrip()
@@ -210,35 +377,62 @@ class WlrBackend(BaseBackend):
     def bytes_per_pixel(self):
         return 4
 
+    def _subregion_plan(self, x, y, w, h):
+        """Plan a sub-region capture of the device-pixel bbox ``x, y, w, h``.
+
+        Raises :class:`NotImplementedError` for the one mapping this
+        backend still refuses outright: a rotated or flipped output.
+        wlroots applies the output transform *before* the scale, so a
+        region on a transformed output lands on a transposed backing
+        store — and nothing here models that, so guessing would be worse
+        than refusing.
+        """
+        out = self._output
+        if out.transform != 0:
+            raise NotImplementedError(
+                "sub-region capture is not supported on output {!r} "
+                "(transform {}): wlr-screencopy takes the region in "
+                "logical coordinates and wlroots applies the output "
+                "transform before the scale, so on a rotated or flipped "
+                "output the region lands on a transposed backing store — "
+                "a 20x10 request comes back 10x20. fastgrab does not "
+                "model output transforms. Capture the full output and "
+                "slice the returned array instead."
+                .format(out.name, out.transform)
+            )
+
+        logical_w = out.logical_w or 0
+        logical_h = out.logical_h or 0
+        if logical_w > 0 and logical_h > 0:
+            return _plan_region(x, y, w, h, out.mode_w, out.mode_h,
+                                logical_w, logical_h)
+
+        # No xdg_output: the compositor never told us the logical size.
+        if out.scale != 1:
+            # wl_output.scale is ceil() of the real scale, an upper bound
+            # and nothing more — not enough to place a region. Take the
+            # whole output, whose size needs no scale arithmetic, and crop.
+            return _RegionPlan(None, x, y, out.mode_w, out.mode_h)
+
+        # Scale 1 and no logical size: assume the identity mapping and
+        # let the frame-size check adjudicate. It has to, because ceil()
+        # collapses every scale in (0, 1] onto the same reported 1.
+        return _RegionPlan((x, y, w, h), 0, 0, w, h)
+
     def screenshot(self, x, y, img):
         h, w, _ = img.shape
         full_w, full_h = self.resolution()
         if x == 0 and y == 0 and w == full_w and h == full_h:
+            # The whole output: no region, so no logical conversion at all.
+            plan = _RegionPlan(None, 0, 0, w, h)
+        else:
+            plan = self._subregion_plan(x, y, w, h)
+
+        if plan.region is None:
             frame = self._screencopy.capture_output(0, self._output.proxy)
         else:
-            # capture_output_region takes the region in *logical*
-            # coordinates -- the protocol XML says so explicitly -- while
-            # a fastgrab bbox is device pixels. The identity mapping
-            # between them needs BOTH an unscaled and an untransformed
-            # output: wlroots applies the output transform before the
-            # scale, so a 90-degree rotation transposes the frame even at
-            # scale 1 (a 20x10 request comes back 10x20), and a scale of
-            # 2 doubles it. Refuse anything but the identity case rather
-            # than hand back the wrong region; full-output capture goes
-            # through capture_output above and is unaffected.
-            if self._output.scale != 1 or self._output.transform != 0:
-                raise NotImplementedError(
-                    "sub-region capture is not supported on output {!r} "
-                    "(scale {}, transform {}): wlr-screencopy takes the "
-                    "region in logical coordinates while fastgrab bboxes "
-                    "are device pixels, and the two agree only on an "
-                    "unscaled, untransformed output. Capture the full "
-                    "output and slice the returned array instead."
-                    .format(self._output.name, self._output.scale,
-                            self._output.transform)
-                )
             frame = self._screencopy.capture_output_region(
-                0, self._output.proxy, x, y, w, h
+                0, self._output.proxy, *plan.region
             )
 
         state = _FrameState()
@@ -266,24 +460,31 @@ class WlrBackend(BaseBackend):
             frame.destroy()
             raise RuntimeError("wlr-screencopy frame failed before buffer info")
 
-        # The up-front guard cannot catch every non-identity mapping:
-        # wl_output.scale is an *integer* event and wlroots reports
-        # ceil() of the real scale, so an output at 0.75 announces scale
-        # 1 and looks like identity. The compositor then returns a
-        # smaller frame, and `img[:] = arr` would broadcast it over the
-        # destination instead of failing -- a 1x1 frame silently filling
-        # a 2x2 request. Checking what actually came back catches that,
-        # and any other cause, before a single byte is copied.
-        if state.w != w or state.h != h:
+        # Check the size the compositor actually returned rather than
+        # trusting the scale it announced. wl_output.scale is an integer
+        # event reported as ceil() of the real scale, so an output at
+        # 0.75 announces 1 and looks like identity; xdg_output's logical
+        # size only bounds the real scale from above. This check is what
+        # turns _plan_region's derived mapping into a proved one — and
+        # without it `img[:] = arr` would *broadcast* a too-small frame
+        # over the destination instead of failing, filling a 2x2 request
+        # from a single pixel.
+        if state.w != plan.exp_w or state.h != plan.exp_h:
             frame.destroy()
             raise NotImplementedError(
-                "compositor returned a {}x{} frame for a {}x{} request on "
-                "output {!r} (reported scale {}, transform {}): the region "
-                "is interpreted in logical coordinates, and wl_output.scale "
-                "is an integer, so a fractionally scaled output reports 1 "
-                "and cannot be detected up front. Capture the full output "
-                "and slice the returned array instead."
-                .format(state.w, state.h, w, h, self._output.name,
+                "compositor returned a {}x{} frame where the region "
+                "mapping predicted {}x{} device pixels, for a {}x{} "
+                "capture at ({}, {}) on output {!r} (mode {}x{}, logical "
+                "{}x{}, wl_output.scale {}, transform {}). The region is "
+                "interpreted in logical coordinates, and wl_output.scale "
+                "is an integer reported as ceil() of the real scale, so a "
+                "fractionally scaled output cannot always be detected up "
+                "front. Capture the full output and slice the returned "
+                "array instead."
+                .format(state.w, state.h, plan.exp_w, plan.exp_h, w, h,
+                        x, y, self._output.name,
+                        self._output.mode_w, self._output.mode_h,
+                        self._output.logical_w, self._output.logical_h,
                         self._output.scale, self._output.transform)
             )
 
@@ -296,15 +497,23 @@ class WlrBackend(BaseBackend):
             frame.destroy()
             raise RuntimeError("wlr-screencopy frame copy failed")
 
-        # Memcpy from mmap into the caller's ndarray, accounting for stride.
+        # Memcpy from mmap into the caller's ndarray, accounting for
+        # stride. The width and stride from the buffer event drive this,
+        # never the requested size: the frame is legitimately bigger than
+        # the bbox whenever the logical region had to be rounded outward,
+        # or the whole output was taken to crop out of.
         frame_bytes = bytes(mm[: state.stride * state.h])
         arr = np.frombuffer(frame_bytes, dtype="uint8").reshape(
             state.h, state.stride
         )[:, : state.w * 4].reshape(state.h, state.w, 4)
         if state.flags & 0x1:  # Y_INVERT
+            # Flip before cropping — the flag describes the frame, so the
+            # crop offsets only count from the top left once it is upright.
             arr = np.flipud(arr)
-        # Caller's ndarray was sized (h, w, 4) by the wrapper; copy in.
-        img[:] = arr
+        # Caller's ndarray was sized (h, w, 4) by the wrapper; copy the
+        # requested bbox out of the frame. The slice is exact, so a
+        # mismatch raises instead of broadcasting.
+        img[:] = arr[plan.crop_y:plan.crop_y + h, plan.crop_x:plan.crop_x + w]
 
         frame.destroy()
 
