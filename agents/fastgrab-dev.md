@@ -54,7 +54,7 @@ Makefile                    host targets; `make <target> docker=1` routes throug
 docker-compose.yml          services: dev (VNC desktop), test, test-wayland, benchmark
 docker/Dockerfile           python:3.11-slim + gcc/libx11-dev/xvfb/cage/ffmpeg/poetry/pytest/...
 docker/*.sh                 entrypoint (in-place ext build), start-desktop, start-wayland-desktop
-.github/workflows/test.yml  CI: x11 (required), wayland / windows / macos (fail-soft)
+.github/workflows/test.yml  CI: x11 / wayland / windows / macos (all blocking)
 fastgrab/
   __init__.py               version/author metadata only — keep it import-cheap
   metadata.py
@@ -209,10 +209,10 @@ Test-writing rules:
 Four jobs on every push and PR:
 
 - `x11` — ubuntu-latest, **required**: `docker compose run --rm test`
-- `wayland` — ubuntu-latest, `continue-on-error` (headless wlroots flaky)
-- `windows` — windows-latest, `continue-on-error`: `pip install .` then
+- `wayland` — ubuntu-latest, blocking
+- `windows` — windows-latest, blocking: `pip install .` then
   `pytest -m "not wayland and not integration"`
-- `macos` — macos-latest, `continue-on-error`: same as windows
+- `macos` — macos-latest, blocking: same as windows
 
 Fail-soft jobs graduate to required once their pass rate is steady. There
 are no release/publish steps in CI.
