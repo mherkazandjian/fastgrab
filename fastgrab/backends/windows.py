@@ -35,6 +35,8 @@ import contextlib
 import ctypes
 from ctypes import wintypes  # only available on Windows; gated by importer
 
+import numpy
+
 from .base import BaseBackend
 
 
@@ -158,6 +160,39 @@ def _thread_dpi_aware(user32):
             set_dpi_ctx(previous)
 
 
+def _validate_destination(img):
+    """Reject a destination this backend cannot safely fill.
+
+    ``screenshot()`` copies with :func:`ctypes.memmove`, which walks
+    ``height * width * 4`` bytes forward from the array's data pointer
+    and knows nothing about strides. A non-contiguous view satisfies the
+    documented shape and dtype while pointing somewhere else entirely --
+    ``arr[::-1]`` starts at the *last* row -- so the copy would run past
+    the end of the allocation and corrupt the heap.
+
+    This backend is alone in needing the guard: macOS and wlr assign
+    through numpy (``img[:] = ...``), which is stride-aware and refuses a
+    read-only destination by itself. The checks and their wording mirror
+    the X11 C extension's, so the directly-callable backend API rejects
+    the same things on every platform. Rejected rather than coerced: a
+    coerced copy would be filled and then dropped on the floor.
+    """
+    if not isinstance(img, numpy.ndarray):
+        raise TypeError("image buffer must be a numpy ndarray")
+    if img.ndim != 3 or img.shape[2] != 4:
+        raise ValueError("image buffer must be a (height, width, 4) array")
+    if img.dtype != numpy.uint8:
+        raise ValueError("image buffer must have dtype uint8")
+    flags = img.flags
+    if not (flags["C_CONTIGUOUS"] and flags["ALIGNED"] and flags["WRITEABLE"]):
+        raise ValueError(
+            "image buffer must be C-contiguous, aligned and writable"
+        )
+    height, width = img.shape[:2]
+    if height <= 0 or width <= 0:
+        raise ValueError("image buffer height and width must be positive")
+
+
 class WindowsBackend(BaseBackend):
     def __init__(self):
         self._user32, self._gdi32 = _load_libs()
@@ -207,6 +242,9 @@ class WindowsBackend(BaseBackend):
         return 4
 
     def screenshot(self, x, y, img):
+        # Before anything touches the screen: the copy at the end is a
+        # raw memmove and cannot recover from a bad destination.
+        _validate_destination(img)
         h, w, _ = img.shape
         self._ensure_bitmap(w, h)
 
