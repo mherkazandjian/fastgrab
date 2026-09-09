@@ -512,3 +512,85 @@ def test_a_stale_screen_dc_would_serve_the_virtualized_desktop():
     got = numpy.frombuffer(buf, numpy.uint8).reshape(6, 8, 4)
     assert numpy.array_equal(got, user32.virtual_screen[0:6, 0:8])
     assert not numpy.array_equal(got, user32.screen[0:6, 0:8])
+
+
+# -------- destination validation --------
+#
+# screenshot() finishes with a raw ctypes.memmove, which walks
+# height*width*4 bytes forward from the array's data pointer and knows
+# nothing about strides. Everything below would previously have reached
+# that memmove. The reversed-view case is the dangerous one: it satisfies
+# the documented shape and dtype while its data pointer sits at the *last*
+# row, so the copy ran off the end of the allocation.
+
+
+def _reject(backend, gdi32, img, exc, match):
+    with pytest.raises(exc, match=match):
+        backend.screenshot(0, 0, img)
+    # Refused before anything touched the screen.
+    assert gdi32.blits == []
+
+
+def test_reversed_view_is_rejected_not_overrun(make_backend):
+    backend, _user32, gdi32 = make_backend()
+    buf = numpy.zeros((16, 16, 4), numpy.uint8)
+    view = buf[::-1]
+    # Sanity: the case under test. Same shape and dtype, data pointer at
+    # the far end of the allocation.
+    assert view.shape == buf.shape and view.dtype == buf.dtype
+    assert not view.flags["C_CONTIGUOUS"]
+    assert view.ctypes.data > buf.ctypes.data
+    _reject(backend, gdi32, view, ValueError, "C-contiguous")
+
+
+def test_strided_view_is_rejected(make_backend):
+    backend, _user32, gdi32 = make_backend()
+    view = numpy.zeros((8, 32, 4), numpy.uint8)[:, ::2]
+    assert not view.flags["C_CONTIGUOUS"]
+    _reject(backend, gdi32, view, ValueError, "C-contiguous")
+
+
+def test_read_only_buffer_is_rejected(make_backend):
+    backend, _user32, gdi32 = make_backend()
+    buf = numpy.zeros((8, 8, 4), numpy.uint8)
+    buf.flags.writeable = False
+    _reject(backend, gdi32, buf, ValueError, "writable")
+
+
+def test_wrong_channel_count_is_rejected(make_backend):
+    # Regression shape: (8, 8, 3) is 192 bytes but the copy writes 256.
+    backend, _user32, gdi32 = make_backend()
+    _reject(backend, gdi32, numpy.zeros((8, 8, 3), numpy.uint8),
+            ValueError, r"height, width, 4")
+
+
+def test_non_3d_buffer_is_rejected(make_backend):
+    backend, _user32, gdi32 = make_backend()
+    _reject(backend, gdi32, numpy.zeros((8, 8), numpy.uint8),
+            ValueError, r"height, width, 4")
+
+
+def test_wrong_dtype_is_rejected(make_backend):
+    backend, _user32, gdi32 = make_backend()
+    _reject(backend, gdi32, numpy.zeros((8, 8, 4), numpy.float64),
+            ValueError, "dtype uint8")
+
+
+def test_non_array_is_rejected(make_backend):
+    backend, _user32, gdi32 = make_backend()
+    _reject(backend, gdi32, [[0, 0, 0, 0]], TypeError, "ndarray")
+
+
+def test_empty_buffer_is_rejected(make_backend):
+    backend, _user32, gdi32 = make_backend()
+    _reject(backend, gdi32, numpy.zeros((0, 8, 4), numpy.uint8),
+            ValueError, "positive")
+
+
+def test_a_valid_destination_still_captures(make_backend):
+    # The guard must not have made the ordinary path stricter.
+    backend, user32, gdi32 = make_backend()
+    img = _capture(backend, 0, 0, 12, 10)
+    assert img.shape == (10, 12, 4)
+    assert len(gdi32.blits) == 1
+    assert numpy.array_equal(img, user32.screen[0:10, 0:12])
