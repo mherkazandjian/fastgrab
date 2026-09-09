@@ -441,6 +441,48 @@ def test_recorder_countdown_cancelled_records_nothing(tmp_path):
 
 @requires_ffmpeg
 @pytest.mark.skipif(not _x11_available(), reason="needs X11 DISPLAY")
+def test_recorded_gif_is_not_transparent(tmp_path):
+    """Every recorded GIF used to come out completely invisible.
+
+    A captured frame's fourth byte is unused padding, not transparency —
+    X11's XGetImage leaves it zero on a 24-bit visual. The encoder
+    described its rawvideo input to ffmpeg as ``bgra``, so ffmpeg read
+    that padding as "fully transparent". mp4 and webm never noticed
+    because they force yuv420p and drop alpha, but GIF keeps it:
+    ``paletteuse`` treats alpha below its default threshold of 128 as
+    transparent, so 100% of the pixels in the output were.
+
+    Asserted on the decoded image rather than on ffmpeg's argv, so it
+    stays true whatever the filter chain becomes.
+    """
+    out = tmp_path / "clip.gif"
+    rec = Recorder(
+        output_path=str(out), bbox=(0, 0, 320, 240), fps=10, backend="x11",
+    )
+    stop = threading.Event()
+
+    def progress(n, _elapsed):
+        if n >= 3:
+            stop.set()
+
+    rec.record(duration=30.0, stop_event=stop, on_progress=progress)
+    assert out.exists() and out.stat().st_size > 0
+
+    raw = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(out),
+         "-f", "rawvideo", "-pix_fmt", "rgba", "-"],
+        capture_output=True, check=True,
+    ).stdout
+    alpha = numpy.frombuffer(raw, dtype=numpy.uint8).reshape(-1, 4)[:, 3]
+    assert alpha.size > 0, "decoded no pixels from the gif"
+    assert alpha.min() == 255, (
+        "{:.1f}% of the gif's pixels are transparent".format(
+            (alpha == 0).mean() * 100)
+    )
+
+
+@requires_ffmpeg
+@pytest.mark.skipif(not _x11_available(), reason="needs X11 DISPLAY")
 def test_recorder_smoke_mp4(tmp_path):
     out = tmp_path / "smoke.mp4"
     rec = Recorder(
