@@ -163,7 +163,14 @@ def _ffmpeg_args(codec: str, width: int, height: int, fps: int, output: str,
         "-loglevel", "error",
         "-f", "rawvideo",
         "-vcodec", "rawvideo",
-        "-pix_fmt", "bgra",
+        # bgr0, not bgra: the fourth byte of a fastgrab frame is unused
+        # padding, not transparency (X11's XGetImage leaves it zero on a
+        # 24-bit visual). Describing it as bgra told ffmpeg every pixel
+        # was fully transparent, which mp4/webm ignore -- they force
+        # yuv420p -- but GIF does not: paletteuse treats alpha below its
+        # default threshold of 128 as transparent, so every recorded GIF
+        # came out completely invisible.
+        "-pix_fmt", "bgr0",
         "-s", "{}x{}".format(width, height),
         "-r", str(fps),
         "-i", "-",
