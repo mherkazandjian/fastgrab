@@ -34,6 +34,7 @@
 #define FG_ERR_GEOMETRY -7
 #define FG_ERR_LOST     -8
 #define FG_ERR_NOMEM    -9
+#define FG_ERR_XPROTO  -10
 
 static const char *fg_strerror(int code)
 {
@@ -60,6 +61,8 @@ static const char *fg_strerror(int code)
     case FG_ERR_LOST:
         return "the X server closed the connection; the cached display "
                "was dropped, so a later call will reconnect";
+    case FG_ERR_XPROTO:
+        return "the X server rejected the request with a protocol error";
     default:
         return "unknown X11 error";
     }
@@ -252,11 +255,60 @@ static int fg_io_error_handler(Display *dpy)
  * fg_io_display is deliberately not cleared here: the recovery path in
  * fg_close_display_guarded() reads it straight after a fault to find
  * the descriptor to reclaim. It is only ever compared while armed. */
+/* X *protocol* errors travel a different channel from I/O errors, and
+ * the handler above never sees them. Xlib's default protocol handler
+ * prints a diagnostic and calls exit(), so a request the server rejects
+ * takes the interpreter down with no exception and no traceback -- the
+ * same class of failure the I/O handler exists to prevent, arriving
+ * through a different door.
+ *
+ * The bounds check in fg_op_screenshot() is what normally keeps
+ * XGetImage inside the root window, but it sits two round trips away
+ * from the request it guards: a RandR resize in between leaves a check
+ * that passed and a request that cannot succeed. A handler that
+ * *returns* turns that into XGetImage returning NULL, which the caller
+ * already handles.
+ *
+ * Installed and removed per armed region for the same reason the I/O
+ * handler is: Xlib keeps one process-global slot, and staying in it
+ * between calls lets a third party's delegating handler capture ours as
+ * its predecessor and close the chain into a loop.
+ */
+static volatile int fg_xerr_armed = 0;
+static Display *fg_xerr_display = NULL;
+static XErrorHandler fg_xerr_prev = NULL;
+static volatile unsigned char fg_xerr_code = 0;
+static volatile unsigned char fg_xerr_request = 0;
+
+static int fg_x_error_handler(Display *dpy, XErrorEvent *event)
+{
+    if (fg_xerr_armed && dpy == fg_xerr_display) {
+        /* First error wins: it is the one that made the call fail, and
+         * anything after it is usually a consequence. */
+        if (fg_xerr_code == 0) {
+            fg_xerr_code = event->error_code;
+            fg_xerr_request = event->request_code;
+        }
+        /* The return value is ignored by Xlib; returning at all rather
+         * than exiting is the entire point. */
+        return 0;
+    }
+    if (fg_xerr_prev != NULL)
+        return fg_xerr_prev(dpy, event);
+    return 0;
+}
+
 static void fg_io_arm(Display *dpy)
 {
     fg_io_prev = XSetIOErrorHandler(fg_io_error_handler);
     fg_io_display = dpy;
     fg_io_armed = 1;
+
+    fg_xerr_prev = XSetErrorHandler(fg_x_error_handler);
+    fg_xerr_display = dpy;
+    fg_xerr_code = 0;
+    fg_xerr_request = 0;
+    fg_xerr_armed = 1;
 }
 
 static void fg_io_disarm(void)
@@ -264,6 +316,12 @@ static void fg_io_disarm(void)
     fg_io_armed = 0;
     XSetIOErrorHandler(fg_io_prev);
     fg_io_prev = NULL;
+
+    fg_xerr_armed = 0;
+    XSetErrorHandler(fg_xerr_prev);
+    fg_xerr_prev = NULL;
+    /* fg_xerr_code is deliberately left set: the caller reads it after
+     * the region closes to report which error it was. */
 }
 
 /* Discard events the server sent that nobody asked for.
@@ -523,7 +581,7 @@ static int fg_op_screenshot(Display *dpy, void *ctx)
                     req->origin_x, req->origin_y, req->width, req->height,
                     AllPlanes, ZPixmap);
     if (img == NULL)
-        return FG_ERR_GETIMAGE;
+        return fg_xerr_code ? FG_ERR_XPROTO : FG_ERR_GETIMAGE;
 
     /* ZPixmap on a 32-bit visual is laid out B,G,R,A on little-endian
      * hosts, which is the byte order the Python side promises. Anything
@@ -615,6 +673,30 @@ static int bytes_per_pixel(int *bpp)
     return fg_call_with_display(fg_op_bytes_per_pixel, bpp);
 }
 
+/* Private, for the tests. Issues a request the server must reject, from
+ * inside a guarded region, so the protocol-error path can be exercised
+ * without waiting for a RandR resize to race a bounds check. Asks for a
+ * region past the edge of the root -- exactly the shape a shrink between
+ * the check and the request produces. */
+static int fg_op_bad_request(Display *dpy, void *ctx)
+{
+    XImage *img;
+    int width, height;
+    int rc;
+
+    (void)ctx;
+    rc = fg_root_size(dpy, &width, &height);
+    if (rc != FG_OK)
+        return rc;
+    img = XGetImage(dpy, RootWindow(dpy, DefaultScreen(dpy)),
+                    0, 0, (unsigned)width + 64, (unsigned)height + 64,
+                    AllPlanes, ZPixmap);
+    if (img == NULL)
+        return fg_xerr_code ? FG_ERR_XPROTO : FG_ERR_GETIMAGE;
+    XDestroyImage(img);
+    return FG_OK;
+}
+
 /* ------------------------------------------------------------------ *
  * Python entry points
  * ------------------------------------------------------------------ */
@@ -623,6 +705,18 @@ static PyObject *fg_raise(int rc)
 {
     if (rc == FG_ERR_NOMEM)
         return PyErr_NoMemory();
+    if (rc == FG_ERR_XPROTO) {
+        /* Name the codes: without them this is indistinguishable from
+         * any other refusal, and the request is asynchronous enough that
+         * the traceback alone does not say what the server objected to. */
+        PyErr_Format(PyExc_RuntimeError,
+                     "the X server rejected the request: error code %u on "
+                     "major opcode %u (73 is X_GetImage). The screen may "
+                     "have been resized between the bounds check and the "
+                     "capture.",
+                     (unsigned)fg_xerr_code, (unsigned)fg_xerr_request);
+        return NULL;
+    }
     PyErr_SetString(PyExc_RuntimeError, fg_strerror(rc));
     return NULL;
 }
@@ -741,6 +835,18 @@ static PyObject *linux_x11_close_display(PyObject *self, PyObject *args)
     Py_RETURN_NONE;
 }
 
+static PyObject *linux_x11_force_x_protocol_error(PyObject *self,
+                                                  PyObject *args)
+{
+    int rc;
+    (void)self;
+    (void)args;
+    rc = fg_call_with_display(fg_op_bad_request, NULL);
+    if (rc != FG_OK)
+        return fg_raise(rc);
+    Py_RETURN_NONE;
+}
+
 static PyMethodDef linux_x11_methods[] = {
     {"resolution", linux_x11_screen_resolution, METH_VARARGS,
      "return the screen resolution"},
@@ -748,6 +854,11 @@ static PyMethodDef linux_x11_methods[] = {
      "return the number of bytes per pixel"},
     {"screenshot", linux_x11_screenshot, METH_VARARGS,
      "capture a screenshot using X11"},
+    {"_force_x_protocol_error", linux_x11_force_x_protocol_error, METH_NOARGS,
+     "private, for the tests: make a request the X server must reject, "
+     "from inside a guarded region. Xlib's default protocol handler "
+     "prints and calls exit(), so without the handler installed by "
+     "fg_io_arm() this kills the interpreter instead of raising."},
     {"_display_cache_info", linux_x11_display_cache_info, METH_NOARGS,
      "private, for the tests: report the cached X connection as a dict "
      "of connected / display / opens / pid / queued / events_discarded. "
