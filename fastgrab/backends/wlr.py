@@ -80,7 +80,7 @@ class _OutputState:
 class _FrameState:
     """Per-capture event accumulator."""
     __slots__ = ("fmt", "w", "h", "stride", "buffer_done",
-                 "flags", "ready", "failed")
+                 "flags", "ready", "failed", "offered")
 
     def __init__(self):
         self.fmt = None
@@ -91,6 +91,9 @@ class _FrameState:
         self.flags = 0
         self.ready = False
         self.failed = False
+        # Formats the compositor offered that are not BGRA in memory,
+        # kept so a refusal can name them.
+        self.offered = []
 
 
 class _RegionPlan:
@@ -225,6 +228,9 @@ class WlrBackend(BaseBackend):
         outputs = []
         shm = [None]
         screencopy = [None]
+        # Set instead of binding when the advertised screencopy version is
+        # too old for the handshake below, so the refusal can name it.
+        screencopy_version = [None]
         xdg_output_manager = [None]
 
         def _on_global(registry, name, interface, version):
@@ -251,6 +257,18 @@ class WlrBackend(BaseBackend):
             elif interface == "wl_shm":
                 shm[0] = registry.bind(name, WlShm, min(version, 1))
             elif interface == "zwlr_screencopy_manager_v1":
+                # The capture loop waits for `buffer_done`, which the
+                # protocol only introduced in version 3. Bound below
+                # that, the compositor sends `buffer` and then waits for
+                # `copy` while we wait for an event it will never send --
+                # a capture that blocks forever rather than failing.
+                # wlroots has shipped version 3 since 2020, so refusing
+                # is proportionate; supporting the legacy handshake would
+                # mean an untestable code path for compositors that
+                # effectively no longer exist.
+                if version < _FRAME_VERSION:
+                    screencopy_version[0] = version
+                    return
                 screencopy[0] = registry.bind(
                     name, ZwlrScreencopyManagerV1, min(version, _FRAME_VERSION)
                 )
@@ -275,6 +293,15 @@ class WlrBackend(BaseBackend):
         display.roundtrip()
         display.roundtrip()  # let mode/name/done + logical_size settle
 
+        if screencopy[0] is None and screencopy_version[0] is not None:
+            raise RuntimeError(
+                "compositor advertises zwlr_screencopy_manager_v1 version "
+                "{}, but fastgrab needs version {}: the capture handshake "
+                "waits for the `buffer_done` event, which the protocol only "
+                "added in version 3. Binding lower would block forever "
+                "waiting for an event the compositor never sends."
+                .format(screencopy_version[0], _FRAME_VERSION)
+            )
         if screencopy[0] is None:
             raise RuntimeError(
                 "compositor does not advertise zwlr_screencopy_manager_v1; "
@@ -459,6 +486,20 @@ class WlrBackend(BaseBackend):
         if state.failed:
             frame.destroy()
             raise RuntimeError("wlr-screencopy frame failed before buffer info")
+        if state.fmt is None:
+            # Every offered format had a memory layout that is not BGRA.
+            # Refused by name rather than copied out as if it were: an
+            # ABGR8888 frame read as BGRA returns red pixels as blue.
+            offered = ", ".join(
+                "0x{:08x}".format(f) for f in state.offered
+            ) or "none"
+            frame.destroy()
+            raise RuntimeError(
+                "compositor offered no BGRA-compatible buffer format for "
+                "this frame (offered: {}). fastgrab needs "
+                "WL_SHM_FORMAT_ARGB8888 (0) or WL_SHM_FORMAT_XRGB8888 (1), "
+                "whose bytes are already B, G, R, A.".format(offered)
+            )
 
         # Check the size the compositor actually returned rather than
         # trusting the scale it announced. wl_output.scale is an integer
@@ -521,11 +562,25 @@ class WlrBackend(BaseBackend):
 
     @staticmethod
     def _on_frame_buffer(state, fmt, w, h, stride):
-        # Prefer the SHM buffer event over linux_dmabuf — we always use SHM.
-        if state.fmt is None or fmt in (
-            _WL_SHM_FORMAT_ARGB8888,
-            _WL_SHM_FORMAT_XRGB8888,
-        ):
+        """Accept only a format whose memory layout is already BGRA.
+
+        A version-3 compositor sends one of these per supported buffer
+        type, so this runs several times and must pick, not merely
+        record. ARGB8888 and XRGB8888 are 32-bit little-endian words, so
+        their bytes land B, G, R, A — exactly the public contract.
+
+        The previous condition began ``state.fmt is None or ...``, which
+        accepted whatever arrived *first* whether or not it was one of
+        those. A compositor offering ABGR8888 (bytes R, G, B, A) had its
+        frames copied out as if they were BGRA, so red came back as blue.
+        Every other format is refused by name in ``screenshot()`` rather
+        than silently mis-read.
+        """
+        if fmt not in (_WL_SHM_FORMAT_ARGB8888, _WL_SHM_FORMAT_XRGB8888):
+            state.offered.append(fmt)
+            return
+        # Both are BGRA in memory; keep the first acceptable one.
+        if state.fmt is None:
             state.fmt = fmt
             state.w = w
             state.h = h

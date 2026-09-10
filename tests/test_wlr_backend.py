@@ -252,8 +252,9 @@ def test_full_output_capture_is_never_blocked_by_the_guard(output):
 class _FakeFrame:
     """A zwlr_screencopy_frame_v1 that reports a fixed buffer size."""
 
-    def __init__(self, w, h, pixels=None, flags=0):
+    def __init__(self, w, h, pixels=None, flags=0, fmts=(0,)):
         self.dispatcher = {}
+        self.fmts = fmts
         self.w, self.h = w, h
         self.pixels = pixels
         self.flags = flags
@@ -261,8 +262,10 @@ class _FakeFrame:
         self.copied = False
 
     def deliver_buffer(self):
-        # wl_shm ARGB8888 is format 0.
-        self.dispatcher["buffer"](self, 0, self.w, self.h, self.w * 4)
+        # A version-3 compositor sends one buffer event per supported
+        # format, then buffer_done. wl_shm ARGB8888 is 0, XRGB8888 is 1.
+        for fmt in self.fmts:
+            self.dispatcher["buffer"](self, fmt, self.w, self.h, self.w * 4)
         if self.flags:
             self.dispatcher["flags"](self, self.flags)
         self.dispatcher["buffer_done"](self)
@@ -483,3 +486,127 @@ def test_full_output_capture_still_copies_the_whole_frame():
 
     assert requests == [("full",)]
     _assert_is_frame_window(img, upright, 0, 0)
+
+
+# -------- buffer format negotiation --------
+#
+# _on_frame_buffer used to begin `if state.fmt is None or fmt in (...)`,
+# so whatever arrived *first* was taken whether or not its bytes were
+# BGRA. ABGR8888 frames were copied out as if they were BGRA, turning
+# red pixels blue.
+
+_ABGR8888 = 0x34324241  # DRM fourcc 'AB24'; bytes are R, G, B, A
+_XRGB8888 = 1
+_ARGB8888 = 0
+
+
+def test_a_format_that_is_not_bgra_is_refused_by_name():
+    backend, frame = _capture_backend(_output(), frame_w=100, frame_h=50)
+    frame.fmts = (_ABGR8888,)
+    with pytest.raises(RuntimeError, match=r"no BGRA-compatible buffer format"):
+        backend.screenshot(0, 0, numpy.zeros((50, 100, 4), numpy.uint8))
+    assert frame.destroyed, "the frame must be released on the error path"
+
+
+def test_the_refusal_names_the_format_that_was_offered():
+    backend, frame = _capture_backend(_output(), frame_w=100, frame_h=50)
+    frame.fmts = (_ABGR8888,)
+    with pytest.raises(RuntimeError, match=r"0x34324241"):
+        backend.screenshot(0, 0, numpy.zeros((50, 100, 4), numpy.uint8))
+
+
+def _state_after(*fmts):
+    """Feed buffer events to a fresh frame state, as a compositor would."""
+    from fastgrab.backends.wlr import _FrameState
+
+    state = _FrameState()
+    for fmt in fmts:
+        WlrBackend._on_frame_buffer(state, fmt, 100, 50, 400)
+    return state
+
+
+def test_a_non_bgra_format_is_never_chosen():
+    state = _state_after(_ABGR8888)
+    assert state.fmt is None, "ABGR8888 bytes are R,G,B,A — not the contract"
+    assert state.offered == [_ABGR8888]
+
+
+def test_an_acceptable_format_is_taken_even_if_offered_second():
+    # The realistic shape: a v3 compositor advertising several types.
+    state = _state_after(_ABGR8888, _XRGB8888)
+    assert state.fmt == _XRGB8888
+    assert state.offered == [_ABGR8888]
+
+
+def test_the_first_acceptable_format_wins():
+    state = _state_after(_ARGB8888, _XRGB8888)
+    assert state.fmt == _ARGB8888
+
+
+@pytest.mark.parametrize("fmt", [_ARGB8888, _XRGB8888])
+def test_both_bgra_formats_are_accepted(fmt):
+    state = _state_after(fmt)
+    assert state.fmt == fmt
+    assert state.stride == 400
+
+
+# -------- screencopy version negotiation --------
+
+
+class _FakeRegistry:
+    def __init__(self, advertised):
+        self.dispatcher = {}
+        self._advertised = advertised
+        self._emitted = False
+
+    def emit(self):
+        if self._emitted:
+            return
+        self._emitted = True
+        for name, (interface, version) in enumerate(self._advertised):
+            self.dispatcher["global"](self, name, interface, version)
+
+    def bind(self, name, cls, version):
+        return SimpleNamespace(dispatcher={})
+
+
+def _connect_against(advertised, monkeypatch):
+    """Drive _connect_singleton over a registry advertising `advertised`."""
+    from fastgrab.backends import wlr as wlr_mod
+
+    registry = _FakeRegistry(advertised)
+
+    class _FakeDisplay:
+        def connect(self):
+            pass
+
+        def get_registry(self):
+            return registry
+
+        def roundtrip(self):
+            registry.emit()
+
+    monkeypatch.setattr(wlr_mod, "Display", lambda *a, **kw: _FakeDisplay())
+    # The connection is a process-wide singleton; do not leave ours behind.
+    monkeypatch.setattr(wlr_mod, "_SINGLETON_STATE", None, raising=False)
+    return wlr_mod.WlrBackend._connect_singleton()
+
+
+def test_a_pre_v3_screencopy_compositor_is_refused_not_hung(monkeypatch):
+    """Binding below version 3 would block forever, not fail.
+
+    The capture loop waits for ``buffer_done``, which the protocol only
+    added in version 3. A v1/v2 compositor sends ``buffer`` and then
+    waits for ``copy`` while we wait for an event it will never send.
+    """
+    with pytest.raises(RuntimeError, match=r"version 2.*needs version 3"):
+        _connect_against(
+            [("zwlr_screencopy_manager_v1", 2), ("wl_shm", 1)], monkeypatch
+        )
+
+
+def test_the_pre_v3_refusal_explains_buffer_done(monkeypatch):
+    with pytest.raises(RuntimeError, match=r"buffer_done"):
+        _connect_against(
+            [("zwlr_screencopy_manager_v1", 1), ("wl_shm", 1)], monkeypatch
+        )
