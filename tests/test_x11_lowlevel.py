@@ -932,3 +932,64 @@ def test_the_delegation_chain_cannot_close_into_a_loop():
     # handler that was installed before any of this started.
     assert "BASE-REACHED" in result.stdout, report
     assert "CYCLE" not in result.stdout, report
+
+
+_PROTOCOL_ERROR_SCRIPT = _XVFB_PRELUDE + r'''
+display = sys.argv[1]
+start(display)
+if not wait_for_socket(display):
+    finish(4, "NO-SOCKET")
+if wait_for_extension(display) is None:
+    finish(4, "NO-EXTENSION")
+
+# A request the server must reject, issued from inside a guarded region.
+# Xlib's default protocol handler prints and calls exit(), so without the
+# handler fg_io_arm() installs this line ends the process here.
+try:
+    _linux_x11._force_x_protocol_error()
+except RuntimeError as exc:
+    say("RAISED")
+    if "error code" not in str(exc):
+        finish(5, "MESSAGE-LACKS-CODE: " + str(exc))
+else:
+    finish(6, "NO-EXCEPTION")
+
+# The connection must still be usable: a rejected request is the server
+# refusing one thing, not the connection dying.
+try:
+    _linux_x11.resolution()
+except RuntimeError as exc:
+    finish(7, "CONNECTION-UNUSABLE: " + str(exc))
+
+finish(0, "SURVIVED")
+'''
+
+
+def test_a_rejected_request_raises_instead_of_exiting():
+    """An X *protocol* error used to take the interpreter down.
+
+    The I/O error handler from #48 does not see protocol errors — they
+    arrive on a different channel, and Xlib's default handler for them
+    prints a diagnostic and calls exit(). The bounds check normally keeps
+    XGetImage inside the root window, but it is two round trips away from
+    the request it guards, so a RandR resize in between leaves a check
+    that passed and a request that cannot succeed.
+    """
+    result, report = _run_x_fault_script(_PROTOCOL_ERROR_SCRIPT)
+    assert result.returncode == 0, report
+    assert "RAISED" in result.stdout, report
+    # Not merely "it did not die" — the connection has to keep working.
+    assert "SURVIVED" in result.stdout, report
+
+
+def test_a_rejected_request_names_the_x_error():
+    """error code 8 is BadMatch, major opcode 73 is X_GetImage.
+
+    Without the codes this is indistinguishable from any other refusal,
+    and the request is asynchronous enough that a traceback alone does
+    not say what the server objected to.
+    """
+    with pytest.raises(RuntimeError, match=r"error code 8 .*opcode 73"):
+        _linux_x11._force_x_protocol_error()
+    # And the cached connection survives it, in process too.
+    assert _linux_x11.resolution() == _linux_x11.resolution()
