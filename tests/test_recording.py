@@ -9,6 +9,8 @@ import argparse
 import os
 import shutil
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 
@@ -538,3 +540,179 @@ def test_recorder_smoke_mp4(tmp_path):
         )
         assert result.returncode == 0, result.stderr
         assert "h264" in result.stdout.strip().lower()
+
+
+# -------- ffmpeg's stderr must never be able to block it --------
+#
+# stderr used to be a subprocess.PIPE that nothing read until close().
+# A pipe holds 64 KiB (F_GETPIPE_SZ on Linux); an ffmpeg that filled it
+# would block writing its own diagnostics, and an ffmpeg blocked on
+# stderr stops reading stdin, which blocks write_frame(). Neither side
+# has a timeout, so that is a hang, not an error.
+#
+# -loglevel error keeps real ffmpeg quiet — mp4, webm and gif encodes of
+# 120 frames each produced 0 bytes of stderr, and so did titles carrying
+# glyphs the font lacks — so this was latent rather than reachable. It is
+# still worth removing: the safety rested entirely on a log level nothing
+# enforced, and what it guarded against was an unkillable hang. These
+# tests stand in for an ffmpeg that does talk.
+
+_NOISY_CHILD = (
+    "import sys\n"
+    "sys.stderr.buffer.write(b'e' * {volume})\n"
+    "sys.stderr.buffer.write(b'\\nLAST-LINE-OF-STDERR\\n')\n"
+    "sys.stderr.buffer.flush()\n"
+    "read = 0\n"
+    "while True:\n"
+    "    chunk = sys.stdin.buffer.read(65536)\n"
+    "    if not chunk:\n"
+    "        break\n"
+    "    read += len(chunk)\n"
+    "sys.exit({status})\n"
+)
+
+
+def _encoder_over(tmp_path, volume, status=0):
+    """An encoder whose 'ffmpeg' is a child with a known stderr volume."""
+    enc = FfmpegEncoder(str(tmp_path / "out.mp4"), 64, 48, fps=30)
+    enc._build_argv = lambda: [
+        sys.executable, "-c",
+        _NOISY_CHILD.format(volume=volume, status=status),
+    ]
+    return enc
+
+
+def _feed(enc, frames=40, timeout=60.0):
+    """Write frames from a thread; return True if the writer finished."""
+    frame = numpy.zeros((48, 64, 4), numpy.uint8)
+    done = threading.Event()
+
+    def run():
+        try:
+            for _ in range(frames):
+                enc.write_frame(frame)
+        except Exception:
+            pass
+        finally:
+            done.set()
+
+    threading.Thread(target=run, daemon=True).start()
+    return done.wait(timeout)
+
+
+@requires_ffmpeg
+@pytest.mark.parametrize("volume", [16 * 1024, 512 * 1024])
+def test_a_talkative_encoder_does_not_block_the_writer(tmp_path, volume):
+    """The deadlock itself.
+
+    16 KiB fits the pipe and always worked; 512 KiB does not, and used to
+    wedge write_frame() forever. 40 frames of 64x48 is ~480 KiB, well
+    past the 64 KiB stdin pipe, so a child that has stopped reading
+    cannot be masked by buffering.
+    """
+    enc = _encoder_over(tmp_path, volume)
+    enc.start()
+    try:
+        assert _feed(enc), (
+            "write_frame() never returned: the encoder's stderr filled and "
+            "nothing was reading it"
+        )
+    finally:
+        enc.close()
+
+
+@requires_ffmpeg
+def test_a_large_stderr_is_reported_as_its_tail(tmp_path):
+    """A megabyte of diagnostics must not become a megabyte of exception."""
+    enc = _encoder_over(tmp_path, 512 * 1024, status=1)
+    enc.start()
+    assert _feed(enc)
+    with pytest.raises(RuntimeError) as excinfo:
+        enc.close()
+    message = str(excinfo.value)
+    assert "exited with status 1" in message
+    # the end of the log survives — that is where ffmpeg says why it died
+    assert "LAST-LINE-OF-STDERR" in message
+    # and the truncation is declared rather than silent
+    assert "earlier bytes omitted" in message
+    assert len(message) < 128 * 1024, "the whole log went into the message"
+
+
+@requires_ffmpeg
+def test_a_short_stderr_is_reported_whole(tmp_path):
+    """No truncation notice when nothing was truncated."""
+    enc = _encoder_over(tmp_path, 128, status=1)
+    enc.start()
+    assert _feed(enc)
+    with pytest.raises(RuntimeError) as excinfo:
+        enc.close()
+    message = str(excinfo.value)
+    assert "LAST-LINE-OF-STDERR" in message
+    assert "omitted" not in message
+
+
+@requires_ffmpeg
+def test_draining_mid_run_does_not_disturb_what_the_child_writes(tmp_path):
+    """subprocess hands the child a dup, which shares the file offset.
+
+    Reading with seek() would move where the child's next write lands and
+    overwrite its own log, so the drain uses positional reads.
+    """
+    enc = _encoder_over(tmp_path, 4096, status=0)
+    enc.start()
+    try:
+        # The child writes as soon as it starts, but "as soon as" is not
+        # "before this line"; poll rather than race it.
+        deadline = time.time() + 30.0
+        early = ""
+        while time.time() < deadline:
+            early = enc._drain_stderr()
+            if "LAST-LINE-OF-STDERR" in early:
+                break
+            time.sleep(0.05)
+        assert "LAST-LINE-OF-STDERR" in early
+        assert _feed(enc)
+    finally:
+        enc.close()
+    # The child's own bytes are intact: 4096 'e's plus its final line,
+    # not a hole where the read repositioned the shared offset.
+    assert early.count("e") >= 4096
+
+
+@requires_ffmpeg
+def test_a_real_ffmpeg_failure_still_reports_its_stderr(tmp_path):
+    """The capture path has to keep working with actual ffmpeg."""
+    enc = FfmpegEncoder(str(tmp_path / "nosuchdir" / "out.mp4"), 64, 48, fps=30)
+    enc.start()
+    frame = numpy.zeros((48, 64, 4), numpy.uint8)
+    with pytest.raises(RuntimeError) as excinfo:
+        for _ in range(30):
+            enc.write_frame(frame)
+        enc.close()
+    message = str(excinfo.value)
+    assert "nosuchdir" in message or "No such file" in message, message
+
+
+def test_the_drain_falls_back_when_pread_is_unavailable(tmp_path, monkeypatch):
+    """os.pread is Unix-only; the drain must still read on a host without it.
+
+    Recording is X11-only in practice, so this path is for completeness
+    rather than a supported platform — but silently returning nothing
+    would turn a real ffmpeg error into an empty message.
+    """
+    enc = FfmpegEncoder(str(tmp_path / "out.mp4"), 64, 48, fps=30)
+    handle = tempfile.TemporaryFile()
+    handle.write(b"e" * 10 + b"\nWHY-FFMPEG-DIED\n")
+    handle.flush()
+    enc._stderr_file = handle
+    try:
+        monkeypatch.delattr(os, "pread", raising=False)
+        assert "WHY-FFMPEG-DIED" in enc._drain_stderr()
+    finally:
+        handle.close()
+
+
+def test_the_drain_is_quiet_before_the_encoder_starts(tmp_path):
+    """No file yet is not an error — write_frame() can be reached first."""
+    enc = FfmpegEncoder(str(tmp_path / "out.mp4"), 64, 48, fps=30)
+    assert enc._drain_stderr() == ""

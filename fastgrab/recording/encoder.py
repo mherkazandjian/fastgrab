@@ -2,6 +2,7 @@
 import os
 import shutil
 import subprocess
+import tempfile
 
 import numpy
 
@@ -247,6 +248,7 @@ class FfmpegEncoder:
         self.subtitles = subtitles
         self.subtitle_style = subtitle_style
         self._proc = None
+        self._stderr_file = None
 
     def _build_argv(self):
         vf = _build_drawtext_filter(
@@ -277,12 +279,36 @@ class FfmpegEncoder:
                 "'apt-get install ffmpeg' or 'brew install ffmpeg') "
                 "to use fastgrab.recording"
             )
-        self._proc = subprocess.Popen(
-            self._build_argv(),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
+        # stderr goes to a temp file, not a pipe. A pipe holds 64 KiB
+        # (F_GETPIPE_SZ on Linux) and nothing reads this one until
+        # close(), so an ffmpeg that filled it would block writing its
+        # own diagnostics -- and an ffmpeg blocked on stderr stops
+        # reading stdin, which blocks write_frame(), which is a hang with
+        # no timeout on either side. Verified with this exact Popen
+        # shape: a child writing 16 KiB to stderr completes, one writing
+        # 128 KiB deadlocks the writer indefinitely.
+        #
+        # -loglevel error keeps real ffmpeg silent today -- an mp4, webm
+        # and gif encode of 120 frames each produced 0 bytes, and so did
+        # titles with glyphs the font lacks -- so this is a latent hazard
+        # rather than one reachable now. It is worth removing anyway: the
+        # safety rests entirely on a log level no test enforces, and the
+        # failure it guards is an unkillable hang rather than an error.
+        # A file has no capacity limit to reach.
+        self._stderr_file = tempfile.TemporaryFile()
+        try:
+            self._proc = subprocess.Popen(
+                self._build_argv(),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=self._stderr_file,
+            )
+        except Exception:
+            # close() never runs when start() fails, so the file has to be
+            # released here or a caller that retries leaks one per attempt.
+            self._stderr_file.close()
+            self._stderr_file = None
+            raise
 
     def write_frame(self, frame) -> None:
         """Write one BGRA frame to ffmpeg's stdin.
@@ -329,19 +355,52 @@ class FfmpegEncoder:
         finally:
             err = self._drain_stderr()
             self._proc = None
+            if self._stderr_file is not None:
+                self._stderr_file.close()
+                self._stderr_file = None
         if rc != 0:
             raise RuntimeError(
                 "ffmpeg exited with status {}: {}".format(rc, err)
             )
 
-    def _drain_stderr(self) -> str:
-        if self._proc is None or self._proc.stderr is None:
+    def _drain_stderr(self, limit: int = 64 * 1024) -> str:
+        """Read what ffmpeg has written to stderr so far.
+
+        Reads the temp file rather than a pipe, so this never blocks and
+        can be called while ffmpeg is still running — which write_frame()
+        does, on a pipe that has just broken.
+
+        Positional reads, not seek()+read(): subprocess hands the child a
+        dup of this file's descriptor, and a dup shares the file
+        *description*, offset included. Seeking here would move where
+        ffmpeg's next write lands and scribble over its own log.
+
+        Only the tail is returned. The file is unbounded by design, and a
+        run that produced megabytes of diagnostics would otherwise put
+        all of it into an exception message; the last lines are the ones
+        that say why ffmpeg stopped.
+        """
+        handle = self._stderr_file
+        if handle is None:
             return ""
         try:
-            data = self._proc.stderr.read() or b""
+            fd = handle.fileno()
+            size = os.fstat(fd).st_size
+            start = max(0, size - limit)
+            if hasattr(os, "pread"):
+                data = os.pread(fd, size - start, start) or b""
+            else:
+                # No pread off Unix. Recording is X11-only, so this is a
+                # fallback for completeness rather than a supported path;
+                # the offset caveat above applies to it.
+                handle.seek(start)
+                data = handle.read() or b""
         except Exception:
             return ""
-        return data.decode("utf-8", errors="replace").strip()
+        text = data.decode("utf-8", errors="replace").strip()
+        if start:
+            text = "[...{} earlier bytes omitted...] {}".format(start, text)
+        return text
 
     def __enter__(self):
         self.start()
