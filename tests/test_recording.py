@@ -28,6 +28,7 @@ from fastgrab.recording import (
 from fastgrab.recording import cli as recording_cli
 from fastgrab.recording import clicks as click_mod
 from fastgrab.recording import encoder as encoder_mod
+from fastgrab.recording import recorder as recorder_mod
 from fastgrab.recording import subtitles as subtitles_mod
 
 
@@ -955,3 +956,182 @@ def test_duplicated_frames_are_still_reported(monkeypatch, tmp_path, capsys):
     captured = capsys.readouterr()
     assert rc == 0
     assert "15 duplicated" in captured.out, captured.out
+
+
+# -------- the clip must last as long as the recording did --------
+#
+# ffmpeg stamps incoming raw frames at the fixed target rate, so a
+# capture loop that cannot keep up would produce a clip shorter than the
+# recording and played back too fast, with every subtitle window drifting
+# out of place. Recorder guards against that by writing the current frame
+# once per elapsed tick.
+#
+# The guard works — measured against real ffmpeg at up to 6x sustained
+# lag, output duration tracked wall-clock to within 15 ms — but nothing
+# pinned it. The only assertion on the mechanism was
+# `written_frames >= frames`, which is true however badly the pacing
+# behaves, so removing the duplication entirely kept the suite green.
+#
+# These drive recorder.py against a fake clock rather than sleeping. The
+# property is arithmetic — how many ticks fell inside the elapsed time —
+# and measuring it with real time made it a test of the runner's timer
+# granularity instead, which is what it failed on for Windows and macOS.
+
+
+class _FakeClock:
+    """Stands in for the time module inside recorder.py.
+
+    Nothing sleeps: sleep() just moves the clock forward, so a recording
+    of any length runs instantly and every tick lands exactly where the
+    arithmetic says it should.
+    """
+
+    def __init__(self, start=1000.0):
+        self.now = start
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        if seconds > 0:
+            self.now += seconds
+
+
+class _ScriptedGrab:
+    """A Screenshot stand-in that costs a known amount of clock time."""
+
+    def __init__(self, clock, cost=0.0, stall_at=None, stall_for=0.0):
+        self.clock = clock
+        self.cost = cost
+        self.stall_at = stall_at
+        self.stall_for = stall_for
+        self.calls = 0
+        self.screensize = (64, 48)
+
+    def capture(self, bbox=None):
+        self.calls += 1
+        if self.stall_at is not None and self.calls == self.stall_at:
+            self.clock.now += self.stall_for
+        else:
+            self.clock.now += self.cost
+        return numpy.zeros((48, 64, 4), numpy.uint8)
+
+
+class _CountingEncoder:
+    """Accepts frames and counts them; no ffmpeg involved."""
+
+    def __init__(self, *args, **kwargs):
+        self.frames = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def write_frame(self, frame):
+        self.frames += 1
+
+
+def _paced_recorder(monkeypatch, tmp_path, fps, encoder=None, **grab):
+    """A Recorder with its clock, its capture and its encoder all stubbed.
+
+    Screenshot is replaced before construction, not after: Recorder builds
+    one in __init__, and the default x11 backend imports the C extension,
+    which does not exist on the Windows and macOS runners.
+    """
+    clock = _FakeClock()
+    stub = _ScriptedGrab(clock, **grab)
+    monkeypatch.setattr(recorder_mod, "time", clock)
+    monkeypatch.setattr(recorder_mod, "Screenshot", lambda **kw: stub)
+    monkeypatch.setattr(
+        recorder_mod, "FfmpegEncoder", encoder or _CountingEncoder
+    )
+    rec = Recorder(str(tmp_path / "out.mp4"), bbox=(0, 0, 64, 48), fps=fps)
+    return rec, stub
+
+
+def _assert_tracks_wall_clock(stats, fps, tolerance=1):
+    """The clip's length, in frames, must match the time that passed."""
+    expected = stats["elapsed_seconds"] * fps
+    assert abs(stats["written_frames"] - expected) <= tolerance, (
+        "clip is {:.2f}s of video for {:.2f}s of recording ({} frames, "
+        "expected about {:.0f})".format(
+            stats["written_frames"] / float(fps), stats["elapsed_seconds"],
+            stats["written_frames"], expected,
+        )
+    )
+
+
+def test_a_capture_that_keeps_up_writes_one_frame_per_tick(monkeypatch, tmp_path):
+    rec, _ = _paced_recorder(monkeypatch, tmp_path, 20, cost=0.01)
+    stats = rec.record(duration=1.0)
+    _assert_tracks_wall_clock(stats, 20)
+    assert stats["written_frames"] == stats["frames"], (
+        "a capture comfortably inside the tick should need no duplicates"
+    )
+
+
+def test_a_capture_four_times_too_slow_still_fills_the_clip(monkeypatch, tmp_path):
+    """The case the duplication exists for: the loop cannot keep up."""
+    rec, _ = _paced_recorder(monkeypatch, tmp_path, 20, cost=0.20)
+    stats = rec.record(duration=1.0)
+    _assert_tracks_wall_clock(stats, 20)
+    # A quarter of the target rate: about five captures for twenty ticks.
+    assert stats["frames"] <= 6, stats
+    assert stats["written_frames"] - stats["frames"] >= 12, stats
+
+
+def test_a_single_long_stall_is_filled_with_duplicates(monkeypatch, tmp_path):
+    """One freeze, not sustained lag — the gap still has to be covered."""
+    rec, _ = _paced_recorder(
+        monkeypatch, tmp_path, 20, cost=0.01, stall_at=3, stall_for=0.5
+    )
+    stats = rec.record(duration=1.0)
+    _assert_tracks_wall_clock(stats, 20)
+    # The freeze alone spans ten ticks at 20 fps and only one frame was
+    # captured across it, so at least nine writes must be duplicates.
+    assert stats["written_frames"] - stats["frames"] >= 9, stats
+
+
+def test_stopping_early_also_tracks_wall_clock(monkeypatch, tmp_path):
+    """stop_event is how an interactive recording ends, not a deadline.
+
+    The capture costs three ticks so this exercises the duplication too;
+    at one tick the loop keeps up and the test would still pass with the
+    mechanism removed.
+    """
+    rec, grab = _paced_recorder(monkeypatch, tmp_path, 20, cost=0.15)
+    stop = threading.Event()
+
+    # Fires on the fake clock, not a real timer: stop once the recording
+    # has covered about a second of clock time.
+    original = grab.capture
+
+    def capture(bbox=None):
+        frame = original(bbox)
+        if grab.clock.now >= 1001.0:
+            stop.set()
+        return frame
+
+    grab.capture = capture
+    stats = rec.record(stop_event=stop)
+    _assert_tracks_wall_clock(stats, 20)
+    assert stats["written_frames"] > stats["frames"], stats
+
+
+def test_every_written_frame_reached_the_encoder(monkeypatch, tmp_path):
+    """written_frames is a claim about ffmpeg's input; check it is true."""
+    made = []
+
+    class _Recording(_CountingEncoder):
+        def __init__(self, *a, **kw):
+            _CountingEncoder.__init__(self, *a, **kw)
+            made.append(self)
+
+    rec, _ = _paced_recorder(
+        monkeypatch, tmp_path, 20, encoder=_Recording, cost=0.1
+    )
+    stats = rec.record(duration=1.0)
+    assert len(made) == 1
+    assert made[0].frames == stats["written_frames"]
