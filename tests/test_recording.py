@@ -906,19 +906,22 @@ def _run_cli_with(monkeypatch, stats, tmp_path, extra=None):
     return recording_cli.main(argv + (extra or []))
 
 
-def _stats(output, frames=0, written=0):
+def _stats(output, frames=0, written=0, encoder_started=True):
     return {
         "frames": frames,
         "written_frames": written,
         "elapsed_seconds": 0.0 if not frames else 1.0,
         "achieved_fps": 0.0 if not frames else float(frames),
         "output": str(output),
+        "encoder_started": encoder_started,
     }
 
 
 def test_a_cancelled_recording_does_not_claim_a_file(monkeypatch, tmp_path, capsys):
     out = tmp_path / "out.mp4"
-    rc = _run_cli_with(monkeypatch, _stats(out), tmp_path)
+    rc = _run_cli_with(
+        monkeypatch, _stats(out, encoder_started=False), tmp_path
+    )
     captured = capsys.readouterr()
     assert rc == 0, "a deliberate cancel is not an error"
     assert "wrote" not in captured.out, captured.out
@@ -1236,3 +1239,94 @@ def test_a_clean_close_still_raises_nothing(tmp_path):
     enc.close(timeout=10.0)
     assert enc._proc is None
     assert enc._stderr_file is None
+
+
+# -------- two regressions the first version of this check introduced --------
+#
+# Both found by review of the merged change, and both confirmed by
+# running ffmpeg rather than by reading the code.
+
+def test_zero_frames_with_a_started_encoder_is_not_a_cancellation(
+    monkeypatch, tmp_path, capsys
+):
+    """A frame count of nought does not mean nothing was produced.
+
+    If the loop stops after ffmpeg starts but before the first capture,
+    ffmpeg writes and closes an empty container quite happily — measured
+    at 261 bytes for mp4 and 465 for webm, both with a clean exit. The
+    first version of this branch keyed on the frame count and so
+    announced that a file which exists "was not written", which is the
+    same lie it was added to prevent, pointing the other way.
+    """
+    out = tmp_path / "out.mp4"
+    out.write_bytes(b"\0" * 261)  # what ffmpeg leaves behind
+    rc = _run_cli_with(
+        monkeypatch, _stats(out, frames=0, written=0, encoder_started=True),
+        tmp_path,
+    )
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "was not written" not in captured.err, captured.err
+    assert "wrote {}".format(out) in captured.out, captured.out
+
+
+def test_a_file_url_output_is_resolved_before_looking_for_it(
+    monkeypatch, tmp_path, capsys
+):
+    """`-o file:out.mp4` writes out.mp4; the check must not fail it.
+
+    ffmpeg's file: protocol exists so a name containing a colon, or one
+    starting with a dash, can be given unambiguously. Confirmed against
+    real ffmpeg: `file:/tmp/url.mp4` produced /tmp/url.mp4 and exited
+    cleanly, while os.path.exists on the raw string was False — so the
+    first version of this check failed a recording that had worked.
+    """
+    real = tmp_path / "out.mp4"
+    real.write_bytes(b"a real recording")
+    rc = _run_cli_with(
+        monkeypatch, _stats("file:" + str(real), frames=10, written=10),
+        tmp_path,
+    )
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    assert "does not exist" not in captured.err
+    assert "wrote file:{}".format(real) in captured.out, captured.out
+
+
+def test_a_non_file_destination_is_not_checked_on_disk(
+    monkeypatch, tmp_path, capsys
+):
+    """ffmpeg can write to a protocol URL; there is no path to stat."""
+    rc = _run_cli_with(
+        monkeypatch, _stats("rtmp://example.invalid/live/x.mp4",
+                            frames=10, written=10),
+        tmp_path,
+    )
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    assert "does not exist" not in captured.err
+
+
+def test_a_genuinely_missing_local_file_is_still_an_error(
+    monkeypatch, tmp_path, capsys
+):
+    """The check must keep working for the ordinary case."""
+    out = tmp_path / "gone.mp4"
+    rc = _run_cli_with(monkeypatch, _stats(out, frames=10, written=10), tmp_path)
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "does not exist" in captured.err
+
+
+def test_a_missing_file_url_target_is_reported_by_its_real_path(
+    monkeypatch, tmp_path, capsys
+):
+    """Resolving must not turn a real failure into a pass."""
+    out = tmp_path / "gone.mp4"
+    rc = _run_cli_with(
+        monkeypatch, _stats("file:" + str(out), frames=10, written=10), tmp_path
+    )
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert str(out) in captured.err
+    assert "file:" not in captured.err, "report the path ffmpeg writes, not the URL"
