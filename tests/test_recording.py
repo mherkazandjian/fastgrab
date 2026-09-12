@@ -1135,3 +1135,104 @@ def test_every_written_frame_reached_the_encoder(monkeypatch, tmp_path):
     stats = rec.record(duration=1.0)
     assert len(made) == 1
     assert made[0].frames == stats["written_frames"]
+
+
+# -------- close() must say why ffmpeg stopped --------
+#
+# The timeout path raised "ffmpeg did not exit within 30s" and nothing
+# else. Its finally block computed the stderr and then dropped it on the
+# floor, so the one failure where ffmpeg's own words matter most — it
+# hung, and you cannot ask it anything afterwards because it gets killed
+# — was the one failure that arrived with no words at all.
+
+_HANGING_CHILD = (
+    "import sys, time\n"
+    "sys.stderr.buffer.write(b'WHY-IT-HUNG\\n')\n"
+    "sys.stderr.buffer.flush()\n"
+    "while True:\n"
+    "    time.sleep(0.05)\n"
+)
+
+_SILENT_HANGING_CHILD = (
+    "import sys, time\n"
+    "while True:\n"
+    "    time.sleep(0.05)\n"
+)
+
+_DYING_CHILD = (
+    "import sys\n"
+    "sys.stderr.buffer.write(b'DIED-BECAUSE-OF-THIS\\n')\n"
+    "sys.stderr.buffer.flush()\n"
+    "sys.exit(3)\n"
+)
+
+
+def _encoder_running(tmp_path, source):
+    enc = FfmpegEncoder(str(tmp_path / "out.mp4"), 64, 48, fps=30)
+    enc._build_argv = lambda: [sys.executable, "-c", source]
+    enc.start()
+    return enc
+
+
+@requires_ffmpeg
+def test_a_hung_encoder_reports_what_it_said_before_hanging(tmp_path):
+    enc = _encoder_running(tmp_path, _HANGING_CHILD)
+    with pytest.raises(RuntimeError) as excinfo:
+        enc.close(timeout=1.0)
+    message = str(excinfo.value)
+    assert "did not exit within 1.0s" in message, message
+    assert "WHY-IT-HUNG" in message, message
+
+
+@requires_ffmpeg
+def test_a_hung_encoder_that_said_nothing_says_so(tmp_path):
+    """An empty tail must not trail off the end of the message."""
+    enc = _encoder_running(tmp_path, _SILENT_HANGING_CHILD)
+    with pytest.raises(RuntimeError) as excinfo:
+        enc.close(timeout=1.0)
+    message = str(excinfo.value)
+    assert "did not exit within 1.0s" in message, message
+    assert "wrote nothing to stderr" in message, message
+
+
+@requires_ffmpeg
+def test_a_hung_encoder_is_killed_and_reaped(tmp_path):
+    """The timeout must not leave the process behind."""
+    enc = _encoder_running(tmp_path, _HANGING_CHILD)
+    proc = enc._proc
+    with pytest.raises(RuntimeError):
+        enc.close(timeout=1.0)
+    assert proc.poll() is not None, "the hung encoder outlived close()"
+    assert enc._proc is None
+    assert enc._stderr_file is None, "the stderr file was not released"
+
+
+@requires_ffmpeg
+def test_a_broken_pipe_on_close_does_not_hide_the_real_cause(tmp_path):
+    """ffmpeg died first, so closing its stdin fails.
+
+    Reporting that BrokenPipeError names a symptom and nothing else, and
+    it skipped the exit status and stderr that say what actually
+    happened.
+    """
+    enc = _encoder_running(tmp_path, _DYING_CHILD)
+    enc._proc.wait()
+
+    def boom():
+        raise BrokenPipeError(32, "Broken pipe")
+
+    enc._proc.stdin.close = boom
+    with pytest.raises(RuntimeError) as excinfo:
+        enc.close(timeout=5.0)
+    message = str(excinfo.value)
+    assert "status 3" in message, message
+    assert "DIED-BECAUSE-OF-THIS" in message, message
+
+
+@requires_ffmpeg
+def test_a_clean_close_still_raises_nothing(tmp_path):
+    """The ordinary path must be untouched."""
+    enc = _encoder_running(tmp_path, "import sys\nsys.stdin.buffer.read()\n")
+    enc.close(timeout=10.0)
+    assert enc._proc is None
+    assert enc._stderr_file is None

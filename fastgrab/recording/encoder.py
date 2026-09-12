@@ -255,6 +255,13 @@ def _ffmpeg_args(codec: str, width: int, height: int, fps: int, output: str,
     return common_in + out
 
 
+# Said instead of trailing an empty string off the end of an error. With
+# -loglevel error a clean run writes nothing, so silence is expected and
+# worth stating rather than leaving the reader wondering whether the
+# message was truncated.
+_NO_STDERR = "(ffmpeg wrote nothing to stderr)"
+
+
 class FfmpegEncoder:
     """Spawn ffmpeg, feed it BGRA frames, and finalise on close.
 
@@ -388,13 +395,30 @@ class FfmpegEncoder:
         if self._proc is None:
             return
         try:
-            if self._proc.stdin is not None:
-                self._proc.stdin.close()
-            rc = self._proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            self._proc.kill()
-            self._proc.wait()
-            raise RuntimeError("ffmpeg did not exit within {}s".format(timeout))
+            try:
+                if self._proc.stdin is not None:
+                    self._proc.stdin.close()
+            except BrokenPipeError:
+                # ffmpeg has already gone. Letting this out would report
+                # the broken pipe -- a symptom that names nothing -- and
+                # skip the exit status and stderr below, which say why it
+                # went. Fall through and let those do the talking.
+                pass
+            try:
+                rc = self._proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+                self._proc.wait()
+                # Drain before the finally closes the file. A hang is the
+                # case where ffmpeg's own words matter most and the one
+                # where they used to be dropped: the message named only
+                # the timeout, while the finally computed the stderr and
+                # then discarded it.
+                raise RuntimeError(
+                    "ffmpeg did not exit within {}s and was killed: {}".format(
+                        timeout, self._drain_stderr() or _NO_STDERR
+                    )
+                )
         finally:
             err = self._drain_stderr()
             self._proc = None
@@ -403,7 +427,7 @@ class FfmpegEncoder:
                 self._stderr_file = None
         if rc != 0:
             raise RuntimeError(
-                "ffmpeg exited with status {}: {}".format(rc, err)
+                "ffmpeg exited with status {}: {}".format(rc, err or _NO_STDERR)
             )
 
     def _drain_stderr(self, limit: int = 64 * 1024) -> str:
