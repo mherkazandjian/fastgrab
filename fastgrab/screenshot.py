@@ -30,6 +30,9 @@ class Screenshot(object):
         self._img = None
         """The buffer where the captured image is stored"""
 
+        self._closed = False
+        """Set by :meth:`close`; capture refuses to run afterwards"""
+
     @property
     def screensize(self) -> tuple:
         """
@@ -236,6 +239,11 @@ class Screenshot(object):
          BGRA byte order.
         """
 
+        if self._closed:
+            raise RuntimeError(
+                "this Screenshot has been closed; construct a new one"
+            )
+
         # check/set the dimensions of the image that will be captured
         if bbox is None:
             width, height = self.screensize
@@ -263,3 +271,41 @@ class Screenshot(object):
         self._backend.screenshot(x, y, self._img)
 
         return self._img
+
+    def close(self):
+        """Release the backend's OS resources and drop the image buffer.
+
+        Optional. Every backend that holds an OS-level frame buffer — the
+        wlr SHM buffer, the Windows DIBSection and its memory DC — keeps
+        it in a helper object carrying a :mod:`weakref` finalizer, so
+        simply dropping a ``Screenshot`` releases the same resources.
+        What ``close`` adds is the *moment*: the release happens here
+        rather than whenever the garbage collector gets to it.
+
+        That matters most for the shortest form of this library's API,
+        which throws the object away by construction::
+
+            img = screenshot.Screenshot().capture()
+
+        In a loop that is a new backend, and a new frame buffer, every
+        iteration. CPython frees each one promptly on refcount zero, but
+        code holding instances in a container, a cycle, or another
+        implementation's deferred collector will not. Reuse one
+        ``Screenshot``, or close what you finish with::
+
+            with screenshot.Screenshot() as grab:
+                img = grab.capture()
+
+        Idempotent, and safe on a backend that holds nothing. The
+        instance must not be used for capture afterwards.
+        """
+        self._closed = True
+        self._img = None
+        self._backend.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False

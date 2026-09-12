@@ -51,6 +51,36 @@ from abc import ABC, abstractmethod
 
 
 class BaseBackend(ABC):
+    _closed = False
+    """Set on the instance by :meth:`close`; a class attribute so that a
+    backend needs no ``__init__`` of its own to have one."""
+
+    def close(self):
+        """Release any OS resources this backend holds.
+
+        The default is a no-op, which is right for a backend that keeps
+        nothing between calls: ``x11`` shares one process-wide connection
+        owned by the C extension, and ``macos`` re-resolves the display
+        every time. A backend that allocates a frame buffer per instance
+        — ``wlr``'s SHM buffer, ``windows``' DIBSection — overrides this
+        and must also refuse to capture afterwards, because the handles
+        it would blit through are gone.
+
+        Closing is optional. Each such backend keeps its handles in a
+        small helper object carrying a :mod:`weakref` finalizer, so
+        dropping the backend frees them too; ``close`` only makes the
+        moment deterministic. It must be safe to call twice.
+        """
+        self._closed = True
+
+    def _check_open(self):
+        """Raise if :meth:`close` has already run."""
+        if self._closed:
+            raise RuntimeError(
+                "this backend has been closed; construct a new "
+                "Screenshot() rather than reusing a closed one"
+            )
+
     @abstractmethod
     def resolution(self):
         """Return ``(width, height)`` of the primary screen/output.

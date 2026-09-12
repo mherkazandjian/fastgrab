@@ -19,6 +19,7 @@ conversion and exactly what it is allowed to assume.
 """
 import mmap
 import os
+import weakref
 import struct  # noqa: F401  (reserved for future DMA-BUF / extended formats)
 
 import numpy as np
@@ -191,6 +192,83 @@ def _plan_region(x, y, w, h, mode_w, mode_h, logical_w, logical_h):
         exp_w=lw * scale,
         exp_h=lh * scale,
     )
+
+
+def _release_shm(mm, fd, wl_buffer):
+    """Free one SHM frame buffer: the compositor's claim first, then ours.
+
+    The order is the whole point. A ``wl_buffer`` the compositor still
+    owns keeps the compositor's own mapping of the memfd alive, so
+    closing our file descriptor first releases no memory at all —
+    measured against cage, 50 dropped buffers held 175.5 MiB of system
+    Shmem, and closing every descriptor by hand freed none of it. Sending
+    ``destroy`` brought the same 50 down to 0.8 MiB.
+
+    Nothing here may raise. This runs from a :mod:`weakref` finalizer,
+    where an exception is printed and swallowed at an arbitrary point in
+    someone else's call stack. A dead connection is not a leak either —
+    the compositor drops every resource it held for us when the socket
+    closes.
+    """
+    try:
+        wl_buffer.destroy()
+    except Exception:
+        pass
+    try:
+        mm.close()
+    except Exception:
+        pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+class _ShmBuffer:
+    """Owns one memfd + mmap + wl_buffer, and frees them when dropped.
+
+    The finalizer lives here rather than on :class:`WlrBackend` so that
+    dropping a backend releases its frame buffer without the backend
+    needing a ``__del__``. That separation is the point: the backend is
+    entangled with pywayland's connection-wide state, whose finalisation
+    order at interpreter shutdown is exactly what makes ``__del__``
+    unsafe here, while these three handles are this object's own and
+    nobody else's.
+
+    ``atexit`` is turned off for the same reason. At shutdown the kernel
+    reclaims the descriptor and the mapping regardless, and the
+    compositor frees everything when the socket closes, so firing then
+    buys nothing and would push a request through a display that may
+    already be half torn down. The leak worth fixing is the one that
+    accumulates *while* the process runs.
+    """
+
+    # __weakref__ is not optional here: weakref.finalize takes a weak
+    # reference to this object, and a __slots__ class does not get one
+    # unless it is asked for. Without it construction raises outright.
+    __slots__ = ("mm", "fd", "wl", "w", "h", "stride", "fmt", "_finalize",
+                 "__weakref__")
+
+    def __init__(self, mm, fd, wl, w, h, stride, fmt):
+        self.mm = mm
+        self.fd = fd
+        self.wl = wl
+        self.w = w
+        self.h = h
+        self.stride = stride
+        self.fmt = fmt
+        # The finalizer is handed the raw handles, never ``self``: a
+        # finalizer that referenced its own object would keep that object
+        # reachable and so could never run.
+        self._finalize = weakref.finalize(self, _release_shm, mm, fd, wl)
+        self._finalize.atexit = False
+
+    def matches(self, w, h, stride, fmt):
+        return (self.w, self.h, self.stride, self.fmt) == (w, h, stride, fmt)
+
+    def close(self):
+        """Free now. Idempotent — a finalizer only ever fires once."""
+        self._finalize()
 
 
 # The wayland connection + globals are shared across all WlrBackend
@@ -447,6 +525,7 @@ class WlrBackend(BaseBackend):
         return _RegionPlan((x, y, w, h), 0, 0, w, h)
 
     def screenshot(self, x, y, img):
+        self._check_open()
         h, w, _ = img.shape
         full_w, full_h = self.resolution()
         if x == 0 and y == 0 and w == full_w and h == full_h:
@@ -607,13 +686,9 @@ class WlrBackend(BaseBackend):
     def _ensure_buffer(self, fmt, w, h, stride):
         """Reuse the SHM-backed wl_buffer if dimensions match the last call."""
         if self._buf is not None:
-            old_mm, old_fd, old_wl, old_w, old_h, old_stride, old_fmt = self._buf
-            if (old_w, old_h, old_stride, old_fmt) == (w, h, stride, fmt):
-                return old_wl, old_mm
-            # dispose of old
-            old_wl.destroy()
-            old_mm.close()
-            os.close(old_fd)
+            if self._buf.matches(w, h, stride, fmt):
+                return self._buf.wl, self._buf.mm
+            self._buf.close()
             self._buf = None
 
         size = stride * h
@@ -625,9 +700,21 @@ class WlrBackend(BaseBackend):
         wl_buffer = pool.create_buffer(0, w, h, stride, fmt)
         pool.destroy()
 
-        self._buf = (mm, fd, wl_buffer, w, h, stride, fmt)
+        self._buf = _ShmBuffer(mm, fd, wl_buffer, w, h, stride, fmt)
         return wl_buffer, mm
 
-    # Intentionally no __del__ — pywayland's C-level state has its own
-    # lifecycle and finalising in arbitrary GC order can segfault. The
-    # OS reclaims the fd / mmap when the process exits.
+    def close(self):
+        """Release this instance's SHM frame buffer.
+
+        Optional — dropping the backend frees the same buffer through
+        :class:`_ShmBuffer`'s finalizer. Call it to pick the moment.
+
+        Still no ``__del__`` on the backend itself: pywayland's C-level
+        state has its own lifecycle and finalising it in arbitrary GC
+        order can segfault. Only the buffer is ours to free; the display
+        is process-wide and outlives every instance.
+        """
+        if self._buf is not None:
+            self._buf.close()
+            self._buf = None
+        self._closed = True

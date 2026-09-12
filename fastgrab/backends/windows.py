@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import weakref
 from ctypes import wintypes  # only available on Windows; gated by importer
 
 import numpy
@@ -193,6 +194,76 @@ def _validate_destination(img):
         raise ValueError("image buffer height and width must be positive")
 
 
+def _release_gdi(state):
+    """Delete a memory DC and the DIBSection selected into it.
+
+    Order is forced by GDI: a bitmap that is still selected into a DC
+    cannot be deleted, so the DC's original bitmap goes back first, and
+    the DC itself is deleted last because it is what the bitmap was
+    selected into.
+
+    ``state`` is a :class:`_GdiSurface`'s attribute dict — see that class
+    for why the handles arrive by dict rather than by value. Nothing here
+    raises: it runs from a finalizer, and these calls only report failure
+    through a return code anyway.
+    """
+    gdi32 = state.get("gdi32")
+    if gdi32 is None:
+        return
+    mem_dc = state.get("mem_dc")
+    bitmap = state.get("bitmap")
+    old_obj = state.get("old_obj")
+    if bitmap:
+        if old_obj:
+            gdi32.SelectObject(mem_dc, old_obj)
+        gdi32.DeleteObject(bitmap)
+    if mem_dc:
+        gdi32.DeleteDC(mem_dc)
+    state["bitmap"] = None
+    state["old_obj"] = None
+    state["bits_ptr"] = None
+    state["mem_dc"] = None
+
+
+class _GdiSurface:
+    """Owns one backend's memory DC and its current DIBSection.
+
+    Freeing both when this object is dropped is what bounds the
+    backend's GDI handles to its own lifetime without putting a
+    ``__del__`` on the backend. GDI's per-process quota is 10,000
+    handles, but the DIBSection's pixels leak along with the handle — at
+    1080p that is ~8 MB apiece, so a program that builds a Screenshot per
+    frame runs out of memory long before it runs out of handles.
+
+    The finalizer is handed this instance's ``__dict__`` rather than the
+    handles themselves. ``weakref.finalize`` freezes its arguments at
+    registration time, and ``bitmap`` is replaced every time the capture
+    size changes, so passing the handle would free a stale one and leak
+    the live one. The attribute dict outlives the instance and always
+    reads back what is currently open. It must not be handed ``self`` —
+    a finalizer that references its own object can never run.
+
+    ``atexit`` is off: at interpreter shutdown Windows reclaims every
+    handle the process owns, and running GDI calls that late is exactly
+    the race the backend's old "no ``__del__``" note was avoiding.
+    """
+
+    def __init__(self, gdi32, mem_dc):
+        self.gdi32 = gdi32
+        self.mem_dc = mem_dc
+        self.bitmap = None      # HBITMAP
+        self.old_obj = None     # HGDIOBJ displaced by SelectObject
+        self.bits_ptr = None    # raw pointer into the DIBSection's pixels
+        self.w = 0
+        self.h = 0
+        self._finalize = weakref.finalize(self, _release_gdi, self.__dict__)
+        self._finalize.atexit = False
+
+    def close(self):
+        """Free now. Idempotent — a finalizer only ever fires once."""
+        self._finalize()
+
+
 class WindowsBackend(BaseBackend):
     def __init__(self):
         self._user32, self._gdi32 = _load_libs()
@@ -207,18 +278,17 @@ class WindowsBackend(BaseBackend):
             if not screen_dc:
                 raise RuntimeError("GetDC(NULL) returned 0; cannot access screen")
             try:
-                self._mem_dc = self._gdi32.CreateCompatibleDC(screen_dc)
+                mem_dc = self._gdi32.CreateCompatibleDC(screen_dc)
             finally:
                 self._user32.ReleaseDC(None, screen_dc)
-        if not self._mem_dc:
+        if not mem_dc:
             raise RuntimeError("CreateCompatibleDC failed")
 
-        # cached DIBSection state — reused when (w, h) match the prior call.
-        self._cur_w = 0
-        self._cur_h = 0
-        self._cur_bitmap = None     # HBITMAP
-        self._cur_old_obj = None    # HGDIOBJ returned by SelectObject
-        self._cur_bits_ptr = None   # raw pointer into the DIBSection's pixels
+        # The DC and the DIBSection cached against it are held by a
+        # separate owner so that dropping this backend frees them; see
+        # _GdiSurface. The bitmap is reused whenever (w, h) match the
+        # previous call.
+        self._surface = _GdiSurface(self._gdi32, mem_dc)
 
     # -------- BaseBackend API --------
 
@@ -244,6 +314,7 @@ class WindowsBackend(BaseBackend):
     def screenshot(self, x, y, img):
         # Before anything touches the screen: the copy at the end is a
         # raw memmove and cannot recover from a bad destination.
+        self._check_open()
         _validate_destination(img)
         h, w, _ = img.shape
         self._ensure_bitmap(w, h)
@@ -265,7 +336,7 @@ class WindowsBackend(BaseBackend):
                 raise RuntimeError("GetDC(NULL) returned 0; cannot access screen")
             try:
                 ok = self._gdi32.BitBlt(
-                    self._mem_dc, 0, 0, w, h,
+                    self._surface.mem_dc, 0, 0, w, h,
                     screen_dc, int(x), int(y),
                     _SRCCOPY | _CAPTUREBLT,
                 )
@@ -278,22 +349,23 @@ class WindowsBackend(BaseBackend):
             raise RuntimeError("BitBlt failed (GetLastError={})".format(err))
 
         nbytes = w * h * 4
-        ctypes.memmove(img.ctypes.data, self._cur_bits_ptr, nbytes)
+        ctypes.memmove(img.ctypes.data, self._surface.bits_ptr, nbytes)
 
     # -------- DIBSection cache --------
 
     def _ensure_bitmap(self, w, h):
-        if self._cur_bitmap is not None and (w, h) == (self._cur_w, self._cur_h):
+        surface = self._surface
+        if surface.bitmap is not None and (w, h) == (surface.w, surface.h):
             return
 
         # Tear down previous bitmap.
-        if self._cur_bitmap is not None:
-            if self._cur_old_obj is not None:
-                self._gdi32.SelectObject(self._mem_dc, self._cur_old_obj)
-            self._gdi32.DeleteObject(self._cur_bitmap)
-            self._cur_bitmap = None
-            self._cur_old_obj = None
-            self._cur_bits_ptr = None
+        if surface.bitmap is not None:
+            if surface.old_obj is not None:
+                self._gdi32.SelectObject(surface.mem_dc, surface.old_obj)
+            self._gdi32.DeleteObject(surface.bitmap)
+            surface.bitmap = None
+            surface.old_obj = None
+            surface.bits_ptr = None
 
         bmi = _BITMAPINFO()
         bmi.bmiHeader.biSize = ctypes.sizeof(_BITMAPINFOHEADER)
@@ -308,7 +380,7 @@ class WindowsBackend(BaseBackend):
 
         bits_ptr = ctypes.c_void_p()
         bitmap = self._gdi32.CreateDIBSection(
-            self._mem_dc,
+            surface.mem_dc,
             ctypes.byref(bmi),
             _DIB_RGB_COLORS,
             ctypes.byref(bits_ptr),
@@ -322,18 +394,27 @@ class WindowsBackend(BaseBackend):
                 )
             )
 
-        old_obj = self._gdi32.SelectObject(self._mem_dc, bitmap)
+        old_obj = self._gdi32.SelectObject(surface.mem_dc, bitmap)
         if not old_obj:
             self._gdi32.DeleteObject(bitmap)
             raise RuntimeError("SelectObject failed for new DIBSection")
 
-        self._cur_bitmap = bitmap
-        self._cur_old_obj = old_obj
-        self._cur_bits_ptr = bits_ptr.value
-        self._cur_w = w
-        self._cur_h = h
+        surface.bitmap = bitmap
+        surface.old_obj = old_obj
+        surface.bits_ptr = bits_ptr.value
+        surface.w = w
+        surface.h = h
 
-    # No __del__: matching the wlr backend, we let the OS reclaim the
-    # memory DC and bitmap handles at process exit. Explicit cleanup
-    # paths are race-prone under interpreter shutdown. The screen DC is
-    # no longer among them — it is released on every capture.
+    def close(self):
+        """Release the memory DC and the DIBSection selected into it.
+
+        Optional — dropping the backend frees the same handles through
+        :class:`_GdiSurface`'s finalizer. Call it to pick the moment.
+
+        Still no ``__del__`` on the backend: explicit cleanup driven from
+        interpreter shutdown is the race the old note here warned about,
+        and the finalizer deliberately does not run then. The screen DC
+        was never among these handles — it is released on every capture.
+        """
+        self._surface.close()
+        self._closed = True
