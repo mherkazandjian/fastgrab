@@ -63,12 +63,13 @@ method     | what it does                          | tune with
 ``pixelate-random`` | every tile a random colour   | ``block``, ``seed``
 ``pixelate-random-shuffle`` | the real tile colours, positions permuted | ``block``, ``seed``
 ``fill``   | a solid ``(B, G, R)`` box, black by default | ``color``
+``image``  | a picture stamped over the region, stretched to fit | ``image``
 
 How much each one destroys, strongest first:
 
-- ``fill`` and ``pixelate-random`` — the output does not depend on the
-  region's content at all, so nothing of it survives. ``fill`` says so
-  plainly; ``pixelate-random`` reads as a mosaic while being just as final.
+- ``fill``, ``pixelate-random`` and ``image`` — the output does not depend
+  on the region's content at all, so nothing of it survives. ``fill`` says
+  so plainly; the other two just look friendlier.
 - ``pixelate-random-shuffle`` — real tile colours, scrambled positions. The
   region still looks like it belongs, but its colour histogram survives, so
   it leaks roughly "how much of what" was there.
@@ -76,8 +77,19 @@ How much each one destroys, strongest first:
   be partially recovered by matching candidate renderings to the tile grid.
 - ``box`` / ``gaussian`` — weakest, and a low radius is recoverable.
 
-**Use ``fill`` or ``pixelate-random`` for passwords, tokens and anything
-else that must not leak.** The other three are cosmetic.
+**Use ``fill``, ``pixelate-random`` or ``image`` for passwords, tokens and
+anything else that must not leak.** The other three are cosmetic.
+
+``image`` takes a numpy array on the Python API, so the core still needs
+nothing but numpy:
+
+````python
+  grab.blur_style = BlurStyle(method='image', image=cover)   # (H, W, 3) BGR uint8
+````
+
+The CLI's ``--blur-image PATH`` decodes the file with Pillow, which is
+optional (``pip install fastgrab[gui]``) and imported only when you use
+that flag.
 
 The random modes are seeded (``seed``, ``--blur-seed``) and therefore
 identical on every frame. That is deliberate: re-rolling per frame would
@@ -144,9 +156,9 @@ Optional pointer overlays and subtitles:
 - ``--blur X,Y,W,H`` (repeatable) obscures a screen region in every frame;
   ``--blur-all`` does the whole frame. ``--blur-method`` selects ``box``
   (default), ``gaussian``, ``pixelate``, ``pixelate-random``,
-  ``pixelate-random-shuffle`` or ``fill``, tuned with
-  ``--blur-radius``, ``--blur-block``, ``--blur-seed`` and
-  ``--blur-color B,G,R``. Redaction
+  ``pixelate-random-shuffle``, ``fill`` or ``image``, tuned with
+  ``--blur-radius``, ``--blur-block``, ``--blur-seed``,
+  ``--blur-color B,G,R`` and ``--blur-image PATH``. Redaction
   happens on the captured frame, so nothing sensitive reaches ffmpeg —
   and, as above, only ``fill`` truly destroys the pixels:
 

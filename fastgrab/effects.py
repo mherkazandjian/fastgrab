@@ -22,10 +22,11 @@ Four modes, selected by :attr:`BlurStyle.method`:
 * ``pixelate-random`` — every tile a random colour.
 * ``pixelate-random-shuffle`` — the real tile colours, positions permuted.
 * ``fill``     — a solid ``(B, G, R)`` box, black by default.
+* ``image``    — a picture stamped over the region.
 
 How much each one actually destroys, strongest first:
 
-* ``fill`` and ``pixelate-random`` — the output does not depend on the
+* ``fill``, ``pixelate-random`` and ``image`` — the output does not depend on the
   region's content at all, so nothing of it survives. ``fill`` says so
   plainly; ``pixelate-random`` reads as a mosaic while being just as
   final.
@@ -38,8 +39,8 @@ How much each one actually destroys, strongest first:
   known tile grid.
 * ``box`` and ``gaussian`` — weakest; a low radius is recoverable.
 
-So for passwords, tokens and anything that must not leak, use ``fill``
-or ``pixelate-random``. The other three are cosmetic.
+So for passwords, tokens and anything that must not leak, use ``fill``,
+``pixelate-random`` or ``image``. The other three are cosmetic.
 
 The two random modes are seeded (:attr:`BlurStyle.seed`) and therefore
 identical on every frame. That is deliberate: re-rolling per frame would
@@ -51,14 +52,14 @@ screen-absolute coordinates into frame-local ones. Only channels 0..2 are
 touched — the alpha channel is left exactly as the backend wrote it.
 """
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy
 
 
 BLUR_METHODS = (
     "box", "gaussian", "pixelate", "pixelate-random",
-    "pixelate-random-shuffle", "fill",
+    "pixelate-random-shuffle", "fill", "image",
 )
 
 # The mosaic family — everything that reads BlurStyle.block.
@@ -83,7 +84,8 @@ class BlurStyle:
     ``method`` is one of :data:`BLUR_METHODS`. ``radius`` is the kernel
     radius in pixels for ``box``/``gaussian``, ``block`` the mosaic tile
     size for ``pixelate``, and ``color`` the ``(B, G, R)`` colour for
-    ``fill``. ``seed`` fixes the randomness of the ``pixelate-random``
+    ``fill``, and ``image`` is the picture for ``image``, stretched to
+    the region. ``seed`` fixes the randomness of the ``pixelate-random``
     modes. ``passes`` is how many box blurs approximate the gaussian;
     three is the usual choice. Their radii are scaled so the combined
     variance approximates a single box blur of ``radius`` — integer radii
@@ -103,6 +105,9 @@ class BlurStyle:
     passes: int = DEFAULT_PASSES
     color: tuple = DEFAULT_FILL_COLOR
     seed: int = DEFAULT_SEED
+    # Excluded from __eq__/__hash__: comparing ndarrays returns an array,
+    # so a generated __eq__ touching this would raise instead of answer.
+    image: object = field(default=None, compare=False)
 
     def __post_init__(self):
         for name in ("radius", "block", "passes", "seed"):
@@ -189,6 +194,77 @@ class BlurStyle:
             )
         # Frozen, so normalising the colour needs the back door.
         object.__setattr__(self, "color", color)
+
+        if self.method == "image" and self.image is None:
+            raise ValueError(
+                "blur method 'image' needs image= set to a (H, W, 3) or "
+                "(H, W, 4) uint8 array"
+            )
+        if self.image is not None:
+            object.__setattr__(self, "image", _as_cover_image(self.image))
+
+
+def _as_cover_image(image):
+    """Validate a cover image and take an immutable BGR snapshot of it.
+
+    Copied rather than referenced, and marked read-only: a caller who
+    mutated the array afterwards would silently change what every later
+    capture paints over the secret.
+    """
+    array = numpy.asarray(image)
+    if array.ndim != 3 or array.shape[2] not in (3, 4):
+        raise ValueError(
+            "blur image must be (H, W, 3) or (H, W, 4); got shape "
+            "{!r}".format(getattr(array, "shape", None))
+        )
+    if array.dtype != numpy.uint8:
+        raise ValueError(
+            "blur image must be uint8, like the frames it covers; got "
+            "{}".format(array.dtype)
+        )
+    if array.shape[0] < 1 or array.shape[1] < 1:
+        raise ValueError("blur image must have at least one pixel")
+    # numpy.ascontiguousarray returns the *same* object when the input is
+    # already contiguous, so it is not a snapshot — and marking that
+    # read-only would freeze the caller's own array. Force the copy.
+    snapshot = numpy.array(array[..., :3], dtype=numpy.uint8, order="C",
+                           copy=True)
+    snapshot.flags.writeable = False
+    return snapshot
+
+
+def _cover_index(scratch, src_h, src_w, dst_h, dst_w):
+    """Nearest-neighbour row/column indices scaling the cover to a region."""
+    key = ("cover", src_h, src_w, dst_h, dst_w)
+    if scratch is not None:
+        cached = scratch.get(key)
+        if cached is not None:
+            return cached
+    rows = (numpy.arange(dst_h) * src_h) // dst_h
+    cols = (numpy.arange(dst_w) * src_w) // dst_w
+    out = (numpy.minimum(rows, src_h - 1), numpy.minimum(cols, src_w - 1))
+    if scratch is not None:
+        scratch[key] = out
+    return out
+
+
+def _image_sub(sub, image, scratch):
+    """Stamp ``image`` over the region, stretched to fit, in place.
+
+    Nearest neighbour on purpose: the cover is there to hide what is
+    underneath, not to look smooth, and it keeps this pure numpy with no
+    interpolation pass over the frame.
+    """
+    h, w = sub.shape[:2]
+    src_h, src_w = image.shape[:2]
+    rows, cols = _cover_index(scratch, src_h, src_w, h, w)
+    stretched_rows = _scratch_get(
+        scratch, "cover_rows", (h, src_w, 3), numpy.uint8
+    )
+    numpy.take(image, rows, axis=0, out=stretched_rows, mode="clip")
+    cover = _scratch_get(scratch, "cover", (h, w, 3), numpy.uint8)
+    numpy.take(stretched_rows, cols, axis=1, out=cover, mode="clip")
+    numpy.copyto(sub[..., :3], cover)
 
 
 def _normalise_regions(regions):
@@ -665,6 +741,8 @@ def blur_regions(img, regions=None, style=None, origin=(0, 0),
         sub = img[y0:y1, x0:x1]
         if style.method == "fill":
             sub[..., 0:3] = style.color
+        elif style.method == "image":
+            _image_sub(sub, style.image, scratch)
         elif style.method in PIXELATE_METHODS:
             _pixelate_sub(sub, style, scratch)
         else:

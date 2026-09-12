@@ -16,11 +16,28 @@ from fastgrab.effects import (
 # BGRA channel indices, same convention as tests/test_integration.py.
 B, G, R, A = 0, 1, 2, 3
 
-# Modes whose output is derived from the pixels underneath. fill and
-# pixelate-random are excluded because their output does not depend on
-# the content at all — which is the point of them, and why "a flat field
+# Modes whose output is a function of the style alone, not of the pixels
+# underneath — which is the point of them, and why "a flat field
 # survives" and "variance drops" are the wrong assertions there.
-AVERAGING = [m for m in BLUR_METHODS if m not in ("fill", "pixelate-random")]
+CONTENT_INDEPENDENT = ("fill", "pixelate-random", "image")
+
+# The rest: modes derived from the pixels they cover.
+AVERAGING = [m for m in BLUR_METHODS if m not in CONTENT_INDEPENDENT]
+
+
+def _cover(h=4, w=4):
+    """A small, unmistakable BGR cover image."""
+    img = numpy.zeros((h, w, 3), numpy.uint8)
+    img[..., 2] = 255                      # red in BGR
+    img[0, 0] = (255, 0, 0)                # one blue corner, to catch flips
+    return img
+
+
+def _style(method, **kwargs):
+    """A valid BlurStyle for ``method``, supplying whatever it requires."""
+    if method == "image":
+        kwargs.setdefault("image", _cover())
+    return BlurStyle(method=method, **kwargs)
 
 
 def _noise(h, w, seed=0, alpha=None):
@@ -123,7 +140,7 @@ def test_a_constant_region_does_not_survive_pixelate_random():
 def test_alpha_channel_is_never_touched(method):
     img = _noise(24, 32, seed=12)
     before = img[..., A].copy()
-    blur_regions(img, [(4, 4, 16, 12)], BlurStyle(method=method))
+    blur_regions(img, [(4, 4, 16, 12)], _style(method))
     assert (img[..., A] == before).all()
 
 
@@ -191,7 +208,7 @@ def test_pixelate_handles_a_region_not_divisible_by_the_block():
 def test_pixels_outside_the_region_are_byte_identical(method):
     img = _noise(40, 40, seed=4)
     before = img.copy()
-    blur_regions(img, [(10, 10, 20, 20)], BlurStyle(method=method))
+    blur_regions(img, [(10, 10, 20, 20)], _style(method))
     assert (img[0:10] == before[0:10]).all()
     assert (img[30:] == before[30:]).all()
     assert (img[:, 0:10] == before[:, 0:10]).all()
@@ -745,3 +762,86 @@ def test_blur_style_rejects_a_negative_seed():
 def test_blur_style_rejects_a_non_whole_seed():
     with pytest.raises(ValueError, match="whole number"):
         BlurStyle(method="pixelate-random", seed=1.5)
+
+
+# --------------------------------------------------------------------
+# The image cover
+# --------------------------------------------------------------------
+
+def test_image_covers_the_region_and_ignores_the_content():
+    """Content-independent, like fill: two different regions come out same."""
+    style = BlurStyle(method="image", image=_cover())
+    a = _noise(24, 24, seed=100)
+    b = _noise(24, 24, seed=101)
+    blur_regions(a, None, style)
+    blur_regions(b, None, style)
+    assert numpy.array_equal(a[..., :3], b[..., :3])
+    assert (a[..., 2] > 0).any(), "the cover was not drawn"
+
+
+def test_image_is_stretched_to_the_region():
+    """A 2x2 cover over a 20x20 region: four equal quadrants."""
+    cover = numpy.zeros((2, 2, 3), numpy.uint8)
+    cover[0, 0] = (10, 20, 30)
+    cover[0, 1] = (40, 50, 60)
+    cover[1, 0] = (70, 80, 90)
+    cover[1, 1] = (100, 110, 120)
+    img = _noise(20, 20, seed=102)
+    blur_regions(img, None, BlurStyle(method="image", image=cover))
+    assert tuple(img[0, 0, :3]) == (10, 20, 30)
+    assert tuple(img[0, 19, :3]) == (40, 50, 60)
+    assert tuple(img[19, 0, :3]) == (70, 80, 90)
+    assert tuple(img[19, 19, :3]) == (100, 110, 120)
+
+
+def test_image_respects_the_region_and_alpha():
+    img = _noise(40, 40, seed=103)
+    before = img.copy()
+    blur_regions(img, [(10, 10, 20, 20)],
+                 BlurStyle(method="image", image=_cover()))
+    assert (img[0:10] == before[0:10]).all()
+    assert (img[30:] == before[30:]).all()
+    assert (img[..., A] == before[..., A]).all()
+
+
+def test_image_method_requires_an_image():
+    with pytest.raises(ValueError, match="needs image="):
+        BlurStyle(method="image")
+
+
+@pytest.mark.parametrize("bad,match", [
+    (numpy.zeros((4, 4), numpy.uint8), "H, W, 3"),
+    (numpy.zeros((4, 4, 2), numpy.uint8), "H, W, 3"),
+    (numpy.zeros((4, 4, 3), numpy.float32), "uint8"),
+    (numpy.zeros((0, 4, 3), numpy.uint8), "at least one pixel"),
+])
+def test_image_rejects_a_cover_it_cannot_use(bad, match):
+    with pytest.raises(ValueError, match=match):
+        BlurStyle(method="image", image=bad)
+
+
+def test_a_four_channel_cover_keeps_only_bgr():
+    cover = numpy.zeros((2, 2, 4), numpy.uint8)
+    cover[..., 0:3] = (1, 2, 3)
+    cover[..., 3] = 200
+    style = BlurStyle(method="image", image=cover)
+    assert style.image.shape == (2, 2, 3)
+
+
+def test_the_cover_is_snapshotted_not_referenced():
+    """Mutating the caller's array must not change later redactions."""
+    cover = _cover()
+    style = BlurStyle(method="image", image=cover)
+    cover[...] = 0                       # caller scribbles over their copy
+    img = _noise(12, 12, seed=104)
+    blur_regions(img, None, style)
+    assert (img[..., 2] > 0).any(), "the redaction followed the caller's array"
+    assert not style.image.flags.writeable
+
+
+def test_blur_style_equality_survives_an_image_field():
+    """ndarray __eq__ returns an array; comparing styles must not raise."""
+    a = BlurStyle(method="image", image=_cover())
+    b = BlurStyle(method="image", image=_cover())
+    assert a == b        # image is compare=False, so this is well defined
+    assert a != BlurStyle(method="fill")

@@ -82,6 +82,31 @@ def _positive_int(value: str):
     return iv
 
 
+def _load_cover_image(parser, path):
+    """Decode --blur-image into a BGR numpy array.
+
+    Pillow is lazy and optional, exactly as python-xlib is for the click
+    overlays: the core blur takes an array and needs no decoder at all,
+    so only this convenience pays for one.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        parser.error(
+            "--blur-image needs Pillow to decode {}: "
+            "pip install fastgrab[gui]".format(path)
+        )
+    import numpy
+
+    try:
+        with Image.open(path) as handle:
+            rgb = numpy.asarray(handle.convert("RGB"), dtype=numpy.uint8)
+    except OSError as exc:
+        parser.error("--blur-image could not read {}: {}".format(path, exc))
+    # PIL gives RGB; frames are BGR.
+    return numpy.ascontiguousarray(rgb[..., ::-1])
+
+
 def _nonnegative_int(value: str):
     try:
         iv = int(value)
@@ -237,6 +262,13 @@ def build_parser():
              "rather than per-frame on purpose: re-rolling every frame "
              "would let a recording be averaged back towards what is "
              "underneath.",
+    )
+    p.add_argument(
+        "--blur-image", default=None, metavar="PATH",
+        help="image to stamp over the region for --blur-method image. "
+             "Stretched to fit. Decoding needs Pillow "
+             "(pip install fastgrab[gui]); the Python API takes a numpy "
+             "array and needs nothing extra.",
     )
     p.add_argument(
         "--blur-color", type=_parse_bgr, default=None, metavar="B,G,R",
@@ -418,7 +450,7 @@ def main(argv=None):
     blur_tuned = (
         args.blur_method != "box" or args.blur_radius is not None
         or args.blur_block is not None or args.blur_color is not None
-        or args.blur_seed is not None
+        or args.blur_seed is not None or args.blur_image is not None
     )
     if blur_tuned and not blur:
         # Silently ignoring a --blur-method the user typed would hide a
@@ -437,6 +469,7 @@ def main(argv=None):
             "--blur-block": PIXELATE_METHODS,
             "--blur-color": ("fill",),
             "--blur-seed": ("pixelate-random", "pixelate-random-shuffle"),
+            "--blur-image": ("image",),
         }
         given = [
             name for name, value in (
@@ -444,6 +477,7 @@ def main(argv=None):
                 ("--blur-block", args.blur_block),
                 ("--blur-color", args.blur_color),
                 ("--blur-seed", args.blur_seed),
+                ("--blur-image", args.blur_image),
             ) if value is not None
         ]
         ignored = [
@@ -464,6 +498,9 @@ def main(argv=None):
                 )
             )
     if blur_tuned:
+        cover = None
+        if args.blur_image is not None:
+            cover = _load_cover_image(parser, args.blur_image)
         try:
             blur_style = BlurStyle(
                 method=args.blur_method,
@@ -474,6 +511,7 @@ def main(argv=None):
                 seed=(args.blur_seed if args.blur_seed is not None
                       else BlurStyle().seed),
                 color=args.blur_color or BlurStyle().color,
+                image=cover,
             )
         except ValueError as exc:
             # BlurStyle rejects identity settings such as

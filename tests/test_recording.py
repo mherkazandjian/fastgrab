@@ -1114,3 +1114,55 @@ def test_cli_rejects_a_negative_blur_seed():
         parser.parse_args(["--fullscreen", "-o", "x.mp4",
                            "--blur-method", "pixelate-random",
                            "--blur-seed", "-1"])
+
+
+def _pillow_available():
+    try:
+        import PIL  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def test_cli_blur_image_needs_the_image_method(capsys):
+    with pytest.raises(SystemExit):
+        recording_cli.main(["--fullscreen", "-o", "x.mp4", "--blur-all",
+                            "--blur-method", "fill",
+                            "--blur-image", "/tmp/nope.png"])
+    err = capsys.readouterr().err
+    assert "--blur-image" in err and "silently ignored" in err
+
+
+@pytest.mark.skipif(_pillow_available(), reason="Pillow is installed")
+def test_cli_blur_image_without_pillow_says_how_to_get_it(capsys):
+    """The decoder is optional; the error has to name the extra."""
+    with pytest.raises(SystemExit):
+        recording_cli.main(["--fullscreen", "-o", "x.mp4", "--blur-all",
+                            "--blur-method", "image",
+                            "--blur-image", "/tmp/nope.png"])
+    assert "fastgrab[gui]" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(not _pillow_available(), reason="needs Pillow")
+def test_cli_blur_image_loads_and_converts_to_bgr(monkeypatch, tmp_path):
+    from PIL import Image
+
+    path = tmp_path / "cover.png"
+    Image.new("RGB", (4, 3), (255, 0, 0)).save(path)   # pure red, RGB
+    style = _run_cli(monkeypatch, [
+        "--fullscreen", "-o", "x.mp4", "--blur", "0,0,80,40",
+        "--blur-method", "image", "--blur-image", str(path),
+    ])["blur_style"]
+    assert style.image.shape == (3, 4, 3)
+    # red arrives in the blue-last order the frames use
+    assert tuple(style.image[0, 0]) == (0, 0, 255)
+
+
+@pytest.mark.skipif(not _pillow_available(), reason="needs Pillow")
+def test_cli_blur_image_reports_an_unreadable_file(capsys, tmp_path):
+    bad = tmp_path / "not-an-image.png"
+    bad.write_text("definitely not a png")
+    with pytest.raises(SystemExit):
+        recording_cli.main(["--fullscreen", "-o", "x.mp4", "--blur-all",
+                            "--blur-method", "image", "--blur-image", str(bad)])
+    assert "could not read" in capsys.readouterr().err
