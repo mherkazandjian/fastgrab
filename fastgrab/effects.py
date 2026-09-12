@@ -22,7 +22,8 @@ Four modes, selected by :attr:`BlurStyle.method`:
 * ``pixelate-random`` — every tile a random colour.
 * ``pixelate-random-shuffle`` — the real tile colours, positions permuted.
 * ``fill``     — a solid ``(B, G, R)`` box, black by default.
-* ``image``    — a picture stamped over the region.
+* ``image``    — a picture stamped over the region, mapped by
+  :data:`IMAGE_FITS` (``crop``, ``fit``, ``stretch``, ``tile``).
 
 How much each one actually destroys, strongest first:
 
@@ -65,11 +66,15 @@ BLUR_METHODS = (
 # The mosaic family — everything that reads BlurStyle.block.
 PIXELATE_METHODS = ("pixelate", "pixelate-random", "pixelate-random-shuffle")
 
+# How an image cover is mapped onto a region it does not match in shape.
+IMAGE_FITS = ("crop", "fit", "stretch", "tile")
+
 DEFAULT_RADIUS = 12
 DEFAULT_BLOCK = 16
 DEFAULT_PASSES = 3
 DEFAULT_FILL_COLOR = (0, 0, 0)  # B, G, R — a black box
 DEFAULT_SEED = 0
+DEFAULT_IMAGE_FIT = "crop"
 
 # Upper bound on how many shapes a caller-supplied scratch dict keeps
 # before it is dropped, so a caller that blurs a different-sized region
@@ -84,8 +89,13 @@ class BlurStyle:
     ``method`` is one of :data:`BLUR_METHODS`. ``radius`` is the kernel
     radius in pixels for ``box``/``gaussian``, ``block`` the mosaic tile
     size for ``pixelate``, and ``color`` the ``(B, G, R)`` colour for
-    ``fill``, and ``image`` is the picture for ``image``, stretched to
-    the region. ``seed`` fixes the randomness of the ``pixelate-random``
+    ``fill``, and ``image`` is the picture for ``image``, mapped onto the
+    region according to ``image_fit``: ``crop`` (default) scales it to
+    cover the region and trims the overflow, ``fit`` scales it to sit
+    entirely inside and pads the remainder with ``color``, ``stretch``
+    distorts it to the exact shape, and ``tile`` repeats it at its own
+    size. Only ``stretch`` changes the picture's proportions.
+    ``seed`` fixes the randomness of the ``pixelate-random``
     modes. ``passes`` is how many box blurs approximate the gaussian;
     three is the usual choice. Their radii are scaled so the combined
     variance approximates a single box blur of ``radius`` — integer radii
@@ -108,6 +118,7 @@ class BlurStyle:
     # Excluded from __eq__/__hash__: comparing ndarrays returns an array,
     # so a generated __eq__ touching this would raise instead of answer.
     image: object = field(default=None, compare=False)
+    image_fit: str = DEFAULT_IMAGE_FIT
 
     def __post_init__(self):
         for name in ("radius", "block", "passes", "seed"):
@@ -195,6 +206,12 @@ class BlurStyle:
         # Frozen, so normalising the colour needs the back door.
         object.__setattr__(self, "color", color)
 
+        if self.image_fit not in IMAGE_FITS:
+            raise ValueError(
+                "unknown image fit {!r}; expected one of {}".format(
+                    self.image_fit, ", ".join(IMAGE_FITS)
+                )
+            )
         if self.method == "image" and self.image is None:
             raise ValueError(
                 "blur method 'image' needs image= set to a (H, W, 3) or "
@@ -233,38 +250,86 @@ def _as_cover_image(image):
     return snapshot
 
 
-def _cover_index(scratch, src_h, src_w, dst_h, dst_w):
-    """Nearest-neighbour row/column indices scaling the cover to a region."""
-    key = ("cover", src_h, src_w, dst_h, dst_w)
+def _axis_samples(count, start, span, limit):
+    """Nearest-neighbour source indices for ``count`` output positions.
+
+    Sampled at pixel centres over ``[start, start + span)`` of the source
+    axis, then clamped — off-by-one at the last row is the classic way a
+    resize picks up a stripe of whatever follows the image in memory.
+    """
+    taps = start + (numpy.arange(count) + 0.5) * (span / float(count))
+    return numpy.clip(taps.astype(numpy.int64), 0, limit - 1)
+
+
+def _cover_index(scratch, src_h, src_w, dst_h, dst_w, fit):
+    """Row/column source indices and the offset to draw them at.
+
+    Returns ``(rows, cols, y_off, x_off)``. ``len(rows)`` and
+    ``len(cols)`` are the drawn size, which equals the region for every
+    fit except ``fit``, where the image is inset and the caller pads
+    around it.
+    """
+    key = ("cover", src_h, src_w, dst_h, dst_w, fit)
     if scratch is not None:
         cached = scratch.get(key)
         if cached is not None:
             return cached
-    rows = (numpy.arange(dst_h) * src_h) // dst_h
-    cols = (numpy.arange(dst_w) * src_w) // dst_w
-    out = (numpy.minimum(rows, src_h - 1), numpy.minimum(cols, src_w - 1))
+
+    if fit == "stretch":
+        out = (_axis_samples(dst_h, 0.0, src_h, src_h),
+               _axis_samples(dst_w, 0.0, src_w, src_w), 0, 0)
+    elif fit == "tile":
+        out = (numpy.arange(dst_h) % src_h, numpy.arange(dst_w) % src_w, 0, 0)
+    elif fit == "crop":
+        # Cover: the larger scale wins, so the region is filled and the
+        # overflowing axis is trimmed evenly from both sides.
+        scale = max(dst_h / float(src_h), dst_w / float(src_w))
+        win_h = min(float(src_h), dst_h / scale)
+        win_w = min(float(src_w), dst_w / scale)
+        out = (_axis_samples(dst_h, (src_h - win_h) / 2.0, win_h, src_h),
+               _axis_samples(dst_w, (src_w - win_w) / 2.0, win_w, src_w),
+               0, 0)
+    else:  # "fit" — contain: the smaller scale wins, nothing is cut off
+        scale = min(dst_h / float(src_h), dst_w / float(src_w))
+        drawn_h = max(1, min(dst_h, int(round(src_h * scale))))
+        drawn_w = max(1, min(dst_w, int(round(src_w * scale))))
+        out = (_axis_samples(drawn_h, 0.0, src_h, src_h),
+               _axis_samples(drawn_w, 0.0, src_w, src_w),
+               (dst_h - drawn_h) // 2, (dst_w - drawn_w) // 2)
+
     if scratch is not None:
         scratch[key] = out
     return out
 
 
-def _image_sub(sub, image, scratch):
-    """Stamp ``image`` over the region, stretched to fit, in place.
+def _image_sub(sub, style, scratch):
+    """Stamp ``style.image`` over the region in place.
 
     Nearest neighbour on purpose: the cover is there to hide what is
     underneath, not to look smooth, and it keeps this pure numpy with no
     interpolation pass over the frame.
     """
     h, w = sub.shape[:2]
+    image = style.image
     src_h, src_w = image.shape[:2]
-    rows, cols = _cover_index(scratch, src_h, src_w, h, w)
-    stretched_rows = _scratch_get(
-        scratch, "cover_rows", (h, src_w, 3), numpy.uint8
+    rows, cols, y_off, x_off = _cover_index(
+        scratch, src_h, src_w, h, w, style.image_fit
     )
-    numpy.take(image, rows, axis=0, out=stretched_rows, mode="clip")
-    cover = _scratch_get(scratch, "cover", (h, w, 3), numpy.uint8)
-    numpy.take(stretched_rows, cols, axis=1, out=cover, mode="clip")
-    numpy.copyto(sub[..., :3], cover)
+    drawn_h, drawn_w = len(rows), len(cols)
+
+    if drawn_h != h or drawn_w != w:
+        # "fit" leaves margins; paint them before the picture goes down so
+        # no part of the region is left showing what it was meant to hide.
+        sub[..., 0:3] = style.color
+
+    rows_buf = _scratch_get(
+        scratch, "cover_rows", (drawn_h, src_w, 3), numpy.uint8
+    )
+    numpy.take(image, rows, axis=0, out=rows_buf, mode="clip")
+    cover = _scratch_get(scratch, "cover", (drawn_h, drawn_w, 3), numpy.uint8)
+    numpy.take(rows_buf, cols, axis=1, out=cover, mode="clip")
+    target = sub[y_off:y_off + drawn_h, x_off:x_off + drawn_w]
+    numpy.copyto(target[..., :3], cover)
 
 
 def _normalise_regions(regions):
@@ -742,7 +807,7 @@ def blur_regions(img, regions=None, style=None, origin=(0, 0),
         if style.method == "fill":
             sub[..., 0:3] = style.color
         elif style.method == "image":
-            _image_sub(sub, style.image, scratch)
+            _image_sub(sub, style, scratch)
         elif style.method in PIXELATE_METHODS:
             _pixelate_sub(sub, style, scratch)
         else:

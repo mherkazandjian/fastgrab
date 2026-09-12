@@ -63,7 +63,7 @@ method     | what it does                          | tune with
 ``pixelate-random`` | every tile a random colour   | ``block``, ``seed``
 ``pixelate-random-shuffle`` | the real tile colours, positions permuted | ``block``, ``seed``
 ``fill``   | a solid ``(B, G, R)`` box, black by default | ``color``
-``image``  | a picture stamped over the region, stretched to fit | ``image``
+``image``  | a picture stamped over the region | ``image``, ``image_fit``
 
 How much each one destroys, strongest first:
 
@@ -86,6 +86,18 @@ nothing but numpy:
 ````python
   grab.blur_style = BlurStyle(method='image', image=cover)   # (H, W, 3) BGR uint8
 ````
+
+``image_fit`` (``--blur-image-fit``) decides how a picture is mapped onto a
+region of a different shape:
+
+fit | what it does
+--- | ---
+``crop`` | default; scales to cover the region and trims the overflow evenly
+``fit`` | scales so the whole picture is visible, padding the rest with ``color``
+``stretch`` | distorts it to the exact region shape
+``tile`` | repeats it at its own size
+
+Only ``stretch`` changes the picture's proportions.
 
 The CLI's ``--blur-image PATH`` decodes the file with Pillow, which is
 optional (``pip install fastgrab[gui]``) and imported only when you use
@@ -158,7 +170,8 @@ Optional pointer overlays and subtitles:
   (default), ``gaussian``, ``pixelate``, ``pixelate-random``,
   ``pixelate-random-shuffle``, ``fill`` or ``image``, tuned with
   ``--blur-radius``, ``--blur-block``, ``--blur-seed``,
-  ``--blur-color B,G,R`` and ``--blur-image PATH``. Redaction
+  ``--blur-color B,G,R``, ``--blur-image PATH`` and
+  ``--blur-image-fit {crop,fit,stretch,tile}``. Redaction
   happens on the captured frame, so nothing sensitive reaches ffmpeg —
   and, as above, only ``fill`` truly destroys the pixels:
 

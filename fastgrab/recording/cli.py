@@ -9,7 +9,9 @@ import threading
 from fastgrab.effects import (
     BLUR_METHODS,
     DEFAULT_BLOCK,
+    DEFAULT_IMAGE_FIT,
     DEFAULT_RADIUS,
+    IMAGE_FITS,
     PIXELATE_METHODS,
     BlurStyle,
 )
@@ -271,6 +273,15 @@ def build_parser():
              "array and needs nothing extra.",
     )
     p.add_argument(
+        "--blur-image-fit", default=None, choices=list(IMAGE_FITS),
+        help="how the cover image is mapped onto the region (default: {}). "
+             "crop scales it to cover and trims the overflow, fit scales it "
+             "to sit inside and pads with --blur-color, stretch distorts it "
+             "to the exact shape, tile repeats it at its own size. Only "
+             "stretch changes the picture's proportions.".format(
+                 DEFAULT_IMAGE_FIT),
+    )
+    p.add_argument(
         "--blur-color", type=_parse_bgr, default=None, metavar="B,G,R",
         help="colour for --blur-method fill, e.g. 255,255,255 "
              "(default: 0,0,0, a black box)",
@@ -451,6 +462,7 @@ def main(argv=None):
         args.blur_method != "box" or args.blur_radius is not None
         or args.blur_block is not None or args.blur_color is not None
         or args.blur_seed is not None or args.blur_image is not None
+        or args.blur_image_fit is not None
     )
     if blur_tuned and not blur:
         # Silently ignoring a --blur-method the user typed would hide a
@@ -467,9 +479,12 @@ def main(argv=None):
         applies_to = {
             "--blur-radius": ("box", "gaussian"),
             "--blur-block": PIXELATE_METHODS,
-            "--blur-color": ("fill",),
+            # padding colour for --blur-image-fit fit, as well as the
+            # block colour for fill
+            "--blur-color": ("fill", "image"),
             "--blur-seed": ("pixelate-random", "pixelate-random-shuffle"),
             "--blur-image": ("image",),
+            "--blur-image-fit": ("image",),
         }
         given = [
             name for name, value in (
@@ -478,6 +493,7 @@ def main(argv=None):
                 ("--blur-color", args.blur_color),
                 ("--blur-seed", args.blur_seed),
                 ("--blur-image", args.blur_image),
+                ("--blur-image-fit", args.blur_image_fit),
             ) if value is not None
         ]
         ignored = [
@@ -512,6 +528,8 @@ def main(argv=None):
                       else BlurStyle().seed),
                 color=args.blur_color or BlurStyle().color,
                 image=cover,
+                image_fit=(args.blur_image_fit if args.blur_image_fit
+                           is not None else BlurStyle().image_fit),
             )
         except ValueError as exc:
             # BlurStyle rejects identity settings such as

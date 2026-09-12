@@ -125,8 +125,10 @@ blur_regions(img, [(0, 0, 320, 80)], BlurStyle(method='fill', color=(0, 0, 0)))
 - `BlurStyle.method`: `box` (default, `radius`), `gaussian` (`radius`,
   `passes`), `pixelate` (`block`), `pixelate-random` (`block`, `seed`),
   `pixelate-random-shuffle` (`block`, `seed`), `fill` (`color`, a **BGR**
-  tuple), `image` (`image`, an (H, W, 3) BGR uint8 array, stretched to the
-  region).
+  tuple), `image` (`image`, an (H, W, 3) BGR uint8 array; `image_fit` is
+  `crop` (default, covers and trims), `fit` (contains and pads with
+  `color`), `stretch` (distorts) or `tile` (repeats) — only `stretch`
+  changes the picture's proportions).
 - **`fill`, `pixelate-random` and `image` destroy the pixels; nothing else
   does.**
   Both are content-independent — the output is a function of the style
@@ -267,7 +269,7 @@ Flag reference:
 | `--show-cursor` | stamp an emulated arrow at the pointer (`[gui]` extra) |
 | `--blur X,Y,W,H` / `--blur-all` | repeatable / whole frame; mutually exclusive; regions are screen coords |
 | `--blur-method` | `box` (default) / `gaussian` / `pixelate` / `pixelate-random` / `pixelate-random-shuffle` / `fill` / `image`; only `fill`, `pixelate-random` and `image` truly destroy pixels |
-| `--blur-radius N` / `--blur-block N` / `--blur-seed N` / `--blur-color B,G,R` / `--blur-image PATH` (needs Pillow, `[gui]`) | tuning; a flag that the chosen method would ignore is an error, as is any of them without `--blur`/`--blur-all` |
+| `--blur-radius N` / `--blur-block N` / `--blur-seed N` / `--blur-color B,G,R` / `--blur-image PATH` (needs Pillow, `[gui]`) / `--blur-image-fit {crop,fit,stretch,tile}` | tuning; a flag that the chosen method would ignore is an error, as is any of them without `--blur`/`--blur-all` |
 | `--subtitle START-END:TEXT` | repeatable; seconds, e.g. `1.5-4.0:Hello` |
 | `--subtitle-font PATH` | default `$FASTGRAB_FONT`, else bundled DejaVu search paths |
 | `--subtitle-fontsize N` / `--subtitle-color` / `--subtitle-box-color` / `--subtitle-position top\|bottom` | ffmpeg colour strings: `white`, `0xRRGGBB`, `red@0.8` |

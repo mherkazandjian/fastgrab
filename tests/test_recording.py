@@ -1166,3 +1166,36 @@ def test_cli_blur_image_reports_an_unreadable_file(capsys, tmp_path):
         recording_cli.main(["--fullscreen", "-o", "x.mp4", "--blur-all",
                             "--blur-method", "image", "--blur-image", str(bad)])
     assert "could not read" in capsys.readouterr().err
+
+
+def test_cli_blur_image_fit_defaults_and_choices(monkeypatch, tmp_path):
+    parser = recording_cli.build_parser()
+    args = parser.parse_args(["--fullscreen", "-o", "x.mp4"])
+    assert args.blur_image_fit is None          # unset means BlurStyle default
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--fullscreen", "-o", "x.mp4",
+                           "--blur-image-fit", "squish"])
+
+
+def test_cli_blur_image_fit_needs_the_image_method(capsys):
+    with pytest.raises(SystemExit):
+        recording_cli.main(["--fullscreen", "-o", "x.mp4", "--blur-all",
+                            "--blur-method", "fill",
+                            "--blur-image-fit", "crop"])
+    err = capsys.readouterr().err
+    assert "--blur-image-fit" in err and "silently ignored" in err
+
+
+@pytest.mark.skipif(not _pillow_available(), reason="needs Pillow")
+def test_cli_blur_image_fit_reaches_the_style(monkeypatch, tmp_path):
+    from PIL import Image
+
+    path = tmp_path / "cover.png"
+    Image.new("RGB", (8, 8), (0, 128, 255)).save(path)
+    for fit in ("crop", "fit", "stretch", "tile"):
+        style = _run_cli(monkeypatch, [
+            "--fullscreen", "-o", "x.mp4", "--blur", "0,0,80,40",
+            "--blur-method", "image", "--blur-image", str(path),
+            "--blur-image-fit", fit,
+        ])["blur_style"]
+        assert style.image_fit == fit

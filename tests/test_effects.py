@@ -8,6 +8,7 @@ import pytest
 
 from fastgrab.effects import (
     BLUR_METHODS,
+    IMAGE_FITS,
     BlurStyle,
     blur_regions,
 )
@@ -845,3 +846,111 @@ def test_blur_style_equality_survives_an_image_field():
     b = BlurStyle(method="image", image=_cover())
     assert a == b        # image is compare=False, so this is well defined
     assert a != BlurStyle(method="fill")
+
+
+# --------------------------------------------------------------------
+# How a cover image is mapped onto a region it does not match
+# --------------------------------------------------------------------
+
+def _gradient_cover(h, w):
+    """A cover whose row and column are recoverable from any pixel.
+
+    Blue encodes the source column, red the source row, so a covered
+    frame says exactly which source pixel landed where — which is what
+    makes the aspect-ratio assertions below possible.
+    """
+    img = numpy.zeros((h, w, 3), numpy.uint8)
+    img[..., 0] = numpy.arange(w, dtype=numpy.uint8)[None, :]
+    img[..., 2] = numpy.arange(h, dtype=numpy.uint8)[:, None]
+    return img
+
+
+def test_the_default_fit_does_not_distort():
+    """The regression: a square cover in a wide region used to be squashed."""
+    assert BlurStyle(method="image", image=_gradient_cover(8, 8)).image_fit \
+        == "crop"
+
+
+def test_crop_preserves_aspect_and_fills_the_region():
+    """Cover: every pixel of the region is painted, nothing is stretched."""
+    cover = _gradient_cover(64, 64)                # square
+    img = numpy.zeros((20, 200, 4), numpy.uint8)   # very wide region
+    blur_regions(img, None,
+                 BlurStyle(method="image", image=cover, image_fit="crop"))
+    # Full coverage: no pixel left at the original zero-with-alpha state.
+    assert (img[..., 0:3] != 0).any(axis=2).all()
+    # A square source in a 10:1 region keeps its scale, so the source
+    # columns sampled span the full width while the rows are a thin band.
+    col_span = int(img[..., 0].max()) - int(img[..., 0].min())
+    row_span = int(img[..., 2].max()) - int(img[..., 2].min())
+    assert col_span > 55, col_span          # whole width used
+    assert row_span < 12, row_span          # only a slice of the height
+
+
+def test_fit_preserves_aspect_and_pads_the_rest():
+    """Contain: the whole picture is visible, margins take --blur-color."""
+    cover = _gradient_cover(64, 64)
+    img = numpy.zeros((20, 200, 4), numpy.uint8)
+    blur_regions(img, None, BlurStyle(method="image", image=cover,
+                                      image_fit="fit", color=(7, 8, 9)))
+    # The padding colour appears at the far left and right.
+    assert tuple(img[10, 0, :3]) == (7, 8, 9)
+    assert tuple(img[10, 199, :3]) == (7, 8, 9)
+    # The whole source is present in the inset, both axes.
+    assert int(img[..., 2].max()) > 55, "rows were cropped"
+    assert int(img[..., 0].max()) > 55, "columns were cropped"
+
+
+def test_stretch_distorts_to_the_exact_shape():
+    """The old behaviour, still available and still the only distorting one."""
+    cover = _gradient_cover(64, 64)
+    img = numpy.zeros((20, 200, 4), numpy.uint8)
+    blur_regions(img, None,
+                 BlurStyle(method="image", image=cover, image_fit="stretch"))
+    # Both source axes are spanned across the whole region — that is the
+    # distortion: 64 rows squeezed into 20, 64 columns spread over 200.
+    assert int(img[..., 2].max()) > 55
+    assert int(img[..., 0].max()) > 55
+    assert (img[..., 0:3] != 0).any(axis=2).all()
+
+
+def test_tile_repeats_at_the_source_scale():
+    cover = _gradient_cover(8, 8)
+    img = numpy.zeros((8, 40, 4), numpy.uint8)
+    blur_regions(img, None,
+                 BlurStyle(method="image", image=cover, image_fit="tile"))
+    # Column 0 of the source reappears every 8 pixels, unscaled.
+    for x in (0, 8, 16, 24, 32):
+        assert img[0, x, 0] == 0, x
+    assert img[0, 7, 0] == 7
+
+
+@pytest.mark.parametrize("fit", list(IMAGE_FITS))
+def test_every_fit_covers_the_whole_region(fit):
+    """Whatever the mapping, nothing underneath may show through."""
+    img = _noise(30, 90, seed=110)
+    before = img.copy()
+    blur_regions(img, [(5, 5, 60, 20)],
+                 BlurStyle(method="image", image=_gradient_cover(16, 40),
+                           image_fit=fit, color=(1, 1, 1)))
+    covered = img[5:25, 5:65, :3]
+    original = before[5:25, 5:65, :3]
+    assert not numpy.array_equal(covered, original)
+    # and only that rectangle moved
+    assert (img[0:5] == before[0:5]).all()
+    assert (img[25:] == before[25:]).all()
+    assert (img[..., A] == before[..., A]).all()
+
+
+@pytest.mark.parametrize("fit", list(IMAGE_FITS))
+def test_a_cover_larger_than_the_region_is_handled(fit):
+    img = _noise(12, 12, seed=111)
+    blur_regions(img, None, BlurStyle(method="image",
+                                      image=_gradient_cover(200, 200),
+                                      image_fit=fit))
+
+
+def test_an_unknown_fit_is_rejected():
+    with pytest.raises(ValueError, match="unknown image fit"):
+        BlurStyle(method="image", image=_gradient_cover(4, 4),
+                  image_fit="squish")
