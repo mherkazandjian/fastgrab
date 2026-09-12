@@ -137,6 +137,7 @@ class Recorder:
                         "elapsed_seconds": 0.0,
                         "achieved_fps": 0.0,
                         "output": self.output_path,
+                        "encoder_started": False,
                     }
                 if on_countdown is not None:
                     on_countdown(remaining)
@@ -210,4 +211,11 @@ class Recorder:
             "elapsed_seconds": elapsed,
             "achieved_fps": (n_captured / elapsed) if elapsed > 0 else 0.0,
             "output": self.output_path,
+            # Whether ffmpeg ran at all. This is the *only* honest way to
+            # know whether an output file can exist: a zero-frame mp4 or
+            # webm is written and closed cleanly by ffmpeg -- 261 and 465
+            # bytes of empty container respectively -- so a frame count
+            # of nought does not mean nothing was produced. Only the
+            # countdown's early return above guarantees that.
+            "encoder_started": True,
         }
