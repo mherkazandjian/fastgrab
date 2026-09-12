@@ -123,10 +123,18 @@ blur_regions(img, [(0, 0, 320, 80)], BlurStyle(method='fill', color=(0, 0, 0)))
 ```
 
 - `BlurStyle.method`: `box` (default, `radius`), `gaussian` (`radius`,
-  `passes`), `pixelate` (`block`), `fill` (`color`, a **BGR** tuple).
-- **Only `fill` actually destroys the pixels.** Say this whenever someone
-  wants to hide a password, token or customer name — a blur or a mosaic
-  can be partially reversed.
+  `passes`), `pixelate` (`block`), `pixelate-random` (`block`, `seed`),
+  `pixelate-random-shuffle` (`block`, `seed`), `fill` (`color`, a **BGR**
+  tuple).
+- **`fill` and `pixelate-random` destroy the pixels; nothing else does.**
+  Both are content-independent — the output is a function of the style
+  alone. `pixelate-random-shuffle` keeps the real tile colours and only
+  scrambles their positions, so the colour histogram leaks; `pixelate`,
+  `box` and `gaussian` are cosmetic and partially reversible. Say this
+  whenever someone wants to hide a password, token or customer name.
+- The random modes are seeded and identical on every frame, on purpose:
+  re-rolling per frame lets a recording be averaged back towards what is
+  underneath.
 - `blur=True` covers the whole frame; `blur=False` on `capture()` turns
   off a blur set on the constructor for that call. Regions are clipped to
   the frame, pixels outside them stay byte-identical, alpha is untouched.
@@ -256,8 +264,8 @@ Flag reference:
 | `--click-lifetime S` | animation length, default 0.5 |
 | `--show-cursor` | stamp an emulated arrow at the pointer (`[gui]` extra) |
 | `--blur X,Y,W,H` / `--blur-all` | repeatable / whole frame; mutually exclusive; regions are screen coords |
-| `--blur-method` | `box` (default) / `gaussian` / `pixelate` / `fill`; only `fill` truly destroys pixels |
-| `--blur-radius N` / `--blur-block N` / `--blur-color B,G,R` | tuning; a tuning flag without `--blur`/`--blur-all` is an error |
+| `--blur-method` | `box` (default) / `gaussian` / `pixelate` / `pixelate-random` / `pixelate-random-shuffle` / `fill`; only `fill` and `pixelate-random` truly destroy pixels |
+| `--blur-radius N` / `--blur-block N` / `--blur-seed N` / `--blur-color B,G,R` | tuning; a flag that the chosen method would ignore is an error, as is any of them without `--blur`/`--blur-all` |
 | `--subtitle START-END:TEXT` | repeatable; seconds, e.g. `1.5-4.0:Hello` |
 | `--subtitle-font PATH` | default `$FASTGRAB_FONT`, else bundled DejaVu search paths |
 | `--subtitle-fontsize N` / `--subtitle-color` / `--subtitle-box-color` / `--subtitle-position top\|bottom` | ffmpeg colour strings: `white`, `0xRRGGBB`, `red@0.8` |

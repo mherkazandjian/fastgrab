@@ -60,6 +60,9 @@ fastgrab/
   metadata.py
   screenshot.py             Screenshot: buffer owner, bbox validation, dispatch to backend
   effects.py                pure-numpy blur/redaction of BGRA frames (core, no extra)
+                            box/gaussian/pixelate/pixelate-random/
+                            pixelate-random-shuffle/fill; only the last
+                            two of those destroy content
   backends/
     __init__.py             _resolve_backend(name) / _autodetect()
     base.py                 BaseBackend ABC: resolution(), bytes_per_pixel(), screenshot(x, y, img)

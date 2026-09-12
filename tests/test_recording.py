@@ -1076,3 +1076,41 @@ def test_a_subtitle_renders_its_apostrophe(tmp_path):
     # The apostrophe has to actually be drawn — dropping it silently was
     # the original symptom, and that renders the same as "dont stop".
     assert not numpy.array_equal(got, bare), "the apostrophe was dropped"
+
+
+def test_cli_accepts_the_randomised_pixelate_methods(monkeypatch):
+    for method in ("pixelate-random", "pixelate-random-shuffle"):
+        style = _run_cli(monkeypatch, [
+            "--fullscreen", "-o", "x.mp4", "--blur", "0,0,80,40",
+            "--blur-method", method, "--blur-block", "12", "--blur-seed", "7",
+        ])["blur_style"]
+        assert style.method == method
+        assert style.block == 12
+        assert style.seed == 7
+
+
+def test_cli_blur_seed_needs_a_random_method(capsys):
+    """--blur-seed does nothing for plain pixelate, so it must not be taken."""
+    with pytest.raises(SystemExit):
+        recording_cli.main(["--fullscreen", "-o", "x.mp4", "--blur-all",
+                            "--blur-method", "pixelate", "--blur-seed", "3"])
+    err = capsys.readouterr().err
+    assert "--blur-seed" in err and "silently ignored" in err
+
+
+def test_cli_blur_block_applies_to_every_pixelate_method(monkeypatch):
+    """--blur-block used to be accepted only for plain pixelate."""
+    for method in ("pixelate", "pixelate-random", "pixelate-random-shuffle"):
+        style = _run_cli(monkeypatch, [
+            "--fullscreen", "-o", "x.mp4", "--blur-all",
+            "--blur-method", method, "--blur-block", "6",
+        ])["blur_style"]
+        assert style.block == 6
+
+
+def test_cli_rejects_a_negative_blur_seed():
+    parser = recording_cli.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--fullscreen", "-o", "x.mp4",
+                           "--blur-method", "pixelate-random",
+                           "--blur-seed", "-1"])

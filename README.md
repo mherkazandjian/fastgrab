@@ -60,12 +60,28 @@ method     | what it does                          | tune with
 ``box``    | moving average (default, radius 12)   | ``radius``
 ``gaussian`` | ``passes`` box blurs, smoother      | ``radius``, ``passes``
 ``pixelate`` | block means, the mosaic look        | ``block``
+``pixelate-random`` | every tile a random colour   | ``block``, ``seed``
+``pixelate-random-shuffle`` | the real tile colours, positions permuted | ``block``, ``seed``
 ``fill``   | a solid ``(B, G, R)`` box, black by default | ``color``
 
-**Only ``fill`` actually destroys the pixels.** ``box``, ``gaussian`` and
-``pixelate`` throw away detail but text can be partially recovered from a
-low radius or a coarse mosaic — use ``fill`` for passwords, tokens and
-anything else that must not leak.
+How much each one destroys, strongest first:
+
+- ``fill`` and ``pixelate-random`` — the output does not depend on the
+  region's content at all, so nothing of it survives. ``fill`` says so
+  plainly; ``pixelate-random`` reads as a mosaic while being just as final.
+- ``pixelate-random-shuffle`` — real tile colours, scrambled positions. The
+  region still looks like it belongs, but its colour histogram survives, so
+  it leaks roughly "how much of what" was there.
+- ``pixelate`` — layout and colour both survive at tile resolution; text can
+  be partially recovered by matching candidate renderings to the tile grid.
+- ``box`` / ``gaussian`` — weakest, and a low radius is recoverable.
+
+**Use ``fill`` or ``pixelate-random`` for passwords, tokens and anything
+else that must not leak.** The other three are cosmetic.
+
+The random modes are seeded (``seed``, ``--blur-seed``) and therefore
+identical on every frame. That is deliberate: re-rolling per frame would
+let anyone average a recording back towards the mosaic underneath.
 
 Other things worth knowing:
 
@@ -127,8 +143,10 @@ Optional pointer overlays and subtitles:
   the X11 capture path never includes the real cursor sprite.
 - ``--blur X,Y,W,H`` (repeatable) obscures a screen region in every frame;
   ``--blur-all`` does the whole frame. ``--blur-method`` selects ``box``
-  (default), ``gaussian``, ``pixelate`` or ``fill``, tuned with
-  ``--blur-radius``, ``--blur-block`` and ``--blur-color B,G,R``. Redaction
+  (default), ``gaussian``, ``pixelate``, ``pixelate-random``,
+  ``pixelate-random-shuffle`` or ``fill``, tuned with
+  ``--blur-radius``, ``--blur-block``, ``--blur-seed`` and
+  ``--blur-color B,G,R``. Redaction
   happens on the captured frame, so nothing sensitive reaches ffmpeg —
   and, as above, only ``fill`` truly destroys the pixels:
 

@@ -19,13 +19,31 @@ Four modes, selected by :attr:`BlurStyle.method`:
 * ``box``      — a moving average; cheap and O(1) per pixel in the radius.
 * ``gaussian`` — ``passes`` box blurs of matched variance; smoother.
 * ``pixelate`` — block means, the classic mosaic look.
+* ``pixelate-random`` — every tile a random colour.
+* ``pixelate-random-shuffle`` — the real tile colours, positions permuted.
 * ``fill``     — a solid ``(B, G, R)`` box, black by default.
 
-**Only ``fill`` actually destroys the pixels.** ``box``, ``gaussian`` and
-``pixelate`` are cosmetic: they discard high-frequency detail but a
-determined attacker can partially recover text from a low-radius blur or
-a coarse mosaic. Use ``fill`` for passwords, tokens and anything else
-that must not leak.
+How much each one actually destroys, strongest first:
+
+* ``fill`` and ``pixelate-random`` — the output does not depend on the
+  region's content at all, so nothing of it survives. ``fill`` says so
+  plainly; ``pixelate-random`` reads as a mosaic while being just as
+  final.
+* ``pixelate-random-shuffle`` — the tiles keep their real colours and
+  only their positions are destroyed, so the region still looks like it
+  belongs. Its colour histogram survives, which leaks roughly "how much
+  of what" was there.
+* ``pixelate`` — layout and colour both survive at tile resolution. Text
+  can be partially recovered by matching candidate renderings against the
+  known tile grid.
+* ``box`` and ``gaussian`` — weakest; a low radius is recoverable.
+
+So for passwords, tokens and anything that must not leak, use ``fill``
+or ``pixelate-random``. The other three are cosmetic.
+
+The two random modes are seeded (:attr:`BlurStyle.seed`) and therefore
+identical on every frame. That is deliberate: re-rolling per frame would
+let anyone average a recording back towards the plain mosaic underneath.
 
 Conventions shared with :mod:`fastgrab.recording.clicks`: frames are
 BGRA uint8, colours are ``(B, G, R)`` tuples, and ``origin`` shifts
@@ -38,12 +56,19 @@ from dataclasses import dataclass
 import numpy
 
 
-BLUR_METHODS = ("box", "gaussian", "pixelate", "fill")
+BLUR_METHODS = (
+    "box", "gaussian", "pixelate", "pixelate-random",
+    "pixelate-random-shuffle", "fill",
+)
+
+# The mosaic family — everything that reads BlurStyle.block.
+PIXELATE_METHODS = ("pixelate", "pixelate-random", "pixelate-random-shuffle")
 
 DEFAULT_RADIUS = 12
 DEFAULT_BLOCK = 16
 DEFAULT_PASSES = 3
 DEFAULT_FILL_COLOR = (0, 0, 0)  # B, G, R — a black box
+DEFAULT_SEED = 0
 
 # Upper bound on how many shapes a caller-supplied scratch dict keeps
 # before it is dropped, so a caller that blurs a different-sized region
@@ -58,7 +83,8 @@ class BlurStyle:
     ``method`` is one of :data:`BLUR_METHODS`. ``radius`` is the kernel
     radius in pixels for ``box``/``gaussian``, ``block`` the mosaic tile
     size for ``pixelate``, and ``color`` the ``(B, G, R)`` colour for
-    ``fill``. ``passes`` is how many box blurs approximate the gaussian;
+    ``fill``. ``seed`` fixes the randomness of the ``pixelate-random``
+    modes. ``passes`` is how many box blurs approximate the gaussian;
     three is the usual choice. Their radii are scaled so the combined
     variance approximates a single box blur of ``radius`` — integer radii
     can't hit it exactly, so the result may land up to 25% either side of
@@ -76,9 +102,10 @@ class BlurStyle:
     block: int = DEFAULT_BLOCK
     passes: int = DEFAULT_PASSES
     color: tuple = DEFAULT_FILL_COLOR
+    seed: int = DEFAULT_SEED
 
     def __post_init__(self):
-        for name in ("radius", "block", "passes"):
+        for name in ("radius", "block", "passes", "seed"):
             value = getattr(self, name)
             try:
                 whole = int(value)
@@ -113,6 +140,10 @@ class BlurStyle:
             raise ValueError(
                 "blur passes must be at least 1, got {}".format(self.passes)
             )
+        if self.seed < 0:
+            raise ValueError(
+                "blur seed must not be negative, got {}".format(self.seed)
+            )
         # Reject settings that are silently identity operations. This is a
         # redaction API: a style that quietly leaves the pixels readable is
         # the one failure mode that actually leaks, so it has to be an
@@ -123,10 +154,10 @@ class BlurStyle:
                 "a {} blur of radius {} leaves the region unchanged; use 1 "
                 "or more".format(self.method, self.radius)
             )
-        if self.method == "pixelate" and self.block < 2:
+        if self.method in PIXELATE_METHODS and self.block < 2:
             raise ValueError(
-                "a pixelate block of {} leaves the region unchanged; use 2 "
-                "or more".format(self.block)
+                "a {} block of {} leaves the region unchanged; use 2 "
+                "or more".format(self.method, self.block)
             )
         try:
             color = tuple(self.color)
@@ -464,28 +495,80 @@ def _pixelate_plan(scratch, h, w, block):
     return plan
 
 
-def _pixelate_sub(sub, block, scratch):
-    """Replace each ``block`` x ``block`` tile with its mean, in place.
+def _random_tiles(scratch, n_y, n_x, seed):
+    """A fixed random colour per tile, cached.
+
+    Drawn once per (grid, seed) and reused, so a capture loop neither
+    reallocates it nor — more importantly — re-rolls it. Re-rolling every
+    frame would look stronger and be weaker: averaging enough frames of a
+    recording converges on whatever is underneath.
+    """
+    key = ("randtiles", n_y, n_x, seed)
+    if scratch is not None:
+        cached = scratch.get(key)
+        if cached is not None:
+            return cached
+    rng = numpy.random.default_rng(seed)
+    tiles = rng.integers(0, 256, (n_y, n_x, 3)).astype(numpy.float32)
+    if scratch is not None:
+        scratch[key] = tiles
+    return tiles
+
+
+def _tile_permutation(scratch, count, seed):
+    """A fixed permutation of ``count`` tiles, cached like the colours."""
+    key = ("randperm", count, seed)
+    if scratch is not None:
+        cached = scratch.get(key)
+        if cached is not None:
+            return cached
+    perm = numpy.random.default_rng(seed).permutation(count)
+    if scratch is not None:
+        scratch[key] = perm
+    return perm
+
+
+def _pixelate_sub(sub, style, scratch):
+    """Replace each tile with a single colour, in place.
+
+    Which colour depends on the method: the tile's own mean
+    (``pixelate``), a fixed random one (``pixelate-random``), or another
+    tile's mean (``pixelate-random-shuffle``).
 
     ``numpy.add.reduceat`` sums ragged runs, so a region whose size is
     not a multiple of ``block`` gets a smaller tile at the right/bottom
     edge instead of an error or a dropped strip.
     """
     h, w = sub.shape[:2]
+    block = style.block
     starts_y, starts_x, counts, idx_y, idx_x = _pixelate_plan(
         scratch, h, w, block
     )
     n_y, n_x = len(starts_y), len(starts_x)
-
-    src = _scratch_get(scratch, "pix_src", (h, w, 3))
-    numpy.copyto(src, sub[..., :3])
-    rows = _scratch_get(scratch, "pix_rows", (n_y, w, 3))
-    numpy.add.reduceat(src, starts_y, axis=0, out=rows)
     acc = _scratch_get(scratch, "pix_acc", (n_y, n_x, 3))
-    numpy.add.reduceat(rows, starts_x, axis=1, out=acc)
-    numpy.divide(acc, counts, out=acc)
-    # +0.5 so the cast back to uint8 rounds instead of truncating.
-    numpy.add(acc, 0.5, out=acc)
+
+    if style.method == "pixelate-random":
+        # Nothing is read from the frame at all, which is exactly why
+        # this destroys the content as completely as fill does.
+        acc[...] = _random_tiles(scratch, n_y, n_x, style.seed)
+    else:
+        src = _scratch_get(scratch, "pix_src", (h, w, 3))
+        numpy.copyto(src, sub[..., :3])
+        rows = _scratch_get(scratch, "pix_rows", (n_y, w, 3))
+        numpy.add.reduceat(src, starts_y, axis=0, out=rows)
+        numpy.add.reduceat(rows, starts_x, axis=1, out=acc)
+        numpy.divide(acc, counts, out=acc)
+        # +0.5 so the cast back to uint8 rounds instead of truncating.
+        numpy.add(acc, 0.5, out=acc)
+
+        if style.method == "pixelate-random-shuffle":
+            # Real colours, scrambled positions: the region keeps its
+            # palette and loses its layout.
+            perm = _tile_permutation(scratch, n_y * n_x, style.seed)
+            flat = acc.reshape(-1, 3)
+            shuffled = _scratch_get(scratch, "pix_shuf", (n_y * n_x, 3))
+            numpy.take(flat, perm, axis=0, out=shuffled, mode="clip")
+            flat[...] = shuffled
 
     # mode="clip" as in _moving_average: the indices are in range by
     # construction, and it keeps numpy.take off the path that allocates a
@@ -582,8 +665,8 @@ def blur_regions(img, regions=None, style=None, origin=(0, 0),
         sub = img[y0:y1, x0:x1]
         if style.method == "fill":
             sub[..., 0:3] = style.color
-        elif style.method == "pixelate":
-            _pixelate_sub(sub, style.block, scratch)
+        elif style.method in PIXELATE_METHODS:
+            _pixelate_sub(sub, style, scratch)
         else:
             _blur_sub(sub, style, scratch)  # box / gaussian
     return img

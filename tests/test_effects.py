@@ -16,7 +16,11 @@ from fastgrab.effects import (
 # BGRA channel indices, same convention as tests/test_integration.py.
 B, G, R, A = 0, 1, 2, 3
 
-BLUR_ONLY = [m for m in BLUR_METHODS if m != "fill"]
+# Modes whose output is derived from the pixels underneath. fill and
+# pixelate-random are excluded because their output does not depend on
+# the content at all — which is the point of them, and why "a flat field
+# survives" and "variance drops" are the wrong assertions there.
+AVERAGING = [m for m in BLUR_METHODS if m not in ("fill", "pixelate-random")]
 
 
 def _noise(h, w, seed=0, alpha=None):
@@ -96,12 +100,23 @@ def test_blur_style_normalises_colour_to_ints():
 # What the modes do to the pixels
 # --------------------------------------------------------------------
 
-@pytest.mark.parametrize("method", BLUR_METHODS)
+@pytest.mark.parametrize("method", AVERAGING + ["fill"])
 def test_constant_region_survives_every_method(method):
-    """Averaging a flat field must give back the same flat field."""
+    """Averaging a flat field must give back the same flat field.
+
+    pixelate-random is excluded on purpose: it ignores the content, so a
+    flat field does not survive it and should not.
+    """
     img = numpy.full((40, 60, 4), 77, numpy.uint8)
     blur_regions(img, None, BlurStyle(method=method, color=(77, 77, 77)))
     assert (img[..., :3] == 77).all()
+
+
+def test_a_constant_region_does_not_survive_pixelate_random():
+    """The counterpart: content-independence means the flat field goes."""
+    img = numpy.full((40, 60, 4), 77, numpy.uint8)
+    blur_regions(img, None, BlurStyle(method="pixelate-random", block=8))
+    assert not (img[..., :3] == 77).all()
 
 
 @pytest.mark.parametrize("method", BLUR_METHODS)
@@ -112,7 +127,7 @@ def test_alpha_channel_is_never_touched(method):
     assert (img[..., A] == before).all()
 
 
-@pytest.mark.parametrize("method", BLUR_ONLY)
+@pytest.mark.parametrize("method", AVERAGING)
 def test_blur_reduces_variance(method):
     img = _noise(48, 48, seed=1)
     before = img[..., :3].astype(float).var()
@@ -624,3 +639,109 @@ def test_exhausted_region_iterator_raises_instead_of_doing_nothing():
     blur_regions(img, gen, BlurStyle(method="fill", color=(1, 2, 3)))
     with pytest.raises(ValueError, match="empty or already consumed"):
         blur_regions(img, gen, BlurStyle(method="fill", color=(1, 2, 3)))
+
+
+# --------------------------------------------------------------------
+# The randomised mosaic modes
+# --------------------------------------------------------------------
+
+RANDOM_PIXELATE = ("pixelate-random", "pixelate-random-shuffle")
+
+
+@pytest.mark.parametrize("method", RANDOM_PIXELATE)
+def test_random_modes_make_each_tile_uniform(method):
+    img = _noise(16, 16, seed=60)
+    blur_regions(img, None, BlurStyle(method=method, block=4))
+    for y in range(0, 16, 4):
+        for x in range(0, 16, 4):
+            tile = img[y:y + 4, x:x + 4, :3]
+            assert (tile == tile[0, 0]).all()
+
+
+def test_pixelate_random_does_not_depend_on_the_content():
+    """The strong claim: the output is a function of the seed alone.
+
+    That is what puts it alongside fill rather than alongside pixelate —
+    two completely different regions must come out identical.
+    """
+    style = BlurStyle(method="pixelate-random", block=4)
+    a = _noise(24, 24, seed=61)
+    b = _noise(24, 24, seed=62)
+    assert not numpy.array_equal(a[..., :3], b[..., :3])
+    blur_regions(a, None, style)
+    blur_regions(b, None, style)
+    assert numpy.array_equal(a[..., :3], b[..., :3])
+
+
+def test_pixelate_random_shuffle_keeps_the_palette_and_drops_the_layout():
+    """Real tile colours, permuted positions.
+
+    The multiset of tile colours is preserved exactly — that is the
+    documented weakness of this mode — while the arrangement is not.
+    """
+    plain = _noise(32, 32, seed=63)
+    shuffled = plain.copy()
+    blur_regions(plain, None, BlurStyle(method="pixelate", block=8))
+    blur_regions(shuffled, None, BlurStyle(method="pixelate-random-shuffle",
+                                           block=8))
+    corner = lambda im: numpy.array(  # noqa: E731 - one tile per 8x8 block
+        [[im[y, x, :3] for x in range(0, 32, 8)] for y in range(0, 32, 8)]
+    ).reshape(-1, 3)
+    before, after = corner(plain), corner(shuffled)
+    assert not numpy.array_equal(before, after), "nothing was shuffled"
+    order = lambda a: sorted(map(tuple, a))  # noqa: E731
+    assert order(before) == order(after), "the tile colours changed"
+
+
+@pytest.mark.parametrize("method", RANDOM_PIXELATE)
+def test_random_modes_are_stable_across_frames(method):
+    """Same seed, same result — a recording cannot be averaged clean."""
+    style = BlurStyle(method=method, block=4)
+    frames = []
+    for seed in (70, 71, 72):
+        img = _noise(20, 20, seed=seed)
+        blur_regions(img, None, style)
+        frames.append(img[..., :3].copy())
+    if method == "pixelate-random":
+        assert numpy.array_equal(frames[0], frames[1])
+        assert numpy.array_equal(frames[1], frames[2])
+    # For the shuffle the content differs per frame, but the permutation
+    # must not: the same tile index has to land in the same place.
+    perm_a = blur_regions(_noise(20, 20, seed=80), None, style)[..., :3].copy()
+    perm_b = blur_regions(_noise(20, 20, seed=80), None, style)[..., :3]
+    assert numpy.array_equal(perm_a, perm_b)
+
+
+@pytest.mark.parametrize("method", RANDOM_PIXELATE)
+def test_a_different_seed_gives_a_different_result(method):
+    a = _noise(24, 24, seed=90)
+    b = a.copy()
+    blur_regions(a, None, BlurStyle(method=method, block=4, seed=1))
+    blur_regions(b, None, BlurStyle(method=method, block=4, seed=2))
+    assert not numpy.array_equal(a[..., :3], b[..., :3])
+
+
+@pytest.mark.parametrize("method", RANDOM_PIXELATE)
+def test_random_modes_respect_the_region_and_alpha(method):
+    img = _noise(40, 40, seed=91)
+    before = img.copy()
+    blur_regions(img, [(10, 10, 20, 20)], BlurStyle(method=method, block=5))
+    assert (img[0:10] == before[0:10]).all()
+    assert (img[30:] == before[30:]).all()
+    assert (img[..., A] == before[..., A]).all()
+
+
+@pytest.mark.parametrize("method", RANDOM_PIXELATE)
+def test_random_modes_reject_a_block_that_changes_nothing(method):
+    with pytest.raises(ValueError, match="unchanged"):
+        BlurStyle(method=method, block=1)
+
+
+def test_blur_style_rejects_a_negative_seed():
+    with pytest.raises(ValueError, match="seed"):
+        BlurStyle(method="pixelate-random", seed=-1)
+
+
+def test_blur_style_rejects_a_non_whole_seed():
+    with pytest.raises(ValueError, match="whole number"):
+        BlurStyle(method="pixelate-random", seed=1.5)

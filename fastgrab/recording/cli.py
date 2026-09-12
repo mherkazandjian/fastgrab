@@ -10,6 +10,7 @@ from fastgrab.effects import (
     BLUR_METHODS,
     DEFAULT_BLOCK,
     DEFAULT_RADIUS,
+    PIXELATE_METHODS,
     BlurStyle,
 )
 
@@ -77,6 +78,20 @@ def _positive_int(value: str):
     if iv <= 0:
         raise argparse.ArgumentTypeError(
             "value must be positive, got {}".format(iv)
+        )
+    return iv
+
+
+def _nonnegative_int(value: str):
+    try:
+        iv = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "expected an integer, got {!r}".format(value)
+        )
+    if iv < 0:
+        raise argparse.ArgumentTypeError(
+            "value must not be negative, got {}".format(iv)
         )
     return iv
 
@@ -200,9 +215,11 @@ def build_parser():
     )
     p.add_argument(
         "--blur-method", default="box", choices=list(BLUR_METHODS),
-        help="how blurred regions are obscured: box, gaussian, pixelate, "
-             "or a solid fill (default: box). Only fill actually destroys "
-             "the pixels — use it for passwords and tokens.",
+        help="how blurred regions are obscured (default: box). fill and "
+             "pixelate-random destroy the pixels outright; "
+             "pixelate-random-shuffle keeps the real tile colours but "
+             "scrambles their positions; box, gaussian and pixelate are "
+             "cosmetic. Use fill or pixelate-random for secrets.",
     )
     p.add_argument(
         "--blur-radius", type=_positive_int, default=None, metavar="N",
@@ -211,8 +228,15 @@ def build_parser():
     )
     p.add_argument(
         "--blur-block", type=_positive_int, default=None, metavar="N",
-        help="mosaic tile size in pixels for --blur-method pixelate "
+        help="mosaic tile size in pixels for the pixelate methods "
              "(default: {})".format(DEFAULT_BLOCK),
+    )
+    p.add_argument(
+        "--blur-seed", type=_nonnegative_int, default=None, metavar="N",
+        help="seed for the pixelate-random methods (default: 0). Fixed "
+             "rather than per-frame on purpose: re-rolling every frame "
+             "would let a recording be averaged back towards what is "
+             "underneath.",
     )
     p.add_argument(
         "--blur-color", type=_parse_bgr, default=None, metavar="B,G,R",
@@ -394,6 +418,7 @@ def main(argv=None):
     blur_tuned = (
         args.blur_method != "box" or args.blur_radius is not None
         or args.blur_block is not None or args.blur_color is not None
+        or args.blur_seed is not None
     )
     if blur_tuned and not blur:
         # Silently ignoring a --blur-method the user typed would hide a
@@ -409,14 +434,16 @@ def main(argv=None):
         # softened it, so refuse rather than ignore.
         applies_to = {
             "--blur-radius": ("box", "gaussian"),
-            "--blur-block": ("pixelate",),
+            "--blur-block": PIXELATE_METHODS,
             "--blur-color": ("fill",),
+            "--blur-seed": ("pixelate-random", "pixelate-random-shuffle"),
         }
         given = [
             name for name, value in (
                 ("--blur-radius", args.blur_radius),
                 ("--blur-block", args.blur_block),
                 ("--blur-color", args.blur_color),
+                ("--blur-seed", args.blur_seed),
             ) if value is not None
         ]
         ignored = [
@@ -444,6 +471,8 @@ def main(argv=None):
                         else BlurStyle().radius),
                 block=(args.blur_block if args.blur_block is not None
                        else BlurStyle().block),
+                seed=(args.blur_seed if args.blur_seed is not None
+                      else BlurStyle().seed),
                 color=args.blur_color or BlurStyle().color,
             )
         except ValueError as exc:
