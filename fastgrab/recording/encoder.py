@@ -2,6 +2,7 @@
 import os
 import shutil
 import subprocess
+import tempfile
 
 import numpy
 
@@ -89,11 +90,12 @@ def infer_codec(path: str) -> str:
 
 
 def _escape_drawtext(text: str) -> str:
-    """Escape user text for ffmpeg's drawtext text= field.
+    """Escape a value for an *unquoted* drawtext option — a path, say.
 
-    ffmpeg's filter parser splits on ``:`` and treats ``\\`` and ``'``
-    specially. We rewrite the four characters that actually break the
-    parse and leave the rest alone.
+    ffmpeg's filter parser splits options on ``:`` and treats ``\\`` and
+    ``'`` specially, so those are backslash-escaped here. Use
+    :func:`_quote_drawtext_text` for anything going into ``text=``, which
+    is quoted and follows different rules.
     """
     out = []
     for ch in text:
@@ -102,6 +104,48 @@ def _escape_drawtext(text: str) -> str:
         else:
             out.append(ch)
     return "".join(out)
+
+
+def _quote_drawtext_text(text: str) -> str:
+    """Render ``text`` as a complete, quoted drawtext ``text=`` value.
+
+    An apostrophe cannot simply be backslash-escaped here. A filter
+    option inside a filtergraph is unescaped *twice* — once when the
+    graph is split into filters, once when a filter's arguments are
+    split — and a single-quoted section has no escape mechanism at all;
+    it ends at the next quote. ``\\'`` therefore does not survive: it is
+    consumed on the way in and the apostrophe is silently dropped, so
+    ``--title "Don't stop"`` rendered "Dont stop", and with the trailing
+    ``enable=`` option present the stray quote ran the parse off the end
+    and ffmpeg rejected the whole filtergraph with "Filter not found" —
+    no recording at all.
+
+    What works is to close the quote, emit the apostrophe escaped for
+    both levels, and reopen: ``'\\\''``. That was not deduced from the
+    documentation but measured — every candidate was rendered and
+    compared pixel-for-pixel against the same text supplied through
+    ``textfile=``, which takes its content verbatim and so is ground
+    truth. Of the encodings tried it is the only one that reproduces the
+    reference.
+
+    The single backslash used for ``:``, ``\\`` and ``%`` was checked the
+    same way and does reproduce the reference, so it stays. Commas,
+    brackets and semicolons need nothing: the surrounding quotes already
+    protect them from the filtergraph splitter.
+    """
+    # Spelled out rather than written as one literal: the
+    # sequence is quote, three backslashes, quote, quote, and a
+    # nested escape of that is very easy to miscount.
+    apostrophe = "'" + "\\" * 3 + "''"
+    out = []
+    for ch in text:
+        if ch == "'":
+            out.append(apostrophe)
+        elif ch in ("\\", ":", "%"):
+            out.append("\\" + ch)
+        else:
+            out.append(ch)
+    return "'" + "".join(out) + "'"
 
 
 def _build_drawtext_filter(title: str = None, overlay_text: str = None,
@@ -126,24 +170,24 @@ def _build_drawtext_filter(title: str = None, overlay_text: str = None,
     parts = []
     if title:
         parts.append(
-            "drawtext=fontfile={font}:text='{text}':"
+            "drawtext=fontfile={font}:text={text}:expansion=none:"
             "fontcolor=white:fontsize=40:"
             "box=1:boxcolor=black@0.55:boxborderw=12:"
             "x=(w-text_w)/2:y=30:"
             "enable='lt(t,{secs})'".format(
                 font=font,
-                text=_escape_drawtext(title),
+                text=_quote_drawtext_text(title),
                 secs=title_seconds,
             )
         )
     if overlay_text:
         parts.append(
-            "drawtext=fontfile={font}:text='{text}':"
+            "drawtext=fontfile={font}:text={text}:expansion=none:"
             "fontcolor=white@0.85:fontsize=22:"
             "box=1:boxcolor=black@0.4:boxborderw=6:"
             "x=w-text_w-20:y=20".format(
                 font=font,
-                text=_escape_drawtext(overlay_text),
+                text=_quote_drawtext_text(overlay_text),
             )
         )
     return ",".join(parts)
@@ -247,6 +291,7 @@ class FfmpegEncoder:
         self.subtitles = subtitles
         self.subtitle_style = subtitle_style
         self._proc = None
+        self._stderr_file = None
 
     def _build_argv(self):
         vf = _build_drawtext_filter(
@@ -277,12 +322,36 @@ class FfmpegEncoder:
                 "'apt-get install ffmpeg' or 'brew install ffmpeg') "
                 "to use fastgrab.recording"
             )
-        self._proc = subprocess.Popen(
-            self._build_argv(),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
+        # stderr goes to a temp file, not a pipe. A pipe holds 64 KiB
+        # (F_GETPIPE_SZ on Linux) and nothing reads this one until
+        # close(), so an ffmpeg that filled it would block writing its
+        # own diagnostics -- and an ffmpeg blocked on stderr stops
+        # reading stdin, which blocks write_frame(), which is a hang with
+        # no timeout on either side. Verified with this exact Popen
+        # shape: a child writing 16 KiB to stderr completes, one writing
+        # 128 KiB deadlocks the writer indefinitely.
+        #
+        # -loglevel error keeps real ffmpeg silent today -- an mp4, webm
+        # and gif encode of 120 frames each produced 0 bytes, and so did
+        # titles with glyphs the font lacks -- so this is a latent hazard
+        # rather than one reachable now. It is worth removing anyway: the
+        # safety rests entirely on a log level no test enforces, and the
+        # failure it guards is an unkillable hang rather than an error.
+        # A file has no capacity limit to reach.
+        self._stderr_file = tempfile.TemporaryFile()
+        try:
+            self._proc = subprocess.Popen(
+                self._build_argv(),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=self._stderr_file,
+            )
+        except Exception:
+            # close() never runs when start() fails, so the file has to be
+            # released here or a caller that retries leaks one per attempt.
+            self._stderr_file.close()
+            self._stderr_file = None
+            raise
 
     def write_frame(self, frame) -> None:
         """Write one BGRA frame to ffmpeg's stdin.
@@ -329,19 +398,52 @@ class FfmpegEncoder:
         finally:
             err = self._drain_stderr()
             self._proc = None
+            if self._stderr_file is not None:
+                self._stderr_file.close()
+                self._stderr_file = None
         if rc != 0:
             raise RuntimeError(
                 "ffmpeg exited with status {}: {}".format(rc, err)
             )
 
-    def _drain_stderr(self) -> str:
-        if self._proc is None or self._proc.stderr is None:
+    def _drain_stderr(self, limit: int = 64 * 1024) -> str:
+        """Read what ffmpeg has written to stderr so far.
+
+        Reads the temp file rather than a pipe, so this never blocks and
+        can be called while ffmpeg is still running — which write_frame()
+        does, on a pipe that has just broken.
+
+        Positional reads, not seek()+read(): subprocess hands the child a
+        dup of this file's descriptor, and a dup shares the file
+        *description*, offset included. Seeking here would move where
+        ffmpeg's next write lands and scribble over its own log.
+
+        Only the tail is returned. The file is unbounded by design, and a
+        run that produced megabytes of diagnostics would otherwise put
+        all of it into an exception message; the last lines are the ones
+        that say why ffmpeg stopped.
+        """
+        handle = self._stderr_file
+        if handle is None:
             return ""
         try:
-            data = self._proc.stderr.read() or b""
+            fd = handle.fileno()
+            size = os.fstat(fd).st_size
+            start = max(0, size - limit)
+            if hasattr(os, "pread"):
+                data = os.pread(fd, size - start, start) or b""
+            else:
+                # No pread off Unix. Recording is X11-only, so this is a
+                # fallback for completeness rather than a supported path;
+                # the offset caveat above applies to it.
+                handle.seek(start)
+                data = handle.read() or b""
         except Exception:
             return ""
-        return data.decode("utf-8", errors="replace").strip()
+        text = data.decode("utf-8", errors="replace").strip()
+        if start:
+            text = "[...{} earlier bytes omitted...] {}".format(start, text)
+        return text
 
     def __enter__(self):
         self.start()

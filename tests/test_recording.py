@@ -10,6 +10,8 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 
@@ -747,3 +749,330 @@ def test_cli_blur_regions_do_not_warn(monkeypatch, capsys):
     _run_cli(monkeypatch, ["--fullscreen", "-o", "x.mp4",
                            "--blur", "0,0,100,100"])
     assert "below the target fps" not in capsys.readouterr().err
+# -------- ffmpeg's stderr must never be able to block it --------
+#
+# stderr used to be a subprocess.PIPE that nothing read until close().
+# A pipe holds 64 KiB (F_GETPIPE_SZ on Linux); an ffmpeg that filled it
+# would block writing its own diagnostics, and an ffmpeg blocked on
+# stderr stops reading stdin, which blocks write_frame(). Neither side
+# has a timeout, so that is a hang, not an error.
+#
+# -loglevel error keeps real ffmpeg quiet — mp4, webm and gif encodes of
+# 120 frames each produced 0 bytes of stderr, and so did titles carrying
+# glyphs the font lacks — so this was latent rather than reachable. It is
+# still worth removing: the safety rested entirely on a log level nothing
+# enforced, and what it guarded against was an unkillable hang. These
+# tests stand in for an ffmpeg that does talk.
+
+_NOISY_CHILD = (
+    "import sys\n"
+    "sys.stderr.buffer.write(b'e' * {volume})\n"
+    "sys.stderr.buffer.write(b'\\nLAST-LINE-OF-STDERR\\n')\n"
+    "sys.stderr.buffer.flush()\n"
+    "read = 0\n"
+    "while True:\n"
+    "    chunk = sys.stdin.buffer.read(65536)\n"
+    "    if not chunk:\n"
+    "        break\n"
+    "    read += len(chunk)\n"
+    "sys.exit({status})\n"
+)
+
+
+def _encoder_over(tmp_path, volume, status=0):
+    """An encoder whose 'ffmpeg' is a child with a known stderr volume."""
+    enc = FfmpegEncoder(str(tmp_path / "out.mp4"), 64, 48, fps=30)
+    enc._build_argv = lambda: [
+        sys.executable, "-c",
+        _NOISY_CHILD.format(volume=volume, status=status),
+    ]
+    return enc
+
+
+def _feed(enc, frames=40, timeout=60.0):
+    """Write frames from a thread; return True if the writer finished."""
+    frame = numpy.zeros((48, 64, 4), numpy.uint8)
+    done = threading.Event()
+
+    def run():
+        try:
+            for _ in range(frames):
+                enc.write_frame(frame)
+        except Exception:
+            pass
+        finally:
+            done.set()
+
+    threading.Thread(target=run, daemon=True).start()
+    return done.wait(timeout)
+
+
+@requires_ffmpeg
+@pytest.mark.parametrize("volume", [16 * 1024, 512 * 1024])
+def test_a_talkative_encoder_does_not_block_the_writer(tmp_path, volume):
+    """The deadlock itself.
+
+    16 KiB fits the pipe and always worked; 512 KiB does not, and used to
+    wedge write_frame() forever. 40 frames of 64x48 is ~480 KiB, well
+    past the 64 KiB stdin pipe, so a child that has stopped reading
+    cannot be masked by buffering.
+    """
+    enc = _encoder_over(tmp_path, volume)
+    enc.start()
+    try:
+        assert _feed(enc), (
+            "write_frame() never returned: the encoder's stderr filled and "
+            "nothing was reading it"
+        )
+    finally:
+        enc.close()
+
+
+@requires_ffmpeg
+def test_a_large_stderr_is_reported_as_its_tail(tmp_path):
+    """A megabyte of diagnostics must not become a megabyte of exception."""
+    enc = _encoder_over(tmp_path, 512 * 1024, status=1)
+    enc.start()
+    assert _feed(enc)
+    with pytest.raises(RuntimeError) as excinfo:
+        enc.close()
+    message = str(excinfo.value)
+    assert "exited with status 1" in message
+    # the end of the log survives — that is where ffmpeg says why it died
+    assert "LAST-LINE-OF-STDERR" in message
+    # and the truncation is declared rather than silent
+    assert "earlier bytes omitted" in message
+    assert len(message) < 128 * 1024, "the whole log went into the message"
+
+
+@requires_ffmpeg
+def test_a_short_stderr_is_reported_whole(tmp_path):
+    """No truncation notice when nothing was truncated."""
+    enc = _encoder_over(tmp_path, 128, status=1)
+    enc.start()
+    assert _feed(enc)
+    with pytest.raises(RuntimeError) as excinfo:
+        enc.close()
+    message = str(excinfo.value)
+    assert "LAST-LINE-OF-STDERR" in message
+    assert "omitted" not in message
+
+
+@requires_ffmpeg
+def test_draining_mid_run_does_not_disturb_what_the_child_writes(tmp_path):
+    """subprocess hands the child a dup, which shares the file offset.
+
+    Reading with seek() would move where the child's next write lands and
+    overwrite its own log, so the drain uses positional reads.
+    """
+    enc = _encoder_over(tmp_path, 4096, status=0)
+    enc.start()
+    try:
+        # The child writes as soon as it starts, but "as soon as" is not
+        # "before this line"; poll rather than race it.
+        deadline = time.time() + 30.0
+        early = ""
+        while time.time() < deadline:
+            early = enc._drain_stderr()
+            if "LAST-LINE-OF-STDERR" in early:
+                break
+            time.sleep(0.05)
+        assert "LAST-LINE-OF-STDERR" in early
+        assert _feed(enc)
+    finally:
+        enc.close()
+    # The child's own bytes are intact: 4096 'e's plus its final line,
+    # not a hole where the read repositioned the shared offset.
+    assert early.count("e") >= 4096
+
+
+@requires_ffmpeg
+def test_a_real_ffmpeg_failure_still_reports_its_stderr(tmp_path):
+    """The capture path has to keep working with actual ffmpeg."""
+    enc = FfmpegEncoder(str(tmp_path / "nosuchdir" / "out.mp4"), 64, 48, fps=30)
+    enc.start()
+    frame = numpy.zeros((48, 64, 4), numpy.uint8)
+    with pytest.raises(RuntimeError) as excinfo:
+        for _ in range(30):
+            enc.write_frame(frame)
+        enc.close()
+    message = str(excinfo.value)
+    assert "nosuchdir" in message or "No such file" in message, message
+
+
+def test_the_drain_falls_back_when_pread_is_unavailable(tmp_path, monkeypatch):
+    """os.pread is Unix-only; the drain must still read on a host without it.
+
+    Recording is X11-only in practice, so this path is for completeness
+    rather than a supported platform — but silently returning nothing
+    would turn a real ffmpeg error into an empty message.
+    """
+    enc = FfmpegEncoder(str(tmp_path / "out.mp4"), 64, 48, fps=30)
+    handle = tempfile.TemporaryFile()
+    handle.write(b"e" * 10 + b"\nWHY-FFMPEG-DIED\n")
+    handle.flush()
+    enc._stderr_file = handle
+    try:
+        monkeypatch.delattr(os, "pread", raising=False)
+        assert "WHY-FFMPEG-DIED" in enc._drain_stderr()
+    finally:
+        handle.close()
+
+
+def test_the_drain_is_quiet_before_the_encoder_starts(tmp_path):
+    """No file yet is not an error — write_frame() can be reached first."""
+    enc = FfmpegEncoder(str(tmp_path / "out.mp4"), 64, 48, fps=30)
+    assert enc._drain_stderr() == ""
+
+
+# -------- drawtext: text the user typed must be the text on screen --------
+#
+# Two bugs lived here, and both were invisible in a filter-string
+# assertion — you have to render to see them.
+#
+# An apostrophe cannot be backslash-escaped in a drawtext text= value. A
+# filter option inside a filtergraph is unescaped twice (once splitting
+# the graph, once splitting a filter's arguments) and a single-quoted
+# section has no escape mechanism at all. \' was consumed on the way in,
+# so --title "Don't stop" rendered "Dont stop"; with the trailing
+# enable= option present the stray quote ran the parse off the end and
+# ffmpeg rejected the whole filtergraph with "Filter not found" — no
+# recording at all.
+#
+# And with drawtext's default expansion=normal, a literal % blanks the
+# *entire* text. No escaping helps: '100\% done', '100%% done' and a
+# verbatim textfile= all render nothing. Only expansion=none renders it,
+# which also stops the text being reinterpreted as %{...} directives.
+
+_DRAWTEXT_CASES = [
+    "Release demo",
+    "Don't stop",
+    "100% done",
+    "step 1: begin",
+    "C:\\path\\to",
+    "%{pts}",
+    "don't: 50%",
+    "it's a 'quote'",
+    "a,b[c]d;e",
+    "trailing'",
+    "'leading",
+    "''",
+    "50% — done",
+]
+
+
+def _render_gray(vf, width=900, height=120):
+    """One frame through `vf` over black, as a gray numpy array."""
+    proc = subprocess.run(
+        ["ffmpeg", "-v", "error", "-f", "lavfi",
+         "-i", "color=black:s=%dx%d:d=0.1" % (width, height),
+         "-vf", vf, "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        return None, proc.stderr.decode("utf-8", "replace").strip()
+    return numpy.frombuffer(proc.stdout, dtype=numpy.uint8).reshape(height, width), ""
+
+
+def _reference_vf(text, path, font):
+    """The same drawtext, with the text supplied through textfile=.
+
+    textfile= takes its content verbatim — no escaping layer at all — so
+    this is ground truth for what the user's string should look like.
+    """
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    return (
+        "drawtext=fontfile={font}:textfile={tf}:expansion=none:"
+        "fontcolor=white:fontsize=40:"
+        "box=1:boxcolor=black@0.55:boxborderw=12:x=(w-text_w)/2:y=30:"
+        "enable='lt(t,3.0)'".format(
+            font=encoder_mod._escape_drawtext(font),
+            tf=encoder_mod._escape_drawtext(path),
+        )
+    )
+
+
+@requires_ffmpeg
+@pytest.mark.parametrize("title", _DRAWTEXT_CASES)
+def test_a_title_renders_exactly_as_typed(title, tmp_path):
+    font = encoder_mod._find_font()
+    if font is None:
+        pytest.skip("no usable font on this host")
+
+    ours, our_err = _render_gray(encoder_mod._build_drawtext_filter(title=title))
+    assert ours is not None, "ffmpeg rejected the filter for {!r}: {}".format(
+        title, our_err
+    )
+
+    want, ref_err = _render_gray(
+        _reference_vf(title, str(tmp_path / "ref.txt"), font)
+    )
+    assert want is not None, "the reference render failed: " + ref_err
+
+    # Blank-vs-blank would compare equal and prove nothing — that is how
+    # the percent bug hid behind the apostrophe one.
+    assert (want > 40).sum() > 0, "the reference rendered nothing for {!r}".format(title)
+    assert numpy.array_equal(ours, want), (
+        "{!r} does not render as typed: {} lit pixels vs {} in the reference"
+        .format(title, int((ours > 40).sum()), int((want > 40).sum()))
+    )
+
+
+def test_an_apostrophe_is_closed_escaped_and_reopened():
+    """The only encoding that survives both unescaping passes."""
+    quoted = encoder_mod._quote_drawtext_text("Don't")
+    assert quoted == "'Don'" + "\\" * 3 + "''t'"
+    # and the plain backslash-escape that used to be emitted is not it
+    assert "\\'t" not in quoted.replace("\\" * 3 + "'", "")
+
+
+def test_the_other_specials_keep_their_single_backslash():
+    q = encoder_mod._quote_drawtext_text
+    assert q("a:b") == "'a\\:b'"
+    assert q("100%") == "'100\\%'"
+    assert q("a\\b") == "'a\\\\b'"
+    # commas and brackets need nothing — the quotes already cover them
+    assert q("a,b[c]") == "'a,b[c]'"
+
+
+def test_every_drawtext_filter_disables_expansion(tmp_path):
+    """A % anywhere in the text blanks the whole render without this.
+
+    The font is passed explicitly: both builders return None when they
+    cannot find one, and a runner without DejaVu installed would turn
+    this assertion into an AttributeError rather than a useful failure.
+    """
+    font = tmp_path / "fake.ttf"
+    font.write_bytes(b"")
+    vf = encoder_mod._build_drawtext_filter(
+        title="t", overlay_text="o", font_path=str(font)
+    )
+    assert vf.count("expansion=none") == 2, vf
+    chain = subtitles_mod.build_subtitle_filters(
+        [Subtitle(text="hello", start=0.0, end=1.0)],
+        SubtitleStyle(font_path=str(font)),
+    )
+    assert "expansion=none" in chain, chain
+
+
+@requires_ffmpeg
+def test_a_subtitle_renders_its_apostrophe(tmp_path):
+    """subtitles.py builds its own drawtext chain and shared the bug."""
+    font = encoder_mod._find_font()
+    if font is None:
+        pytest.skip("no usable font on this host")
+    style = SubtitleStyle(font_path=font)
+    chain = subtitles_mod.build_subtitle_filters(
+        [Subtitle(text="don't stop", start=0.0, end=5.0)], style
+    )
+    got, err = _render_gray(chain)
+    assert got is not None, "ffmpeg rejected the subtitle chain: " + err
+    plain = subtitles_mod.build_subtitle_filters(
+        [Subtitle(text="dont stop", start=0.0, end=5.0)], style
+    )
+    bare, _ = _render_gray(plain)
+    assert bare is not None
+    # The apostrophe has to actually be drawn — dropping it silently was
+    # the original symptom, and that renders the same as "dont stop".
+    assert not numpy.array_equal(got, bare), "the apostrophe was dropped"
