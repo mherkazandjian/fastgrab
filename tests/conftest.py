@@ -26,16 +26,28 @@ if sys.platform != "linux":
 
 
 def _x11_available() -> bool:
-    display = os.environ.get("DISPLAY")
-    if not display:
+    """Whether an X display can actually be opened.
+
+    Asks the extension the tests themselves will use, rather than
+    shelling out to xdpyinfo or reimplementing Xlib's address parsing.
+    Xlib accepts transport prefixes, socket pathnames, bracketed IPv6
+    literals and address-family pins; anything that reinterprets DISPLAY
+    by hand gets some of those wrong and mis-gates the suite. The old
+    xdpyinfo check also degraded to a bare "DISPLAY is set" whenever
+    xdpyinfo was not installed, which is the hole behind #44.
+    """
+    if not os.environ.get("DISPLAY"):
         return False
-    if not shutil.which("xdpyinfo"):
-        return True
-    return subprocess.run(
-        ["xdpyinfo", "-display", display],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    ).returncode == 0
+    try:
+        from fastgrab import _linux_x11
+    except ImportError:
+        # No compiled extension means nothing here can capture anyway.
+        return False
+    try:
+        _linux_x11.resolution()
+    except Exception:
+        return False
+    return True
 
 
 def _wayland_available() -> bool:
@@ -46,17 +58,37 @@ def _wayland_available() -> bool:
     return os.path.exists(os.path.join(rd, wd))
 
 
-@pytest.fixture(scope="session", autouse=True)
-def require_some_display():
+_SOME_DISPLAY = None
+
+
+def _some_display_available() -> bool:
+    # Cached: the gate is consulted once per test, and _x11_available()
+    # shells out to xdpyinfo.
+    global _SOME_DISPLAY
+    if _SOME_DISPLAY is None:
+        _SOME_DISPLAY = _x11_available() or _wayland_available()
+    return _SOME_DISPLAY
+
+
+@pytest.fixture(autouse=True)
+def require_some_display(request):
+    """Skip tests that need a display when there is not one.
+
+    Per-test rather than per-session, and skippable with the
+    ``no_display`` marker: suites that drive fakes (the macOS and wlr
+    backend unit tests) need no display at all, and a session-wide skip
+    took them down with everything else — losing exactly the coverage a
+    contributor gets when running pytest on a headless box, which is
+    also the only place ``off_x``/``off_y`` are ever exercised.
+    """
     # On Windows/macOS the system always has a desktop available to capture;
     # the display-server gate is a Linux-only concept.
     if sys.platform != "linux":
         return
-    if not (_x11_available() or _wayland_available()):
-        pytest.skip(
-            "no usable display server (need DISPLAY or WAYLAND_DISPLAY)",
-            allow_module_level=True,
-        )
+    if request.node.get_closest_marker("no_display"):
+        return
+    if not _some_display_available():
+        pytest.skip("no usable display server (need DISPLAY or WAYLAND_DISPLAY)")
 
 
 @pytest.fixture
@@ -117,7 +149,12 @@ def paint_wayland():
     cs.settimeout(5.0)
 
     def _paint(color: str) -> None:
-        cs.sendall(("paint " + color + "\n").encode())
+        # "blocks" is the painter's coordinate-encoding pattern; anything
+        # else is a solid #RRGGBB. A flat color cannot distinguish a
+        # correctly placed sub-region capture from a displaced one, which
+        # is what the scale tests need to check.
+        command = "blocks" if color == "blocks" else "paint " + color
+        cs.sendall((command + "\n").encode())
         # Read until newline (the painter responds 'ok\n' or 'err: ...\n').
         buf = b""
         while b"\n" not in buf:
@@ -137,5 +174,78 @@ def paint_wayland():
 
     try:
         cs.close()
+    except Exception:
+        pass
+
+
+def _wlr_randr(*args):
+    """Run ``wlr-randr`` against the current Wayland display."""
+    return subprocess.run(
+        ["wlr-randr", *args],
+        check=True, capture_output=True, text=True,
+    )
+
+
+def _wlr_first_output_name():
+    """The name of the first output ``wlr-randr`` lists (cage has one)."""
+    for line in _wlr_randr().stdout.splitlines():
+        if line and not line[0].isspace():
+            return line.split()[0]
+    return None
+
+
+def _refresh_wlr_output_state():
+    """Round-trip the shared wlr connection so latched geometry updates.
+
+    ``WlrBackend`` keeps one connection and one set of ``_OutputState``
+    objects per process, and reads them without querying the compositor.
+    A scale change is therefore invisible — to every ``Screenshot``
+    already built *and* to every one built afterwards — until something
+    dispatches. Doing it here rather than in each test keeps a test that
+    changed the scale from leaving a stale reading behind for the next
+    one.
+    """
+    from fastgrab.backends.wlr import WlrBackend
+
+    WlrBackend().refresh()
+
+
+@pytest.fixture
+def wlr_output_scale():
+    """Set the wlroots output scale for the duration of one test.
+
+    cage's headless output comes up at scale 1 and neither cage nor the
+    wlroots headless backend takes a scale option or environment
+    variable. cage does implement ``zwlr_output_manager_v1`` though, so
+    ``wlr-randr`` can drive the scale live — which is the only way to
+    reach the scaled sub-region path of the wlr backend under
+    ``docker compose run --rm test-wayland``.
+
+    Yields ``set_scale(2)``. The scale is put back to 1 on teardown,
+    and the backend's latched output state is refreshed both times so
+    neither this test nor the next one reads a stale logical size.
+    """
+    if not _wayland_available():
+        pytest.skip("wlr_output_scale requires a working Wayland display")
+    if not shutil.which("wlr-randr"):
+        pytest.skip("wlr-randr is not installed (apt install wlr-randr)")
+
+    name = _wlr_first_output_name()
+    if not name:
+        pytest.skip("wlr-randr listed no outputs")
+
+    def _set_scale(scale) -> None:
+        _wlr_randr("--output", name, "--scale", str(scale))
+        # The compositor reconfigures the kiosk client, which redraws at
+        # the new size; give both a moment before anything is captured.
+        time.sleep(0.3)
+        _refresh_wlr_output_state()
+
+    yield _set_scale
+
+    try:
+        _wlr_randr("--output", name, "--scale", "1")
+        time.sleep(0.3)
+        _refresh_wlr_output_state()
     except Exception:
         pass

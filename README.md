@@ -24,11 +24,13 @@ resolution    | fps
   from fastgrab import screenshot
   # take a full screen screenshot
   img = screenshot.Screenshot().capture()
-  # >> img is a numpy ndarray, do whatever you want with it
+  # >> img is a numpy ndarray of shape (height, width, 4) in BGRA byte order
+  # >> do whatever you want with it
   # (optional)
   # e.g it can be displayed with matplotlib (install matplotlib first)
   from matplotlib import pyplot as plt
-  plt.imshow(img[:, :, 0:3], interpolation='none', cmap='Greys_r')
+  # matplotlib expects RGB, so reverse the BGR channels and drop alpha
+  plt.imshow(img[:, :, 2::-1], interpolation='none')
   plt.show()
 ````
 
@@ -213,7 +215,10 @@ Per-platform extras:
    GDI ``BitBlt`` via ``ctypes``.
  - **macOS**: nothing beyond Python + numpy. macOS 10.15+ requires
    *Screen Recording* permission for the running app (System Settings →
-   Privacy & Security).
+   Privacy & Security). Captures are in **device pixels**, so a Retina
+   display reports (and returns) the full backing store — a 1800x1169
+   desktop captures as 3600x2338. ``bbox`` rectangles are in device
+   pixels too.
 
 note that ``fastgrab`` could work with lower versions but I have not tested it
 (and probaby will not). 

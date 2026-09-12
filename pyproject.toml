@@ -44,14 +44,13 @@ python = "^3.10"
 numpy = ">=1.26"
 pywayland = {version = "^0.4.17", optional = true}
 dbus-next = {version = "^0.2.3", optional = true}
-pipewire-python = {version = "^0.2.0", optional = true}
 python-xlib = {version = "*", optional = true}
 Pillow = {version = "*", optional = true}
 
 [tool.poetry.extras]
 wayland = ["pywayland"]
-wayland-portal = ["dbus-next", "pipewire-python"]
-wayland-all = ["pywayland", "dbus-next", "pipewire-python"]
+wayland-portal = ["dbus-next"]
+wayland-all = ["pywayland", "dbus-next"]
 gui = ["python-xlib", "Pillow"]
 
 [tool.poetry.scripts]
@@ -73,4 +72,5 @@ build-backend = "poetry.core.masonry.api"
 markers = [
     "integration: pixel-level tests that mutate X server state (need DISPLAY + xsetroot)",
     "wayland: pixel-level tests that exercise the Wayland (wlr-screencopy) backend (need WAYLAND_DISPLAY + a wlroots compositor like cage)",
+    "no_display: tests that drive fakes and need no display server, so the require_some_display gate lets them run on a headless box",
 ]
