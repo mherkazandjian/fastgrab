@@ -512,9 +512,9 @@ def socket_path(display):
     return "/tmp/.X11-unix/X" + display.lstrip(":").split(".")[0]
 
 
-def start(display):
+def start(display, depth=24):
     proc = subprocess.Popen(
-        ["Xvfb", display, "-screen", "0", "320x240x24", "-ac"],
+        ["Xvfb", display, "-screen", "0", "320x240x%d" % depth, "-ac"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     _servers.append(proc)
@@ -993,3 +993,75 @@ def test_a_rejected_request_names_the_x_error():
         _linux_x11._force_x_protocol_error()
     # And the cached connection survives it, in process too.
     assert _linux_x11.resolution() == _linux_x11.resolution()
+
+
+# -------- pixel layout --------
+
+_PIXEL_FORMAT_TEMPLATE = r'''
+import numpy
+
+display = sys.argv[1]
+start(display, depth=__DEPTH__)
+if not wait_for_socket(display):
+    finish(4, "NO-SOCKET")
+if wait_for_extension(display) is None:
+    finish(4, "NO-EXTENSION")
+
+img = numpy.zeros((8, 8, 4), "uint8")
+try:
+    _linux_x11.screenshot(0, 0, img)
+except RuntimeError as exc:
+    say("REFUSED " + " ".join(str(exc).split()))
+    finish(0)
+say("CAPTURED")
+finish(0)
+'''
+
+
+def _pixel_format_script(depth):
+    return _XVFB_PRELUDE + _PIXEL_FORMAT_TEMPLATE.replace("__DEPTH__", str(depth))
+
+
+def test_a_depth_30_screen_is_refused_rather_than_copied_out_as_bgra():
+    """bits_per_pixel says how wide a pixel is, not how it is arranged.
+
+    A depth-30 visual packs 10:10:10 RGB into 32 bits, so it passed the
+    only check there was and the packed value was handed back as if its
+    bytes were B, G, R, A. Nothing failed and nothing warned; the caller
+    got wrong colours. Measured on this same Xvfb before the fix, a mid
+    grey painted as (512, 512, 512) came back as B=0 G=2 R=8 A=32 — near
+    black — and a mid orange lost its green channel outright. Saturated
+    primaries came back close enough to look correct, which is exactly
+    why it could go unnoticed.
+    """
+    result, report = _run_x_fault_script(_pixel_format_script(30))
+    assert result.returncode == 0, report
+    assert "REFUSED" in result.stdout, report
+    assert "CAPTURED" not in result.stdout, report
+
+
+def test_the_refusal_names_the_layout_the_server_offered():
+    """Without the masks the message cannot be acted on.
+
+    "not BGRA" sends the reader to xdpyinfo to find out what they have;
+    the masks and the depth say it outright, and naming the layout
+    fastgrab *does* accept says what to change.
+    """
+    result, report = _run_x_fault_script(_pixel_format_script(30))
+    assert result.returncode == 0, report
+    # what the server offered
+    assert "30-bit-deep" in result.stdout, report
+    assert "R=0x3ff00000" in result.stdout, report
+    assert "G=0x000ffc00" in result.stdout, report
+    assert "B=0x000003ff" in result.stdout, report
+    assert "LSBFirst" in result.stdout, report
+    # and what it would have had to be
+    assert "R=0x00ff0000" in result.stdout, report
+
+
+def test_a_depth_24_screen_still_captures():
+    """The control: the same script one depth down must not be refused."""
+    result, report = _run_x_fault_script(_pixel_format_script(24))
+    assert result.returncode == 0, report
+    assert "CAPTURED" in result.stdout, report
+    assert "REFUSED" not in result.stdout, report

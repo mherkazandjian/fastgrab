@@ -35,6 +35,27 @@
 #define FG_ERR_LOST     -8
 #define FG_ERR_NOMEM    -9
 #define FG_ERR_XPROTO  -10
+#define FG_ERR_FORMAT  -11
+
+/* The only 32-bit ZPixmap layout whose bytes are already B,G,R,A on a
+ * little-endian host -- what the Python side promises callers. These are
+ * the masks a depth-24 visual reports; every channel sits on a byte
+ * boundary, so the server's rows can be memcpy'd out untouched. */
+#define FG_BGRA_RED_MASK   0x00ff0000UL
+#define FG_BGRA_GREEN_MASK 0x0000ff00UL
+#define FG_BGRA_BLUE_MASK  0x000000ffUL
+
+/* Detail for FG_ERR_FORMAT, filled in on the refusal path so fg_raise can
+ * name what the server actually offered. Same reasoning as the
+ * fg_xerr_* statics: the GIL is held for the whole call, and a message
+ * that does not say which layout was rejected sends the reader back to
+ * xdpyinfo to find out. */
+static unsigned long fg_fmt_red = 0;
+static unsigned long fg_fmt_green = 0;
+static unsigned long fg_fmt_blue = 0;
+static int fg_fmt_depth = 0;
+static int fg_fmt_byte_order = 0;
+
 
 static const char *fg_strerror(int code)
 {
@@ -63,6 +84,9 @@ static const char *fg_strerror(int code)
                "was dropped, so a later call will reconnect";
     case FG_ERR_XPROTO:
         return "the X server rejected the request with a protocol error";
+    case FG_ERR_FORMAT:
+        return "the X server returned a 32-bit image whose channels are "
+               "not byte-aligned BGRA";
     default:
         return "unknown X11 error";
     }
@@ -592,6 +616,28 @@ static int fg_op_screenshot(Display *dpy, void *ctx)
         return FG_ERR_DEPTH;
     }
 
+    /* bits_per_pixel says how *wide* a pixel is, not how its channels are
+     * arranged inside that width. A depth-30 visual -- 10:10:10 packed
+     * RGB, which amdgpu and nvidia ship for 10-bit output and Xvfb will
+     * happily serve -- is also 32 bits per pixel, so the check above let
+     * it through and the packed value was handed back as if it were
+     * BGRA. Measured on Xvfb at depth 30: a mid grey (512,512,512) came
+     * back B=0 G=2 R=8 A=32, near black, and a mid orange lost its green
+     * channel entirely. Saturated primaries survived close enough to
+     * look right, which is how this stayed invisible. */
+    if (img->red_mask != FG_BGRA_RED_MASK ||
+        img->green_mask != FG_BGRA_GREEN_MASK ||
+        img->blue_mask != FG_BGRA_BLUE_MASK ||
+        img->byte_order != LSBFirst) {
+        fg_fmt_red = img->red_mask;
+        fg_fmt_green = img->green_mask;
+        fg_fmt_blue = img->blue_mask;
+        fg_fmt_depth = img->depth;
+        fg_fmt_byte_order = img->byte_order;
+        XDestroyImage(img);
+        return FG_ERR_FORMAT;
+    }
+
     const size_t row_bytes = (size_t)req->width * 4;
     const size_t nbytes = row_bytes * (size_t)req->height;
 
@@ -715,6 +761,29 @@ static PyObject *fg_raise(int rc)
                      "have been resized between the bounds check and the "
                      "capture.",
                      (unsigned)fg_xerr_code, (unsigned)fg_xerr_request);
+        return NULL;
+    }
+    if (rc == FG_ERR_FORMAT) {
+        /* snprintf, not PyErr_Format: PyUnicode_FromFormat understands
+         * only a subset of printf and silently copies the rest of the
+         * string verbatim when it meets something it does not know --
+         * "%08lx" among them, which printed the format specifiers
+         * themselves into the message. */
+        char detail[768];
+        snprintf(detail, sizeof(detail),
+                 "the X server returned a %d-bit-deep image whose channels "
+                 "are not byte-aligned BGRA: masks R=0x%08lx G=0x%08lx "
+                 "B=0x%08lx, byte order %s. fastgrab copies the server's "
+                 "rows out verbatim, so it can only promise BGRA for the "
+                 "depth-24 layout (R=0x%08lx G=0x%08lx B=0x%08lx, "
+                 "LSBFirst). A depth-30 screen packs 10:10:10 RGB into the "
+                 "same 32 bits, which is not byte-aligned channels at all "
+                 "-- read as BGRA, a mid grey comes back near black. Run "
+                 "the X server at depth 24.",
+                 fg_fmt_depth, fg_fmt_red, fg_fmt_green, fg_fmt_blue,
+                 fg_fmt_byte_order == LSBFirst ? "LSBFirst" : "MSBFirst",
+                 FG_BGRA_RED_MASK, FG_BGRA_GREEN_MASK, FG_BGRA_BLUE_MASK);
+        PyErr_SetString(PyExc_RuntimeError, detail);
         return NULL;
     }
     PyErr_SetString(PyExc_RuntimeError, fg_strerror(rc));
