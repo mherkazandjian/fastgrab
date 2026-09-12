@@ -869,3 +869,89 @@ def test_a_subtitle_renders_its_apostrophe(tmp_path):
     # The apostrophe has to actually be drawn — dropping it silently was
     # the original symptom, and that renders the same as "dont stop".
     assert not numpy.array_equal(got, bare), "the apostrophe was dropped"
+
+
+# -------- what the CLI claims it wrote --------
+#
+# Ctrl-C during the countdown stops the recorder before ffmpeg is ever
+# started. The recorder says so — it returns a zero stats dict, and its
+# own comment reads "Cancelled before the first frame ... there's no
+# file" — but the CLI printed the ordinary summary anyway:
+#
+#   $ fastgrab-record --region 0,0,320,240 --countdown 5 -o out.mp4
+#   ^C
+#   wrote out.mp4: 0 frames in 0.00s (0.0 fps achieved)     # exit 0
+#   $ ls out.mp4
+#   ls: cannot access 'out.mp4': No such file or directory
+#
+# Verified end to end by SIGINTing the real CLI under xvfb.
+
+
+class _StubRecorder:
+    """Stands in for Recorder, returning a chosen stats dict."""
+
+    def __init__(self, stats):
+        self._stats = stats
+
+    def record(self, **kwargs):
+        return self._stats
+
+
+def _run_cli_with(monkeypatch, stats, tmp_path, extra=None):
+    monkeypatch.setattr(
+        recording_cli, "Recorder", lambda **kw: _StubRecorder(stats)
+    )
+    argv = ["--region", "0,0,64,48", "-o", str(tmp_path / "out.mp4")]
+    return recording_cli.main(argv + (extra or []))
+
+
+def _stats(output, frames=0, written=0):
+    return {
+        "frames": frames,
+        "written_frames": written,
+        "elapsed_seconds": 0.0 if not frames else 1.0,
+        "achieved_fps": 0.0 if not frames else float(frames),
+        "output": str(output),
+    }
+
+
+def test_a_cancelled_recording_does_not_claim_a_file(monkeypatch, tmp_path, capsys):
+    out = tmp_path / "out.mp4"
+    rc = _run_cli_with(monkeypatch, _stats(out), tmp_path)
+    captured = capsys.readouterr()
+    assert rc == 0, "a deliberate cancel is not an error"
+    assert "wrote" not in captured.out, captured.out
+    assert "cancelled before the first frame" in captured.err
+    assert str(out) in captured.err
+    assert not out.exists()
+
+
+def test_a_recording_that_produced_no_file_is_an_error(monkeypatch, tmp_path, capsys):
+    """Frames encoded, ffmpeg happy, nothing on disk — do not say "wrote"."""
+    out = tmp_path / "out.mp4"
+    rc = _run_cli_with(monkeypatch, _stats(out, frames=10, written=10), tmp_path)
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "wrote" not in captured.out, captured.out
+    assert "does not exist" in captured.err
+
+
+def test_a_real_recording_still_reports_what_it_wrote(monkeypatch, tmp_path, capsys):
+    """The ordinary path must be untouched."""
+    out = tmp_path / "out.mp4"
+    out.write_bytes(b"not really an mp4, but it exists")
+    rc = _run_cli_with(monkeypatch, _stats(out, frames=30, written=30), tmp_path)
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "wrote {}".format(out) in captured.out
+    assert "30 frames" in captured.out
+
+
+def test_duplicated_frames_are_still_reported(monkeypatch, tmp_path, capsys):
+    """written_frames > frames is the slow-capture case, not a cancel."""
+    out = tmp_path / "out.mp4"
+    out.write_bytes(b"x")
+    rc = _run_cli_with(monkeypatch, _stats(out, frames=10, written=25), tmp_path)
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "15 duplicated" in captured.out, captured.out

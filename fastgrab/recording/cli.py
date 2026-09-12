@@ -1,6 +1,7 @@
 """``fastgrab-record`` CLI — argparse around :class:`Recorder`."""
 import argparse
 import math
+import os
 import re
 import signal
 import sys
@@ -404,6 +405,33 @@ def main(argv=None):
 
     if stats is None:
         return 0
+
+    if stats.get("written_frames", stats["frames"]) == 0:
+        # Ctrl-C during the countdown stops the recorder before ffmpeg is
+        # ever started, so there is no file. Reporting that as
+        # "wrote <path>: 0 frames" -- which is what the summary below
+        # does -- sent a script off to open something that was never
+        # created, and the failure then surfaced far from its cause.
+        # Cancelling deliberately is not an error, so the exit status
+        # stays 0, matching the selection- and dialog-cancel paths above.
+        print(
+            "fastgrab: cancelled before the first frame; {} was not "
+            "written".format(stats["output"]),
+            file=sys.stderr,
+        )
+        return 0
+
+    if not os.path.exists(stats["output"]):
+        # Frames went to ffmpeg and it exited cleanly, yet nothing is
+        # there. Whatever the cause, saying "wrote" would be a lie of the
+        # same kind, so fail rather than describe a file that is absent.
+        print(
+            "error: {} frames were encoded but {} does not exist".format(
+                stats["frames"], stats["output"]
+            ),
+            file=sys.stderr,
+        )
+        return 1
 
     duplicated = stats.get("written_frames", stats["frames"]) - stats["frames"]
     print(
