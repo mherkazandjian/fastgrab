@@ -29,6 +29,7 @@ backend's fakes do:
   ``AttributeError`` here just as it would there.
 """
 import ctypes
+import gc
 import sys
 import types
 
@@ -182,11 +183,24 @@ class _FakeGdi32:
         self.buffers = {}         # HBITMAP -> (ctypes buffer, w, h)
         self.created_bitmaps = []
         self.deleted_bitmaps = []
+        self.created_dcs = []
+        self.deleted_dcs = []
         self._bitmap_serial = 0
+        self._dc_serial = 0
 
     def CreateCompatibleDC(self, hdc):
         assert hdc, "a memory DC must be built from a live screen DC"
-        return 0x2000
+        # A distinct handle per call: a shared constant would hide a
+        # backend that deleted one instance's DC and kept using another's.
+        self._dc_serial += 1
+        mem_dc = 0x2000 + self._dc_serial
+        self.created_dcs.append(mem_dc)
+        return mem_dc
+
+    def DeleteDC(self, hdc):
+        assert hdc not in self.deleted_dcs, "the memory DC was deleted twice"
+        self.deleted_dcs.append(hdc)
+        return 1
 
     def CreateDIBSection(self, hdc, bmi, usage, bits_ptr, section, offset):
         # ctypes.byref() wraps the argument in a CArgObject; the fake
@@ -208,6 +222,13 @@ class _FakeGdi32:
         return previous
 
     def DeleteObject(self, hgdiobj):
+        # GDI refuses to delete a bitmap that is still selected into a
+        # DC, and returns failure rather than leaking loudly — which is
+        # precisely how a wrong teardown order becomes a silent leak.
+        assert hgdiobj != self.selected, \
+            "deleted a bitmap while it was still selected into the DC"
+        assert hgdiobj not in self.deleted_bitmaps, \
+            "the same bitmap was deleted twice"
         self.deleted_bitmaps.append(hgdiobj)
         return 1
 
@@ -594,3 +615,141 @@ def test_a_valid_destination_still_captures(make_backend):
     assert img.shape == (10, 12, 4)
     assert len(gdi32.blits) == 1
     assert numpy.array_equal(img, user32.screen[0:10, 0:12])
+
+
+# -------- GDI handle lifetime --------
+#
+# The bug: __init__ created a memory DC and screenshot() created a
+# DIBSection, and neither was ever freed. GDI's per-process quota is
+# 10,000 handles, but the DIBSection's pixels leak with the handle — at
+# 1080p ~8 MB apiece — so `Screenshot().capture()` in a loop exhausts
+# memory long before the handle count. The old code said so itself:
+# "No __del__: ... we let the OS reclaim the memory DC and bitmap
+# handles at process exit."
+
+def test_close_deletes_the_bitmap_and_the_memory_dc(make_backend):
+    backend, _, gdi32 = make_backend()
+    _capture(backend, 0, 0, 8, 8)
+    bitmap = backend._surface.bitmap
+    mem_dc = backend._surface.mem_dc
+    assert bitmap in gdi32.created_bitmaps
+    assert mem_dc in gdi32.created_dcs
+
+    backend.close()
+
+    assert bitmap in gdi32.deleted_bitmaps
+    assert mem_dc in gdi32.deleted_dcs
+
+
+def test_close_is_idempotent(make_backend):
+    """The fake asserts on a double delete, so this is a real check."""
+    backend, _, gdi32 = make_backend()
+    _capture(backend, 0, 0, 8, 8)
+    backend.close()
+    backend.close()
+    assert len(gdi32.deleted_dcs) == 1
+
+
+def test_close_before_any_capture_still_frees_the_memory_dc(make_backend):
+    """The DC is built in __init__, so it leaks even with no capture."""
+    backend, _, gdi32 = make_backend()
+    mem_dc = backend._surface.mem_dc
+    backend.close()
+    assert gdi32.deleted_dcs == [mem_dc]
+    assert gdi32.deleted_bitmaps == []
+
+
+def test_dropping_the_backend_frees_its_gdi_handles(make_backend):
+    """The leak itself: no close(), just let the backend go out of scope.
+
+    This is the shape the library's own headline API produces —
+    ``Screenshot().capture()`` keeps no reference to the backend — so
+    collection has to be enough on its own.
+    """
+    backend, _, gdi32 = make_backend()
+    _capture(backend, 0, 0, 8, 8)
+    bitmap = backend._surface.bitmap
+    mem_dc = backend._surface.mem_dc
+
+    del backend
+    gc.collect()
+
+    assert bitmap in gdi32.deleted_bitmaps, "the DIBSection outlived its backend"
+    assert mem_dc in gdi32.deleted_dcs, "the memory DC outlived its backend"
+
+
+def test_many_dropped_backends_leak_no_handles(make_backend):
+    """Twenty instances, none closed: every handle must come back."""
+    made = []
+    for _ in range(20):
+        backend, _, gdi32 = make_backend()
+        _capture(backend, 0, 0, 8, 8)
+        made.append(gdi32)
+        del backend
+    gc.collect()
+
+    for gdi32 in made:
+        assert sorted(gdi32.deleted_bitmaps) == sorted(gdi32.created_bitmaps)
+        assert sorted(gdi32.deleted_dcs) == sorted(gdi32.created_dcs)
+
+
+def test_the_finalizer_does_not_run_at_interpreter_exit(make_backend):
+    """Deliberate: GDI calls during shutdown are the race __del__ had.
+
+    Windows reclaims every handle a process owned when it exits, so
+    firing then buys nothing and runs ctypes calls through modules that
+    may already be torn down.
+    """
+    backend, _, _ = make_backend()
+    assert backend._surface._finalize.atexit is False
+
+
+def test_capture_after_close_raises_instead_of_blitting(make_backend):
+    """Blitting through a deleted DC is undefined, not an error."""
+    backend, _, gdi32 = make_backend()
+    _capture(backend, 0, 0, 8, 8)
+    backend.close()
+
+    before = len(gdi32.blits)
+    with pytest.raises(RuntimeError, match="closed"):
+        _capture(backend, 0, 0, 8, 8)
+    assert len(gdi32.blits) == before, "a closed backend still reached BitBlt"
+
+
+def test_resizing_frees_the_previous_bitmap_but_keeps_the_dc(make_backend):
+    """Pre-existing behaviour the refactor must not disturb."""
+    backend, _, gdi32 = make_backend()
+    _capture(backend, 0, 0, 8, 8)
+    first = backend._surface.bitmap
+    mem_dc = backend._surface.mem_dc
+
+    _capture(backend, 0, 0, 4, 4)
+    second = backend._surface.bitmap
+
+    assert second != first
+    assert first in gdi32.deleted_bitmaps
+    assert second not in gdi32.deleted_bitmaps
+    assert gdi32.deleted_dcs == [], "the memory DC survives a resize"
+    assert backend._surface.mem_dc == mem_dc
+
+
+def test_closing_one_backend_leaves_another_untouched(make_backend):
+    """Each instance owns its own DC; close() must not reach past it.
+
+    Every make_backend() call installs a fresh pair of fakes, so the two
+    backends are asserted against their own gdi32 rather than compared
+    by handle value.
+    """
+    first, _, gdi_first = make_backend()
+    second, _, gdi_second = make_backend()
+    _capture(first, 0, 0, 8, 8)
+    _capture(second, 0, 0, 8, 8)
+    # Read before closing: teardown nulls the handles it has freed.
+    first_dc = first._surface.mem_dc
+
+    first.close()
+
+    assert gdi_first.deleted_dcs == [first_dc]
+    assert gdi_second.deleted_dcs == [], "closing one backend freed another's DC"
+    assert gdi_second.deleted_bitmaps == []
+    assert _capture(second, 0, 0, 8, 8).shape == (8, 8, 4)

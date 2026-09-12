@@ -9,6 +9,8 @@ and assert on the resulting BGRA bytes.
 These tests are tagged with the ``wayland`` marker so they're excluded
 from the X11 test run and selected explicitly via ``-m wayland``.
 """
+import gc
+import os
 import time
 
 import numpy
@@ -222,3 +224,116 @@ def test_wlr_subregion_comes_from_the_right_place_when_scaled(
     ) == exact, "this parametrization is meant to exercise the other branch"
 
     _assert_subregion_matches_full_output(g, bbox)
+
+
+# -------- frame-buffer lifetime --------
+#
+# Each WlrBackend allocates a memfd-backed wl_buffer and nothing ever
+# freed it, so every Screenshot instance leaked one descriptor and one
+# frame's worth of memory. Measured before the fix, against cage: 76
+# leaked memfds after 76 instances, and with RLIMIT_NOFILE lowered to 64
+# the 43rd capture died with "OSError: [Errno 24] Too many open files".
+#
+# The memory is the worse half and is *not* ours to free directly. The
+# compositor keeps its own mapping for as long as it owns the wl_buffer,
+# so closing our descriptor releases nothing — 50 dropped buffers held
+# 175.5 MiB of system Shmem, and closing every fd by hand freed none of
+# it; the wl_buffer.destroy() requests brought it to 0.8 MiB. That is
+# asserted deterministically in tests/test_wlr_backend.py rather than
+# here, where it would mean reading a system-wide counter.
+
+# One live frame buffer accounts for *two* descriptors, not one:
+# os.memfd_create gives us ours, and mmap.mmap() dups it internally and
+# holds that copy until mm.close(). Both are freed together. Before the
+# fix, GC reclaimed the mmap (and so its dup) while the memfd itself was
+# never closed, which is why the leak measured one descriptor per
+# instance rather than two.
+_FDS_PER_BUFFER = 2
+
+
+def _fastgrab_memfds():
+    """Count this process's open ``fastgrab-wlr`` descriptors.
+
+    Collects first. Most tests in this module drop their backend without
+    closing it — the normal way to use the library — so an uncollected
+    buffer from an earlier test would otherwise sit in the baseline and
+    make these counts depend on test order.
+    """
+    gc.collect()
+    total = 0
+    for entry in os.listdir("/proc/self/fd"):
+        try:
+            target = os.readlink("/proc/self/fd/" + entry)
+        except OSError:
+            continue  # the descriptor closed under us; it is not a leak
+        if "fastgrab-wlr" in target:
+            total += 1
+    return total
+
+
+def test_a_capture_opens_one_frame_buffer():
+    """Baseline for the leak tests: one buffer per live backend."""
+    before = _fastgrab_memfds()
+    with _grab() as grab:
+        grab.capture((0, 0, 32, 32))
+        assert _fastgrab_memfds() == before + _FDS_PER_BUFFER
+    assert _fastgrab_memfds() == before
+
+
+def test_close_releases_the_frame_buffer_immediately():
+    before = _fastgrab_memfds()
+    grab = _grab()
+    try:
+        grab.capture((0, 0, 32, 32))
+    finally:
+        grab.close()
+    assert _fastgrab_memfds() == before
+
+
+def test_dropped_screenshot_objects_do_not_leak():
+    """The leak as a user meets it: no close(), just instances going away.
+
+    This is the shape of the library's headline API — the object in
+    ``Screenshot().capture()`` is unreachable the moment the expression
+    ends — so collection alone has to be enough.
+    """
+    before = _fastgrab_memfds()
+    for _ in range(20):
+        grab = _grab()
+        grab.capture((0, 0, 32, 32))
+        del grab
+    gc.collect()
+    assert _fastgrab_memfds() == before
+
+
+def test_the_two_line_api_in_a_loop_does_not_leak():
+    """Verbatim the form the README advertises, thirty times over."""
+    before = _fastgrab_memfds()
+    for _ in range(30):
+        screenshot.Screenshot(backend="wlr").capture((0, 0, 16, 16))
+    gc.collect()
+    assert _fastgrab_memfds() == before
+
+
+def test_resizing_within_one_instance_reuses_one_buffer():
+    """The resize path already freed correctly; keep it that way."""
+    before = _fastgrab_memfds()
+    with _grab() as grab:
+        for size in (16, 32, 64, 32, 16):
+            grab.capture((0, 0, size, size))
+            assert _fastgrab_memfds() == before + _FDS_PER_BUFFER
+    assert _fastgrab_memfds() == before
+
+
+def test_a_closed_instance_does_not_disturb_a_live_one():
+    """The display is a process-wide singleton; the buffer is not."""
+    first, second = _grab(), _grab()
+    try:
+        first.capture((0, 0, 32, 32))
+        second.capture((0, 0, 32, 32))
+        first.close()
+        # The survivor keeps working, and still owns exactly one buffer.
+        assert second.capture((0, 0, 32, 32)).shape == (32, 32, 4)
+    finally:
+        first.close()
+        second.close()

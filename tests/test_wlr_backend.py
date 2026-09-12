@@ -8,6 +8,9 @@ transform refusal exist for are unreachable there. The scale-2 mapping
 for the one scale ``wlr-randr`` is asked to set. These drive the same
 code over hand-built output state instead.
 """
+import gc
+import mmap
+import os
 from types import SimpleNamespace
 
 import numpy
@@ -18,7 +21,7 @@ pytest.importorskip(
 )
 
 from fastgrab.backends.wlr import (  # noqa: E402
-    WlrBackend, _plan_region, _uniform_integer_scale,
+    WlrBackend, _ShmBuffer, _plan_region, _release_shm, _uniform_integer_scale,
 )
 
 # Hand-built output state only — no compositor, no display server.
@@ -610,3 +613,141 @@ def test_the_pre_v3_refusal_explains_buffer_done(monkeypatch):
         _connect_against(
             [("zwlr_screencopy_manager_v1", 1), ("wl_shm", 1)], monkeypatch
         )
+
+
+# -------- _ShmBuffer: freeing a frame buffer --------
+#
+# Nothing ever freed the per-instance SHM buffer, so each Screenshot
+# leaked a memfd and a frame's worth of memory. The descriptor half is
+# measured against a real compositor in tests/test_integration_wlr.py.
+# The memory half is asserted here, because it is not ours to free: the
+# compositor holds its own mapping of the memfd for as long as it owns
+# the wl_buffer. Measured on cage, 50 dropped buffers held 175.5 MiB of
+# system Shmem and closing every descriptor by hand released *none* of
+# it; the destroy() requests took the same 50 down to 0.8 MiB. So the
+# call that matters is destroy(), and these pin it down without reading
+# a system-wide counter that CI cannot hold still.
+
+
+class _FakeWlBuffer:
+    """A wl_buffer proxy that records whether it was destroyed."""
+
+    def __init__(self, fail=False):
+        self.destroys = 0
+        self._fail = fail
+
+    def destroy(self):
+        self.destroys += 1
+        if self._fail:
+            raise RuntimeError("connection is gone")
+
+
+def _shm_buffer(**kw):
+    """A real memfd + mmap, so close()/fd handling is not itself faked."""
+    fd = os.memfd_create("fastgrab-wlr-test", 0)
+    os.ftruncate(fd, 4096)
+    mm = mmap.mmap(fd, 4096, prot=mmap.PROT_READ | mmap.PROT_WRITE,
+                   flags=mmap.MAP_SHARED)
+    wl = _FakeWlBuffer(**kw)
+    return _ShmBuffer(mm, fd, wl, 32, 32, 128, 0), mm, fd, wl
+
+
+def _fd_is_open(fd):
+    try:
+        os.fstat(fd)
+    except OSError:
+        return False
+    return True
+
+
+def test_closing_a_buffer_destroys_the_wl_buffer():
+    """The one call that gets the memory back from the compositor."""
+    buf, mm, fd, wl = _shm_buffer()
+    buf.close()
+    assert wl.destroys == 1
+    assert mm.closed
+    assert not _fd_is_open(fd)
+
+
+def test_dropping_a_buffer_destroys_the_wl_buffer():
+    """No close() anywhere — collection alone must free it.
+
+    This is what removes the leak: WlrBackend has no __del__ and must not
+    grow one, so the buffer has to free itself when the backend that
+    owned it goes away.
+    """
+    buf, mm, fd, wl = _shm_buffer()
+    del buf
+    gc.collect()
+    assert wl.destroys == 1
+    assert mm.closed
+    assert not _fd_is_open(fd)
+
+
+def test_closing_a_buffer_twice_destroys_once():
+    buf, _, _, wl = _shm_buffer()
+    buf.close()
+    buf.close()
+    assert wl.destroys == 1
+
+
+def test_an_explicitly_closed_buffer_is_not_freed_again_on_collection():
+    buf, _, fd, wl = _shm_buffer()
+    buf.close()
+    del buf
+    gc.collect()
+    assert wl.destroys == 1
+    assert not _fd_is_open(fd)
+
+
+def test_the_finalizer_does_not_run_at_interpreter_exit():
+    """Deliberate. Firing at shutdown is what makes __del__ unsafe here.
+
+    destroy() is a request on the display connection, and at shutdown
+    that connection may already be half torn down — the segfault the
+    backend's "intentionally no __del__" note is about. The kernel
+    reclaims the fd and the mapping then anyway, and the compositor
+    drops everything when the socket closes, so there is nothing to win.
+    """
+    buf, _, _, _ = _shm_buffer()
+    assert buf._finalize.atexit is False
+    buf.close()
+
+
+def test_a_dead_connection_does_not_raise_out_of_teardown():
+    """destroy() on a lost connection is not a leak, and must not throw.
+
+    _release_shm runs from a finalizer, where an exception surfaces at an
+    arbitrary point in someone else's stack. The compositor frees every
+    resource it held for us when the socket closes.
+    """
+    buf, mm, fd, wl = _shm_buffer(fail=True)
+    buf.close()  # must not raise
+    assert wl.destroys == 1
+    # And our own handles still came back despite the failure above.
+    assert mm.closed
+    assert not _fd_is_open(fd)
+
+
+def test_release_frees_our_handles_even_if_destroy_raises():
+    """_release_shm directly, since the ordering is the whole point."""
+    fd = os.memfd_create("fastgrab-wlr-test", 0)
+    os.ftruncate(fd, 4096)
+    mm = mmap.mmap(fd, 4096, prot=mmap.PROT_READ | mmap.PROT_WRITE,
+                   flags=mmap.MAP_SHARED)
+    wl = _FakeWlBuffer(fail=True)
+    _release_shm(mm, fd, wl)
+    assert wl.destroys == 1
+    assert mm.closed
+    assert not _fd_is_open(fd)
+
+
+def test_matches_distinguishes_every_dimension():
+    """_ensure_buffer reuses on this; a loose compare would reuse wrongly."""
+    buf, _, _, _ = _shm_buffer()
+    assert buf.matches(32, 32, 128, 0)
+    assert not buf.matches(33, 32, 128, 0)
+    assert not buf.matches(32, 33, 128, 0)
+    assert not buf.matches(32, 32, 129, 0)
+    assert not buf.matches(32, 32, 128, 1)
+    buf.close()
