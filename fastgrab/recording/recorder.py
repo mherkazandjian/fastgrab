@@ -21,6 +21,13 @@ class Recorder:
     ``subtitle_style``) are rendered the same way, each during its own
     start/end window.
 
+    ``blur`` obscures regions of every captured frame before anything
+    else is drawn on it — a list of screen-absolute ``(x, y, w, h)``
+    rectangles, or ``True`` for the whole frame — styled by ``blur_style``
+    (a :class:`fastgrab.effects.BlurStyle`). Redaction happens on the
+    frame the backend just wrote, so nothing sensitive ever reaches
+    ffmpeg; click and cursor overlays are drawn on top of it.
+
     ``show_clicks`` overlays a click animation (see
     :class:`fastgrab.recording.clicks.ClickStyle`, passed as
     ``click_style``) on every detected mouse-button press, and
@@ -35,7 +42,8 @@ class Recorder:
                  show_clicks: bool = False, click_style=None,
                  show_cursor: bool = False, cursor_color=(255, 255, 255),
                  cursor_scale: float = 1.0,
-                 subtitles=None, subtitle_style=None):
+                 subtitles=None, subtitle_style=None,
+                 blur=None, blur_style=None):
         self.output_path = output_path
         self.bbox = bbox  # (x, y, w, h) or None for fullscreen
         # Validate before touching the display so bad input fails fast
@@ -51,7 +59,33 @@ class Recorder:
         self.cursor_scale = cursor_scale
         self.subtitles = subtitles
         self.subtitle_style = subtitle_style
-        self._grab = Screenshot(backend=backend)
+        # Blurring is delegated to Screenshot so the frame arrives
+        # already redacted and the capture loop below stays unchanged.
+        # self.blur / self.blur_style are properties onto that Screenshot
+        # rather than copies: plain attributes here would let
+        # ``rec.blur = [...]`` after construction look like it had taken
+        # effect while the recording still used the original setting.
+        self._grab = Screenshot(
+            backend=backend, blur=blur, blur_style=blur_style
+        )
+
+    @property
+    def blur(self):
+        """Regions obscured in every recorded frame; see :class:`Screenshot`."""
+        return self._grab.blur
+
+    @blur.setter
+    def blur(self, value):
+        self._grab.blur = value
+
+    @property
+    def blur_style(self):
+        """The :class:`fastgrab.effects.BlurStyle` used for :attr:`blur`."""
+        return self._grab.blur_style
+
+    @blur_style.setter
+    def blur_style(self, value):
+        self._grab.blur_style = value
 
     def _resolved_bbox(self):
         if self.bbox is not None:

@@ -59,6 +59,7 @@ fastgrab/
   __init__.py               version/author metadata only — keep it import-cheap
   metadata.py
   screenshot.py             Screenshot: buffer owner, bbox validation, dispatch to backend
+  effects.py                pure-numpy blur/redaction of BGRA frames (core, no extra)
   backends/
     __init__.py             _resolve_backend(name) / _autodetect()
     base.py                 BaseBackend ABC: resolution(), bytes_per_pixel(), screenshot(x, y, img)
@@ -175,6 +176,7 @@ immediately; the entrypoint rebuilds the C extension in place on start.
 | `tests/test_x11_lowlevel.py` | direct `fastgrab._linux_x11` exercises; module-level skip on non-Linux. |
 | `tests/test_integration.py` | `@pytest.mark.integration` — pixel-level: paints the X root via python-xlib `XFillRectangle`, asserts captured BGRA bytes. |
 | `tests/test_integration_wlr.py` | `@pytest.mark.wayland` — pixel-level via the `wayland_painter.py` kiosk client under headless `cage`. |
+| `tests/test_effects.py` | blur/redaction: every method, region clipping, alpha and out-of-region bytes untouched, scratch reuse. Pure numpy, no display — runs on the Windows/macOS runners too. |
 | `tests/test_recording.py` | codec inference, ffmpeg argv/drawtext, click patterns, cursor stamping, subtitles, CLI parsing; a few `skipif(not X11)` recorder smoke tests that really invoke ffmpeg. |
 | `tests/test_macos_backend.py` | `@pytest.mark.no_display` — the points-vs-pixels snapping as a pure function, plus the copy path over a fake CoreGraphics/CoreFoundation pair. The only place `off_x`/`off_y` run, since CI Macs are 1x. Runs everywhere. |
 | `tests/test_wlr_backend.py` | `@pytest.mark.no_display` — `WlrBackend.refresh()` over hand-built output state; covers the mode-change and output-reselection paths the single-output `cage` session cannot. Skipped without pywayland. |
@@ -220,7 +222,21 @@ are no release/publish steps in CI.
 ## 8. Conventions and gotchas
 
 - **BGRA everywhere.** To hand RGB to something, slice `img[..., 2::-1]`.
-  Click colours in `ClickStyle.color` and `--click-color` are also BGR.
+  Click colours in `ClickStyle.color` and `--click-color` are also BGR, as
+  is `BlurStyle.color` / `--blur-color`.
+- **Blur regions are screen-absolute at the `Screenshot` layer,
+  frame-local at the `effects` layer** — `capture()` passes the bbox
+  origin down as `blur_regions(origin=...)`, the same convention as
+  `overlay_clicks(bbox_origin=...)`. `effects` only ever writes channels
+  0..2; alpha stays exactly as the backend wrote it.
+- `fastgrab.effects` is imported **lazily** inside `capture()`, and
+  `tests/test_screenshot.py` asserts it via a subprocess. Don't promote it
+  to a module-level import — a capture that never blurs shouldn't parse it.
+- Blur cost scales with the region and is independent of the radius
+  (cumsum moving average). A *full* 1080p frame is ~64 ms (`box`) /
+  ~180 ms (`gaussian`), which will not hold 30 fps — the CLI warns when
+  `--blur-all` is combined with those. Only `fill` destroys pixels; say so
+  whenever someone reaches for blur to hide a secret.
 - **Lazy-import optional deps** (`pywayland`, `python-xlib`, `tkinter`,
   `Pillow`) inside the function/class that needs them, and wrap with an
   error carrying the `pip install fastgrab[extra]` hint. The top-level
@@ -267,6 +283,23 @@ are no release/publish steps in CI.
    `backends/__init__.py`. Re-run `make lock docker=1`.
 6. Prove the two-line API is unchanged: `docker compose run --rm test`.
 
+### Add a frame effect (blur-like, pure numpy)
+
+1. Implement it in `fastgrab/effects.py` operating **in place on a view**
+   (`img[y0:y1, x0:x1, :3]`) — no full-frame copy; take the optional
+   `scratch` dict for reusable work arrays so a capture loop allocates no
+   work buffer per frame. Two numpy traps to know: `numpy.take(out=...)`
+   allocates a full-size temporary unless you pass `mode="clip"`, and any
+   ufunc writing into a *strided* output view costs numpy's fixed ~100 KiB
+   iteration buffer (constant, not proportional to the region).
+2. Add it to `BLUR_METHODS` (or a sibling tuple), validate in
+   `__post_init__`, and keep it numpy-only: a new runtime dep here would
+   tax the default wheel.
+3. Test it headless in `tests/test_effects.py`; the display-backed proof
+   goes in `tests/test_integration.py` via `paint_root`.
+4. Measure it before claiming it is cheap — region cost and full-frame
+   cost, in the container.
+
 ### Add a recording overlay / CLI flag
 
 1. Implement as pure numpy (frame-side, in `clicks.py`-style modules) or
@@ -310,6 +343,8 @@ containers — say so.
 - [ ] New optional functionality is behind an extra with lazy imports and
       an install hint.
 - [ ] BGRA contract preserved; buffer reuse preserved.
+- [ ] Nothing new imported eagerly on the `import fastgrab.screenshot`
+      path.
 - [ ] `docker compose run --rm test` passes; wayland suite run if backends
       touched.
 - [ ] `test_screenshot.py` still platform-agnostic; anything else that

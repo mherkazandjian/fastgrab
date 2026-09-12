@@ -8,11 +8,50 @@ import numpy
 from fastgrab.backends import _resolve_backend
 
 
+def _normalise_blur(blur):
+    """Validate blur regions and materialise them into a tuple.
+
+    ``blur`` is ``None`` / ``True`` / ``False`` or an iterable of
+    ``(x, y, width, height)``. The rectangle checks live in
+    :func:`fastgrab.effects._normalise_regions` so that the low-level
+    entry point enforces exactly the same rules; importing it here is
+    still lazy, because only a caller who passed actual regions reaches
+    that line.
+    """
+    if blur is None or blur is True or blur is False:
+        return blur
+    try:
+        regions = tuple(blur)
+    except TypeError:
+        raise TypeError(
+            "blur must be None, True, False, or an iterable of "
+            "(x, y, width, height); got {!r}".format(type(blur).__name__)
+        )
+    if not regions:
+        if hasattr(blur, "__next__"):
+            # An empty *iterator* is almost always one that was already
+            # consumed by an earlier call — silently capturing in the
+            # clear is exactly the failure this feature must not have.
+            # An intentional no-op is spelled [] or False.
+            raise ValueError(
+                "blur regions iterable was empty or already consumed; "
+                "pass [] or False to capture unmodified, and store a "
+                "list rather than a generator to reuse regions"
+            )
+        # A genuinely empty list is documented as "capture unmodified",
+        # so it must not drag in fastgrab.effects. Materialising first
+        # (the iterable is consumed either way) is what lets this be
+        # decided before the import.
+        return ()
+    from fastgrab.effects import _normalise_regions
+    return _normalise_regions(regions)
+
+
 class Screenshot(object):
     """
     Main object that captures screenshots and provides other utilities
     """
-    def __init__(self, backend=None):
+    def __init__(self, backend=None, blur=None, blur_style=None):
         """
         Constructor
 
@@ -20,6 +59,14 @@ class Screenshot(object):
             ``'x11'``, ``'wlr'``, ``'portal'``. When ``None`` (default)
             the backend is auto-detected from the environment:
             Wayland sessions try wlr → portal; X11 sessions use x11.
+        :param blur: regions to obscure in every capture — a list of
+            screen-absolute ``(x, y, width, height)`` rectangles, or
+            ``True`` for the whole frame. ``None`` (default) captures
+            unmodified frames. See :meth:`capture`.
+        :param blur_style: a :class:`fastgrab.effects.BlurStyle`
+            selecting the method (``box``, ``gaussian``, ``pixelate`` or
+            a solid ``fill``) and its parameters; ``None`` uses the
+            defaults.
         """
         self._backend = _resolve_backend(backend)
         """The capture backend (BaseBackend subclass instance)"""
@@ -32,6 +79,51 @@ class Screenshot(object):
 
         self._closed = False
         """Set by :meth:`close`; capture refuses to run afterwards"""
+
+        self.blur = blur              # both normalised/validated by the
+        self.blur_style = blur_style  # property setters defined below
+
+        self._blur_scratch = {}
+        """Work buffers reused across captures by fastgrab.effects, so a
+        capture loop blurring a fixed region stops reallocating them"""
+
+    @property
+    def blur(self):
+        """Regions obscured in every capture, or ``None`` / ``True``.
+
+        A property rather than a plain attribute so that assigning to it
+        after construction goes through the same validation the
+        constructor uses — otherwise ``grab.blur = (r for r in rects)``
+        would redact one frame and then silently stop.
+        """
+        return self._blur
+
+    @blur.setter
+    def blur(self, value):
+        self._blur = _normalise_blur(value)
+
+    @property
+    def blur_style(self):
+        """The :class:`fastgrab.effects.BlurStyle` used for :attr:`blur`.
+
+        Validated on assignment for the same reason as :attr:`blur`, and
+        so that a bad style is refused up front rather than at the end of
+        the next ``capture()`` — by which point the backend has already
+        overwritten the shared buffer that a caller may still be holding
+        as a redacted frame.
+        """
+        return self._blur_style
+
+    @blur_style.setter
+    def blur_style(self, value):
+        if value is not None:
+            from fastgrab.effects import BlurStyle
+            if not isinstance(value, BlurStyle):
+                raise TypeError(
+                    "blur_style must be a BlurStyle or None, got "
+                    "{!r}".format(type(value).__name__)
+                )
+        self._blur_style = value
 
     @property
     def screensize(self) -> tuple:
@@ -72,6 +164,9 @@ class Screenshot(object):
         self._backend.refresh()
         self._screensize = None
         self._img = None
+        # Keyed by region shape, so a geometry change makes every cached
+        # blur buffer stale as well.
+        self._blur_scratch.clear()
 
     @staticmethod
     def _as_pixels(name, value, bbox):
@@ -205,7 +300,7 @@ class Screenshot(object):
 
         return (x, y, w, h)
 
-    def capture(self, bbox: tuple=None) -> numpy.ndarray:
+    def capture(self, bbox: tuple=None, blur=None) -> numpy.ndarray:
         """
         Take a screenshot and return the image
 
@@ -235,6 +330,14 @@ class Screenshot(object):
          fractional value such as ``7.5`` raises :class:`ValueError`;
          round it yourself to say which pixel you mean. ``x``/``y`` must
          not be negative and ``width``/``height`` must be positive.
+        :param blur: regions to obscure in this capture, overriding the
+         ones passed to the constructor. A list of screen-absolute
+         ``(x, y, width, height)`` rectangles, ``True`` for the whole
+         frame, or ``False`` / ``[]`` to capture this frame unmodified.
+         ``None`` (default) falls back to ``self.blur``. Rectangles are
+         clipped to the captured region, and the blur is applied in place
+         to the returned buffer — it does not accumulate across calls
+         because the backend overwrites the whole buffer every time.
         :return: The image as a numpy array of shape (height, width, 4) in
          BGRA byte order.
         """
@@ -243,6 +346,13 @@ class Screenshot(object):
             raise RuntimeError(
                 "this Screenshot has been closed; construct a new one"
             )
+
+        # Resolve the blur before anything is captured: capture() hands
+        # back the reused internal buffer, so if an invalid override
+        # raised *after* the backend had written into it, a caller still
+        # holding a redacted frame from the previous call would find it
+        # turned into a clear capture by the very call that failed.
+        regions = self.blur if blur is None else _normalise_blur(blur)
 
         # check/set the dimensions of the image that will be captured
         if bbox is None:
@@ -269,6 +379,21 @@ class Screenshot(object):
                 )
 
         self._backend.screenshot(x, y, self._img)
+
+        if regions:
+            # Imported here rather than at module level so a capture that
+            # never blurs doesn't pay to import the module at all.
+            from fastgrab.effects import blur_regions
+            blur_regions(
+                self._img,
+                None if regions is True else regions,
+                style=self.blur_style,
+                # The normalized origin from check_bbox, not bbox[0:2]:
+                # the raw box may hold a numpy integer or an integral
+                # float, and those must not reach the clip arithmetic.
+                origin=(x, y),
+                scratch=self._blur_scratch,
+            )
 
         return self._img
 
@@ -301,6 +426,10 @@ class Screenshot(object):
         """
         self._closed = True
         self._img = None
+        # These outweigh the frame buffer — a full-frame 1080p blur holds
+        # several float32 planes — so releasing _img without them would
+        # miss most of what close() is for.
+        self._blur_scratch.clear()
         self._backend.close()
 
     def __enter__(self):
