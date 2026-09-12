@@ -716,3 +716,156 @@ def test_the_drain_is_quiet_before_the_encoder_starts(tmp_path):
     """No file yet is not an error — write_frame() can be reached first."""
     enc = FfmpegEncoder(str(tmp_path / "out.mp4"), 64, 48, fps=30)
     assert enc._drain_stderr() == ""
+
+
+# -------- drawtext: text the user typed must be the text on screen --------
+#
+# Two bugs lived here, and both were invisible in a filter-string
+# assertion — you have to render to see them.
+#
+# An apostrophe cannot be backslash-escaped in a drawtext text= value. A
+# filter option inside a filtergraph is unescaped twice (once splitting
+# the graph, once splitting a filter's arguments) and a single-quoted
+# section has no escape mechanism at all. \' was consumed on the way in,
+# so --title "Don't stop" rendered "Dont stop"; with the trailing
+# enable= option present the stray quote ran the parse off the end and
+# ffmpeg rejected the whole filtergraph with "Filter not found" — no
+# recording at all.
+#
+# And with drawtext's default expansion=normal, a literal % blanks the
+# *entire* text. No escaping helps: '100\% done', '100%% done' and a
+# verbatim textfile= all render nothing. Only expansion=none renders it,
+# which also stops the text being reinterpreted as %{...} directives.
+
+_DRAWTEXT_CASES = [
+    "Release demo",
+    "Don't stop",
+    "100% done",
+    "step 1: begin",
+    "C:\\path\\to",
+    "%{pts}",
+    "don't: 50%",
+    "it's a 'quote'",
+    "a,b[c]d;e",
+    "trailing'",
+    "'leading",
+    "''",
+    "50% — done",
+]
+
+
+def _render_gray(vf, width=900, height=120):
+    """One frame through `vf` over black, as a gray numpy array."""
+    proc = subprocess.run(
+        ["ffmpeg", "-v", "error", "-f", "lavfi",
+         "-i", "color=black:s=%dx%d:d=0.1" % (width, height),
+         "-vf", vf, "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        return None, proc.stderr.decode("utf-8", "replace").strip()
+    return numpy.frombuffer(proc.stdout, dtype=numpy.uint8).reshape(height, width), ""
+
+
+def _reference_vf(text, path, font):
+    """The same drawtext, with the text supplied through textfile=.
+
+    textfile= takes its content verbatim — no escaping layer at all — so
+    this is ground truth for what the user's string should look like.
+    """
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    return (
+        "drawtext=fontfile={font}:textfile={tf}:expansion=none:"
+        "fontcolor=white:fontsize=40:"
+        "box=1:boxcolor=black@0.55:boxborderw=12:x=(w-text_w)/2:y=30:"
+        "enable='lt(t,3.0)'".format(
+            font=encoder_mod._escape_drawtext(font),
+            tf=encoder_mod._escape_drawtext(path),
+        )
+    )
+
+
+@requires_ffmpeg
+@pytest.mark.parametrize("title", _DRAWTEXT_CASES)
+def test_a_title_renders_exactly_as_typed(title, tmp_path):
+    font = encoder_mod._find_font()
+    if font is None:
+        pytest.skip("no usable font on this host")
+
+    ours, our_err = _render_gray(encoder_mod._build_drawtext_filter(title=title))
+    assert ours is not None, "ffmpeg rejected the filter for {!r}: {}".format(
+        title, our_err
+    )
+
+    want, ref_err = _render_gray(
+        _reference_vf(title, str(tmp_path / "ref.txt"), font)
+    )
+    assert want is not None, "the reference render failed: " + ref_err
+
+    # Blank-vs-blank would compare equal and prove nothing — that is how
+    # the percent bug hid behind the apostrophe one.
+    assert (want > 40).sum() > 0, "the reference rendered nothing for {!r}".format(title)
+    assert numpy.array_equal(ours, want), (
+        "{!r} does not render as typed: {} lit pixels vs {} in the reference"
+        .format(title, int((ours > 40).sum()), int((want > 40).sum()))
+    )
+
+
+def test_an_apostrophe_is_closed_escaped_and_reopened():
+    """The only encoding that survives both unescaping passes."""
+    quoted = encoder_mod._quote_drawtext_text("Don't")
+    assert quoted == "'Don'" + "\\" * 3 + "''t'"
+    # and the plain backslash-escape that used to be emitted is not it
+    assert "\\'t" not in quoted.replace("\\" * 3 + "'", "")
+
+
+def test_the_other_specials_keep_their_single_backslash():
+    q = encoder_mod._quote_drawtext_text
+    assert q("a:b") == "'a\\:b'"
+    assert q("100%") == "'100\\%'"
+    assert q("a\\b") == "'a\\\\b'"
+    # commas and brackets need nothing — the quotes already cover them
+    assert q("a,b[c]") == "'a,b[c]'"
+
+
+def test_every_drawtext_filter_disables_expansion(tmp_path):
+    """A % anywhere in the text blanks the whole render without this.
+
+    The font is passed explicitly: both builders return None when they
+    cannot find one, and a runner without DejaVu installed would turn
+    this assertion into an AttributeError rather than a useful failure.
+    """
+    font = tmp_path / "fake.ttf"
+    font.write_bytes(b"")
+    vf = encoder_mod._build_drawtext_filter(
+        title="t", overlay_text="o", font_path=str(font)
+    )
+    assert vf.count("expansion=none") == 2, vf
+    chain = subtitles_mod.build_subtitle_filters(
+        [Subtitle(text="hello", start=0.0, end=1.0)],
+        SubtitleStyle(font_path=str(font)),
+    )
+    assert "expansion=none" in chain, chain
+
+
+@requires_ffmpeg
+def test_a_subtitle_renders_its_apostrophe(tmp_path):
+    """subtitles.py builds its own drawtext chain and shared the bug."""
+    font = encoder_mod._find_font()
+    if font is None:
+        pytest.skip("no usable font on this host")
+    style = SubtitleStyle(font_path=font)
+    chain = subtitles_mod.build_subtitle_filters(
+        [Subtitle(text="don't stop", start=0.0, end=5.0)], style
+    )
+    got, err = _render_gray(chain)
+    assert got is not None, "ffmpeg rejected the subtitle chain: " + err
+    plain = subtitles_mod.build_subtitle_filters(
+        [Subtitle(text="dont stop", start=0.0, end=5.0)], style
+    )
+    bare, _ = _render_gray(plain)
+    assert bare is not None
+    # The apostrophe has to actually be drawn — dropping it silently was
+    # the original symptom, and that renders the same as "dont stop".
+    assert not numpy.array_equal(got, bare), "the apostrophe was dropped"
