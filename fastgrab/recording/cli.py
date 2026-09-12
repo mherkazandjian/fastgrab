@@ -327,6 +327,28 @@ def _missing_output(output):
 
 
 def main(argv=None):
+    """Entry point for ``fastgrab-record``.
+
+    Only job beyond calling :func:`_main` is to keep a Ctrl-C from ending
+    the command with a traceback. The recording loop installs its own
+    SIGINT handler, but everything before that -- imports, argument
+    parsing, the interactive region selector, the config dialog -- runs
+    under Python's default one, and there a Ctrl-C raises. Aborting is
+    the right response; the traceback is only noise. Deliberately not
+    solved by installing the handler sooner: that would swap the noise
+    for a setup phase that ignores Ctrl-C, which is worse.
+    """
+    try:
+        return _main(argv)
+    except KeyboardInterrupt:
+        # 130 is the shell's conventional status for a program ended by
+        # SIGINT, and what bash reports for a child killed by one, so
+        # scripts see no change from the previous behaviour.
+        print("fastgrab: interrupted", file=sys.stderr)
+        return 130
+
+
+def _main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -395,11 +417,17 @@ def main(argv=None):
     def _on_signal(_signum, _frame):
         stop_event.set()
 
-    signal.signal(signal.SIGINT, _on_signal)
-    signal.signal(signal.SIGTERM, _on_signal)
+    # Restored once recording is over. Left installed, they would swallow
+    # a Ctrl-C during the summary below -- setting an event nothing reads
+    # any more, so the command could not be interrupted at all -- and
+    # main() is importable and reachable as a library call, which has no
+    # business permanently changing the process's signal disposition.
+    previous_handlers = {}
 
     progress_cb = None
     try:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous_handlers[signum] = signal.signal(signum, _on_signal)
         if args.gui:
             # Launched from a hotkey there's no terminal to print to, so
             # show a small window with the live frame count. It stays open
@@ -422,6 +450,9 @@ def main(argv=None):
             sys.stdout.write("\n")
         print("error: {}".format(exc), file=sys.stderr)
         return 1
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
 
     if progress_cb is not None:
         # Close off the in-place status line so the summary starts fresh.
