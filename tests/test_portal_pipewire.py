@@ -305,9 +305,21 @@ def test_an_idle_stream_answers_without_waiting_out_the_timeout(node_id):
     seconds.
     """
     reader = PipeWireVideoReader(node_id, timeout=5.0)
+
+    def idle(deadline_ns):
+        """Behave like a real appsink with nothing queued.
+
+        A stand-in that returns None immediately whatever it is handed
+        cannot observe this bug at all -- it would report a fast read
+        even from code that asked to block for five seconds. Honouring
+        the deadline is the whole point of the stand-in.
+        """
+        time.sleep(deadline_ns / 1e9)
+        return None
+
     try:
         reader.read()
-        reader._sink.try_pull_sample = lambda _ns: None
+        reader._sink.try_pull_sample = idle
         started = time.monotonic()
         reader.read()
         elapsed = time.monotonic() - started
