@@ -8,6 +8,7 @@ inside ``docker compose run --rm test``.
 import argparse
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -1330,3 +1331,110 @@ def test_a_missing_file_url_target_is_reported_by_its_real_path(
     assert rc == 1
     assert str(out) in captured.err
     assert "file:" not in captured.err, "report the path ffmpeg writes, not the URL"
+
+
+# -------- Ctrl-C outside the recording loop --------
+#
+# The loop installs its own SIGINT handler so a stop finalises the
+# container. Everything around it did not behave:
+#
+#   * before the handler is installed — argument parsing, the region
+#     selector, the config dialog — Ctrl-C ended the command with a bare
+#     KeyboardInterrupt traceback. The selector is the case that matters:
+#     it can sit open for as long as the user takes to drag a box.
+#     (One window stays: the ~0.22s of module import, measured, which
+#     happens before main() is called and so before any code here can
+#     catch anything. A SIGINT at 0.2s still ends in a traceback; at 0.6s
+#     it does not.)
+#   * after record() returns, the handler was still installed, so a
+#     Ctrl-C during the summary set an event nothing reads any more and
+#     the command could not be interrupted at all.
+#   * main() is importable and reachable as a library call, and it left
+#     the process's signal disposition permanently changed.
+#
+# Installing the handler earlier would fix only the first, and would buy
+# it by making the interactive setup ignore Ctrl-C, which is worse.
+
+
+def test_an_interrupt_before_recording_exits_cleanly(monkeypatch, tmp_path, capsys):
+    """No traceback, and the shell's conventional status for SIGINT."""
+
+    def interrupted(**kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(recording_cli, "Recorder", interrupted)
+    try:
+        rc = recording_cli.main(
+            ["--region", "0,0,64,48", "-o", str(tmp_path / "out.mp4")]
+        )
+    except KeyboardInterrupt:
+        # Caught here on purpose. pytest treats a KeyboardInterrupt as a
+        # request to abandon the session, so letting one escape would
+        # abort the whole run at whatever point this test happens to sit
+        # rather than reporting which behaviour regressed.
+        pytest.fail("main() let the KeyboardInterrupt escape to the caller")
+    captured = capsys.readouterr()
+    assert rc == 130, "130 is what bash reports for a child killed by SIGINT"
+    assert "fastgrab: interrupted" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_the_signal_handlers_are_restored_after_recording(monkeypatch, tmp_path):
+    """Left installed, they swallow a Ctrl-C during the summary."""
+    out = tmp_path / "out.mp4"
+    out.write_bytes(b"x")
+    before = (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM))
+
+    rc = _run_cli_with(monkeypatch, _stats(out, frames=5, written=5), tmp_path)
+
+    assert rc == 0
+    assert (signal.getsignal(signal.SIGINT),
+            signal.getsignal(signal.SIGTERM)) == before
+
+
+def test_the_signal_handlers_are_restored_when_recording_fails(
+    monkeypatch, tmp_path
+):
+    """The restore has to survive the error path too."""
+    before = (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM))
+
+    class _Failing:
+        def record(self, **kwargs):
+            raise RuntimeError("ffmpeg fell over")
+
+    monkeypatch.setattr(recording_cli, "Recorder", lambda **kw: _Failing())
+    rc = recording_cli.main(
+        ["--region", "0,0,64,48", "-o", str(tmp_path / "out.mp4")]
+    )
+
+    assert rc == 1
+    assert (signal.getsignal(signal.SIGINT),
+            signal.getsignal(signal.SIGTERM)) == before
+
+
+def test_the_handler_is_installed_while_recording(monkeypatch, tmp_path):
+    """The restore must not undo the thing it is restoring around.
+
+    A Ctrl-C mid-recording still has to set the stop event rather than
+    raise, or ffmpeg loses the chance to write its trailer.
+    """
+    out = tmp_path / "out.mp4"
+    out.write_bytes(b"x")
+    seen = {}
+
+    class _Watching:
+        def record(self, stop_event=None, **kwargs):
+            seen["handler"] = signal.getsignal(signal.SIGINT)
+            seen["default"] = signal.default_int_handler
+            # what a real SIGINT would do at this moment
+            seen["handler"](signal.SIGINT, None)
+            seen["stopped"] = stop_event.is_set()
+            return _stats(out, frames=5, written=5)
+
+    monkeypatch.setattr(recording_cli, "Recorder", lambda **kw: _Watching())
+    rc = recording_cli.main(
+        ["--region", "0,0,64,48", "-o", str(out)]
+    )
+    assert rc == 0
+    assert seen["handler"] is not seen["default"], "the loop ran unprotected"
+    assert seen["stopped"], "a Ctrl-C mid-recording did not ask it to stop"
