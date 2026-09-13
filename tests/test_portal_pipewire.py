@@ -248,10 +248,15 @@ def test_a_padded_row_stride_is_honoured(node_id):
     because whether this fixture ever produces one is not something the
     test should depend on.
     """
+    # Through the module's own helper, which calls Gst.init(). Relying
+    # on an earlier test having done it makes this pass in the suite and
+    # segfault when run alone -- Gst.Caps.from_string() on an
+    # uninitialised GStreamer takes the interpreter with it.
+    from fastgrab.backends._pipewire import _require_gst
+    Gst = _require_gst()
     import gi
-    gi.require_version("Gst", "1.0")
     gi.require_version("GstVideo", "1.0")
-    from gi.repository import Gst, GstVideo
+    from gi.repository import GstVideo
 
     width, height = 7, 3
     stride = width * 4 + 20          # 20 bytes of padding per row
@@ -416,14 +421,14 @@ def test_a_frame_does_not_alias_the_gstreamer_buffer(node_id):
     Written against a buffer this test still owns, so it can be
     overwritten afterwards and the frame checked against what it was.
     """
-    import gi
-    gi.require_version("Gst", "1.0")
-    from gi.repository import Gst
+    from fastgrab.backends._pipewire import _require_gst
+    Gst = _require_gst()
 
     width, height = 4, 2                 # tightly packed: stride == 16
     raw = bytes(bytearray(range(width * height * 4)))
-    buffer = Gst.Buffer.new_allocate(None, len(raw), None)
-    buffer.fill(0, raw)
+    # new_wrapped, not new_allocate: passing None for the allocator and
+    # params segfaults this gst-python outright.
+    buffer = Gst.Buffer.new_wrapped(raw)
     caps = Gst.Caps.from_string(
         "video/x-raw,format=BGRx,width=%d,height=%d" % (width, height))
     sample = Gst.Sample.new(buffer, caps, None, None)
@@ -433,18 +438,24 @@ def test_a_frame_does_not_alias_the_gstreamer_buffer(node_id):
         reader.start()
         reader._sink.try_pull_sample = lambda _ns: sample
         frame = reader.read()
-        was = frame.copy()
-        # What GStreamer does next with a buffer it has taken back.
-        buffer.fill(0, b"\xff" * len(raw))
     finally:
         reader.close()
 
-    assert numpy.array_equal(frame, was), (
-        "the frame changed when the GStreamer buffer was refilled, so "
-        "it was a view over borrowed memory rather than a copy"
+    # Ownership is the whole question: ascontiguousarray() on an
+    # already-contiguous strided view returns that view unchanged, so
+    # the result's base is the borrowed mapping -- which read() unmaps
+    # before returning and GStreamer then refills.
+    #
+    # Asserted this way rather than by overwriting the buffer and
+    # comparing: a new_wrapped buffer is not writable, so gst_buffer_fill
+    # is refused and the comparison can never fail. An assertion that
+    # cannot fail reads as coverage without being any.
+    assert frame.base is None or frame.base.flags.owndata, (
+        "the frame is a view over the mapped GStreamer buffer, which is "
+        "unmapped and handed back to be refilled the moment read() "
+        "returns"
     )
-    assert not (frame == 0xFF).all()
-
+    assert frame.shape == (height, width, 4)
 
 def test_close_is_idempotent(node_id):
     reader = PipeWireVideoReader(node_id)
