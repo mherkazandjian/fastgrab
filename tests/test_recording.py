@@ -295,21 +295,20 @@ def test_build_subtitle_filters_empty_and_fontless(monkeypatch):
     assert subtitles_mod.build_subtitle_filters(subs) is None
 
 
-def test_font_path_is_escaped_in_drawtext():
-    # A ':' inside the font path would be read as an option separator by
-    # the filter parser, so it has to be escaped like the text is. The
-    # path is synthetic (explicit font_path= skips the existence check)
-    # because ':' is not a legal filename character on Windows.
-    font = "/fonts:odd/fake.ttf"
-    escaped = "/fonts\\:odd/fake.ttf"
+def test_font_path_is_escaped_as_a_filter_value(tmp_path, monkeypatch):
+    """A font path is an option value, not drawtext text.
 
-    vf = encoder_mod._build_drawtext_filter(title="t", font_path=font)
-    assert "fontfile=" + escaped + ":" in vf
-    assert "fontfile=" + font + ":" not in vf
-
-    subs = [Subtitle(text="x", start=0.0, end=1.0)]
-    vf = subtitles_mod.build_subtitle_filters(subs, SubtitleStyle(font_path=font))
-    assert "fontfile=" + escaped + ":" in vf
+    Escaped the old way -- the same single pass used for text -- a path
+    containing an apostrophe, colon, comma or bracket made ffmpeg reject
+    the whole filtergraph, and one containing a backslash rendered
+    different pixels. Escaping for both of ffmpeg's parse passes fixes
+    all five; see test_a_font_path_with_awkward_characters_still_renders.
+    """
+    fake_font = tmp_path / "fake.ttf"
+    fake_font.write_bytes(b"")
+    monkeypatch.setenv("FASTGRAB_FONT", str(fake_font))
+    vf = encoder_mod._build_drawtext_filter(title="hi")
+    assert "fontfile=" + encoder_mod._escape_filter_path(str(fake_font)) in vf
 
 
 def test_encoder_argv_includes_subtitles(tmp_path, monkeypatch):
@@ -1937,3 +1936,39 @@ def test_the_temporary_script_goes_away_when_start_fails(tmp_path):
         enc.start()
     assert enc._ass_path is None
     assert enc._stderr_file is None
+
+
+@requires_ffmpeg
+@pytest.mark.parametrize("name", ["it's.ttf", "a:b.ttf", "a,b.ttf",
+                                  "a[b].ttf", "a\\b.ttf"])
+def test_a_font_path_with_awkward_characters_still_renders(name, tmp_path):
+    """The real oracle: the same font under an awkward name must render
+    identically to the same font under a plain one.
+
+    Measured before the fix: apostrophe, colon, comma and bracket each
+    made ffmpeg reject the filtergraph outright, and backslash produced
+    1191 lit pixels against the reference's 1920.
+    """
+    base = encoder_mod._find_font()
+    if base is None:
+        pytest.skip("no usable font on this host")
+
+    reference, err = _render_gray(
+        encoder_mod._build_drawtext_filter(title="Demo", font_path=base)
+    )
+    assert reference is not None, err
+    assert (reference > 40).sum() > 0, "the reference rendered nothing"
+
+    awkward = tmp_path / name
+    shutil.copy(base, awkward)
+    got, err = _render_gray(
+        encoder_mod._build_drawtext_filter(title="Demo", font_path=str(awkward))
+    )
+    assert got is not None, "ffmpeg rejected the filter for {!r}: {}".format(
+        name, err
+    )
+    assert numpy.array_equal(got, reference), (
+        "{!r} rendered differently: {} lit pixels vs {}".format(
+            name, int((got > 40).sum()), int((reference > 40).sum())
+        )
+    )

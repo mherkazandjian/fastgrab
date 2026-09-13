@@ -155,6 +155,24 @@ def _escape_filter_value(value: str) -> str:
     return "".join(out)
 
 
+def _escape_filter_path(path: str) -> str:
+    """Escape a filesystem path for use as a filter option value.
+
+    Twice, for the two unescaping passes described in
+    :func:`_escape_filter_value`. Measured against a plain path, with the
+    same font copied to each awkward name: escaped once, a path
+    containing an apostrophe, a colon, a comma or a bracket makes ffmpeg
+    reject the whole filtergraph, and one containing a backslash renders
+    visibly different pixels. Escaped twice, all five reproduce the plain
+    path exactly.
+
+    This is why a font path must not go through
+    :func:`_quote_drawtext_text`: that is for the quoted ``text=`` field,
+    and a path is an unquoted option value with different rules.
+    """
+    return _escape_filter_value(_escape_filter_value(path))
+
+
 def _quote_drawtext_text(text: str) -> str:
     """Render ``text`` as a complete, quoted drawtext ``text=`` value.
 
@@ -212,10 +230,9 @@ def _build_drawtext_filter(title: str = None, overlay_text: str = None,
     font = font_path or _find_font()
     if font is None:
         return None
-    # The font path goes into the same filter string as the text, so it
-    # needs the same escaping — an unescaped ':' (Windows drive letters)
-    # would be parsed as a filter-option separator.
-    font = _escape_drawtext(font)
+    # A path is an option value, not text: escaped for both parse passes
+    # rather than through the text quoter. See _escape_filter_path.
+    font = _escape_filter_path(font)
     parts = []
     if title:
         parts.append(

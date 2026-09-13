@@ -34,6 +34,7 @@ from dataclasses import dataclass
 
 from .encoder import (
     _escape_drawtext,
+    _escape_filter_path,
     _escape_filter_value,
     _find_font,
     _quote_drawtext_text,
@@ -107,9 +108,9 @@ def build_subtitle_filters(subtitles, style=None) -> "str | None":
     font = style.font_path or _find_font()
     if font is None:
         return None
-    # Same parser as the text — a ':' in the path (e.g. Windows drive
-    # letters) would break the filter string if left unescaped.
-    font = _escape_drawtext(font)
+    # A path is an option value, not text: escaped for both of ffmpeg's
+    # parse passes. See _escape_filter_path.
+    font = _escape_filter_path(font)
     if style.position == "bottom":
         xy = "x=(w-text_w)/2:y=h-text_h-40"
     else:
