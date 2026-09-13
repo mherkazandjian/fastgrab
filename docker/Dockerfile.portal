@@ -40,10 +40,14 @@ RUN apt-get update && apt-get install -y \
         xdg-desktop-portal \
     && rm -rf /var/lib/apt/lists/*
 
+# The PyGObject bound mirrors pyproject.toml's [portal] extra, so this
+# image tests what `pip install fastgrab[portal]` actually resolves to.
+# 3.51+ needs girepository-2.0, which libgirepository1.0-dev above does
+# not provide; see the comment on the dependency for when to lift it.
 RUN pip install --no-cache-dir \
         numpy \
         pytest \
-        "PyGObject<3.51"
+        "PyGObject>=3.42,<3.51"
 
 WORKDIR /app
 

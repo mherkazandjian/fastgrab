@@ -248,7 +248,10 @@ Per-platform extras:
    ``gstreamer1-plugin-pipewire``, ``python3-gobject``) — untested here.
    If pip has to *build* PyGObject rather than reuse a distro
    ``python3-gi``, it also needs ``libgirepository1.0-dev``,
-   ``libcairo2-dev``, ``pkg-config`` and a C toolchain.
+   ``libcairo2-dev``, ``pkg-config`` and a C toolchain. The extra pins
+   PyGObject below 3.51 for that reason: from 3.51 it wants
+   ``girepository-2.0``, which ``libgirepository1.0-dev`` does not
+   provide and which only reaches Debian in trixie.
 
    **This path asks your permission.** The desktop shows its own
    screen-share chooser the first time a ``Screenshot`` captures, and the
