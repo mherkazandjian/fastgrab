@@ -354,3 +354,75 @@ def test_capture_reallocates_buffer_when_size_changes():
     img2 = grab.capture(bbox=(0, 0, bw2, bh2))
     assert img1 is not img2
     assert img2.shape == (bh2, bw2, 4)
+
+
+# -------- close() and the context manager --------
+#
+# The resources at stake are per-backend (a wlr SHM buffer, a Windows
+# DIBSection and its memory DC), so what they actually free is asserted
+# in tests/test_integration_wlr.py and tests/test_windows_backend.py.
+# These cover the contract every platform shares.
+
+def test_close_is_idempotent():
+    grab = screenshot.Screenshot()
+    grab.capture((0, 0, 2, 2))
+    grab.close()
+    grab.close()
+
+
+def test_close_releases_the_image_buffer():
+    """The numpy buffer is the one resource Screenshot owns directly."""
+    grab = screenshot.Screenshot()
+    grab.capture((0, 0, 2, 2))
+    assert grab._img is not None
+    grab.close()
+    assert grab._img is None
+
+
+def test_capture_after_close_raises():
+    """Refusing beats the alternative on Windows.
+
+    A closed backend has deleted the memory DC its BitBlt targets, and
+    blitting through a freed GDI handle is undefined rather than an
+    error. Every backend refuses uniformly so the behaviour does not
+    depend on which one was autodetected.
+    """
+    grab = screenshot.Screenshot()
+    grab.capture((0, 0, 2, 2))
+    grab.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        grab.capture((0, 0, 2, 2))
+
+
+def test_context_manager_yields_the_instance_and_closes_it():
+    with screenshot.Screenshot() as grab:
+        img = grab.capture((0, 0, 2, 2))
+        assert img.shape == (2, 2, 4)
+    assert grab._closed is True
+
+
+def test_context_manager_closes_on_an_exception():
+    """A capture that raises must still release the frame buffer."""
+    boom = RuntimeError("caller blew up")
+    try:
+        with screenshot.Screenshot() as grab:
+            raise boom
+    except RuntimeError as exc:
+        assert exc is boom
+    assert grab._closed is True
+
+
+def test_a_closed_screenshot_does_not_close_a_new_one():
+    """Backends share process-wide state; closing must stay per instance.
+
+    The wlr backend's display connection is a process-wide singleton, so
+    an over-broad close would take out every future instance too. This is
+    the cheap check that it does not.
+    """
+    first = screenshot.Screenshot()
+    first.capture((0, 0, 2, 2))
+    first.close()
+
+    second = screenshot.Screenshot()
+    assert second.capture((0, 0, 2, 2)).shape == (2, 2, 4)
+    second.close()

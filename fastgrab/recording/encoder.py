@@ -111,11 +111,12 @@ def infer_codec(path: str) -> str:
 
 
 def _escape_drawtext(text: str) -> str:
-    """Escape user text for ffmpeg's drawtext text= field.
+    """Escape a value for an *unquoted* drawtext option — a path, say.
 
-    ffmpeg's filter parser splits on ``:`` and treats ``\\`` and ``'``
-    specially. We rewrite the four characters that actually break the
-    parse and leave the rest alone.
+    ffmpeg's filter parser splits options on ``:`` and treats ``\\`` and
+    ``'`` specially, so those are backslash-escaped here. Use
+    :func:`_quote_drawtext_text` for anything going into ``text=``, which
+    is quoted and follows different rules.
     """
     out = []
     for ch in text:
@@ -154,6 +155,48 @@ def _escape_filter_value(value: str) -> str:
     return "".join(out)
 
 
+def _quote_drawtext_text(text: str) -> str:
+    """Render ``text`` as a complete, quoted drawtext ``text=`` value.
+
+    An apostrophe cannot simply be backslash-escaped here. A filter
+    option inside a filtergraph is unescaped *twice* — once when the
+    graph is split into filters, once when a filter's arguments are
+    split — and a single-quoted section has no escape mechanism at all;
+    it ends at the next quote. ``\\'`` therefore does not survive: it is
+    consumed on the way in and the apostrophe is silently dropped, so
+    ``--title "Don't stop"`` rendered "Dont stop", and with the trailing
+    ``enable=`` option present the stray quote ran the parse off the end
+    and ffmpeg rejected the whole filtergraph with "Filter not found" —
+    no recording at all.
+
+    What works is to close the quote, emit the apostrophe escaped for
+    both levels, and reopen: ``'\\\''``. That was not deduced from the
+    documentation but measured — every candidate was rendered and
+    compared pixel-for-pixel against the same text supplied through
+    ``textfile=``, which takes its content verbatim and so is ground
+    truth. Of the encodings tried it is the only one that reproduces the
+    reference.
+
+    The single backslash used for ``:``, ``\\`` and ``%`` was checked the
+    same way and does reproduce the reference, so it stays. Commas,
+    brackets and semicolons need nothing: the surrounding quotes already
+    protect them from the filtergraph splitter.
+    """
+    # Spelled out rather than written as one literal: the
+    # sequence is quote, three backslashes, quote, quote, and a
+    # nested escape of that is very easy to miscount.
+    apostrophe = "'" + "\\" * 3 + "''"
+    out = []
+    for ch in text:
+        if ch == "'":
+            out.append(apostrophe)
+        elif ch in ("\\", ":", "%"):
+            out.append("\\" + ch)
+        else:
+            out.append(ch)
+    return "'" + "".join(out) + "'"
+
+
 def _build_drawtext_filter(title: str = None, overlay_text: str = None,
                            title_seconds: float = 3.0,
                            font_path: str = None) -> str:
@@ -176,24 +219,24 @@ def _build_drawtext_filter(title: str = None, overlay_text: str = None,
     parts = []
     if title:
         parts.append(
-            "drawtext=fontfile={font}:text='{text}':"
+            "drawtext=fontfile={font}:text={text}:expansion=none:"
             "fontcolor=white:fontsize=40:"
             "box=1:boxcolor=black@0.55:boxborderw=12:"
             "x=(w-text_w)/2:y=30:"
             "enable='lt(t,{secs})'".format(
                 font=font,
-                text=_escape_drawtext(title),
+                text=_quote_drawtext_text(title),
                 secs=title_seconds,
             )
         )
     if overlay_text:
         parts.append(
-            "drawtext=fontfile={font}:text='{text}':"
+            "drawtext=fontfile={font}:text={text}:expansion=none:"
             "fontcolor=white@0.85:fontsize=22:"
             "box=1:boxcolor=black@0.4:boxborderw=6:"
             "x=w-text_w-20:y=20".format(
                 font=font,
-                text=_escape_drawtext(overlay_text),
+                text=_quote_drawtext_text(overlay_text),
             )
         )
     return ",".join(parts)
@@ -213,7 +256,14 @@ def _ffmpeg_args(codec: str, width: int, height: int, fps: int, output: str,
         "-loglevel", "error",
         "-f", "rawvideo",
         "-vcodec", "rawvideo",
-        "-pix_fmt", "bgra",
+        # bgr0, not bgra: the fourth byte of a fastgrab frame is unused
+        # padding, not transparency (X11's XGetImage leaves it zero on a
+        # 24-bit visual). Describing it as bgra told ffmpeg every pixel
+        # was fully transparent, which mp4/webm ignore -- they force
+        # yuv420p -- but GIF does not: paletteuse treats alpha below its
+        # default threshold of 128 as transparent, so every recorded GIF
+        # came out completely invisible.
+        "-pix_fmt", "bgr0",
         "-s", "{}x{}".format(width, height),
         "-r", str(fps),
         "-i", "-",
@@ -252,6 +302,43 @@ def _ffmpeg_args(codec: str, width: int, height: int, fps: int, output: str,
     else:
         raise ValueError("unknown codec {!r}".format(codec))
     return common_in + out
+
+
+# Said instead of trailing an empty string off the end of an error. With
+# -loglevel error a clean run writes nothing, so silence is expected and
+# worth stating rather than leaving the reader wondering whether the
+# message was truncated.
+_NO_STDERR = "(ffmpeg wrote nothing to stderr)"
+
+
+def _local_output_path(target: str) -> "str | None":
+    """The filesystem path ffmpeg will write, or ``None`` if it is not a file.
+
+    ffmpeg accepts protocol URLs as outputs, so the configured string is
+    not always a path. ``file:`` names a local path with the prefix
+    stripped -- it exists precisely so a name containing a colon, or one
+    starting with a dash, can be given unambiguously. Anything else
+    carrying a scheme is somewhere else entirely.
+
+    The scheme test allows the ``+`` of composed protocols such as
+    ``crypto+file:``, and treats a single letter as a Windows drive
+    rather than a protocol.
+    """
+    if target.startswith("file:"):
+        return target[len("file:"):]
+    head = target.split(":", 1)[0]
+    if ":" in target and len(head) > 1 and all(
+            ch.isalnum() or ch in "+-." for ch in head):
+        return None
+    return target
+
+
+def _same_file(left: str, right: str) -> bool:
+    """Whether two paths name the same file, existing or not."""
+    try:
+        return os.path.samefile(left, right)
+    except OSError:
+        return os.path.realpath(left) == os.path.realpath(right)
 
 
 class FfmpegEncoder:
@@ -299,19 +386,49 @@ class FfmpegEncoder:
         self.subtitle_style = subtitle_style
         self.subtitle_backend = validate_subtitle_backend(subtitle_backend)
         self.subtitle_sidecar = subtitle_sidecar
+        if subtitle_sidecar:
+            local = _local_output_path(subtitle_sidecar)
+            if local is None:
+                raise ValueError(
+                    "the subtitle sidecar must be a local path, got "
+                    "{!r}".format(subtitle_sidecar)
+                )
+            target = _local_output_path(output_path)
+            if target is not None and _same_file(local, target):
+                raise ValueError(
+                    "the subtitle sidecar {!r} is the recording's own "
+                    "output file; writing the script there would destroy "
+                    "it".format(subtitle_sidecar)
+                )
+            if not subtitles:
+                raise ValueError(
+                    "a subtitle sidecar was requested but no subtitles "
+                    "were given, so there would be nothing to write"
+                )
         self._proc = None
         # Temporary ASS script to delete on close(); a caller-supplied
         # sidecar is never recorded here, because it is theirs to keep.
         self._ass_path = None
+        self._stderr_file = None
+        # The script to publish as the caller's sidecar, kept from start()
+        # so close() can write it only once the encode has succeeded.
+        self._sidecar_document = None
 
-    def _build_argv(self):
+    def _build_argv(self, ass_path=None):
+        """The ffmpeg command line. Pure — this writes nothing.
+
+        ``ass_path`` is the script :meth:`start` has already written, when
+        the ass backend is in use. Building argv used to write it, which
+        meant merely inspecting the command line truncated whatever the
+        caller had named as a sidecar.
+        """
         vf = _build_drawtext_filter(
             title=self.title,
             overlay_text=self.overlay_text,
             title_seconds=self.title_seconds,
             font_path=self.font_path,
         )
-        sub_vf = self._build_subtitle_filter()
+        sub_vf = self._build_subtitle_filter(ass_path)
         if sub_vf:
             vf = "{},{}".format(vf, sub_vf) if vf else sub_vf
         return _ffmpeg_args(
@@ -319,59 +436,101 @@ class FfmpegEncoder:
             vf_extra=vf,
         )
 
-    def _build_subtitle_filter(self):
-        """Render the subtitles, writing the ASS script when one is needed.
+    def ass_document(self):
+        """The ASS script this configuration needs, or ``None``.
 
-        Returns the filter string to append to ``-vf``, or ``None``. The
-        ASS document is built whenever the ``ass`` backend is selected
-        *or* a sidecar was requested, so ``subtitle_sidecar`` can be
-        combined with burned-in drawtext.
+        Built whenever the ``ass`` backend is selected *or* a sidecar was
+        asked for, so a sidecar can be exported while drawtext does the
+        burning in.
         """
         if not self.subtitles:
             return None
-        # Imported here to keep the module cycle (subtitles reuses
-        # helpers from this module) one-directional at import time.
-        from .subtitles import (
-            ass_fonts_dir, build_ass_document, build_ass_filter,
-            build_subtitle_filters,
+        if self.subtitle_backend != "ass" and not self.subtitle_sidecar:
+            return None
+        from .subtitles import build_ass_document
+        return build_ass_document(
+            self.subtitles, self.subtitle_style,
+            width=self.width, height=self.height,
         )
-        burn_ass = self.subtitle_backend == "ass"
-        path = None
-        if burn_ass or self.subtitle_sidecar:
-            path = self._write_ass(
-                build_ass_document(
-                    self.subtitles, self.subtitle_style,
-                    width=self.width, height=self.height,
-                )
-            )
-        if not burn_ass:
+
+    def _build_subtitle_filter(self, ass_path=None):
+        """The ``-vf`` fragment for subtitles, or ``None``."""
+        if not self.subtitles:
+            return None
+        from .subtitles import (
+            ass_fonts_dir, build_ass_filter, build_subtitle_filters,
+        )
+        if self.subtitle_backend != "ass":
             return build_subtitle_filters(self.subtitles, self.subtitle_style)
+        if ass_path is None:
+            raise RuntimeError(
+                "the ass backend needs its script written before the "
+                "command line is built"
+            )
         return build_ass_filter(
-            path, fontsdir=ass_fonts_dir(self.subtitle_style)
+            ass_path, fontsdir=ass_fonts_dir(self.subtitle_style)
         )
 
     def _write_ass(self, document: str) -> str:
-        """Write ``document`` to the sidecar path or a temp file, return it."""
+        """Write ``document`` to a private temp file and return its path.
+
+        Always private, never the caller's sidecar. Two reasons, and the
+        second is not obvious:
+
+        * pointing ffmpeg at the sidecar meant this write truncated it,
+          and it happened while *building* the command line -- before any
+          capture, and with the default drawtext backend, so a mistyped
+          --subtitle-sidecar destroyed the named file for a recording
+          that never used ASS at all;
+        * ffmpeg opens the script lazily. Deleting it after Popen returns
+          but before the first frame still fails ASS initialisation, so a
+          successful Popen does not mean the script has been read. Two
+          recordings sharing a sidecar path could each consume the
+          other's.
+
+        The caller's sidecar is published from this same document once
+        the encode has succeeded -- see :meth:`_publish_sidecar`.
+        """
         self._cleanup_ass()
-        if self.subtitle_sidecar:
-            path = self.subtitle_sidecar
-            try:
-                with open(path, "w", encoding="utf-8") as fobj:
-                    fobj.write(document)
-            except OSError as exc:
-                # The sidecar path comes straight from the user, so give
-                # the CLI a message it can print instead of a traceback.
-                raise RuntimeError(
-                    "cannot write the subtitle sidecar {!r}: {}".format(
-                        path, exc
-                    )
-                ) from exc
-            return path
         handle, path = tempfile.mkstemp(prefix="fastgrab-", suffix=".ass")
         with os.fdopen(handle, "w", encoding="utf-8") as fobj:
             fobj.write(document)
         self._ass_path = path
         return path
+
+    def _publish_sidecar(self, document: str) -> None:
+        """Write the caller's sidecar, atomically, once encoding worked.
+
+        Staged through a temp file in the same directory and renamed, so
+        a failure part-way cannot leave the destination truncated: either
+        the old contents survive or the new ones are complete.
+        """
+        destination = _local_output_path(self.subtitle_sidecar)
+        folder = os.path.dirname(os.path.abspath(destination)) or "."
+        handle = None
+        staged = None
+        try:
+            handle, staged = tempfile.mkstemp(
+                prefix=".fastgrab-", suffix=".ass", dir=folder
+            )
+            with os.fdopen(handle, "w", encoding="utf-8") as fobj:
+                handle = None
+                fobj.write(document)
+            os.replace(staged, destination)
+            staged = None
+        except OSError as exc:
+            if handle is not None:
+                os.close(handle)
+            if staged is not None:
+                try:
+                    os.remove(staged)
+                except OSError:
+                    pass
+            raise RuntimeError(
+                "cannot write the subtitle sidecar {!r}: {}".format(
+                    self.subtitle_sidecar, exc
+                )
+            ) from exc
 
     def _cleanup_ass(self) -> None:
         """Delete the temporary ASS script, if we wrote one."""
@@ -392,17 +551,32 @@ class FfmpegEncoder:
                 "'apt-get install ffmpeg' or 'brew install ffmpeg') "
                 "to use fastgrab.recording"
             )
+        # stderr goes to a temp file, not a pipe. A pipe holds 64 KiB
+        # (F_GETPIPE_SZ on Linux) and nothing reads this one until
+        # close(), so an ffmpeg that filled it would block writing its
+        # own diagnostics -- and an ffmpeg blocked on stderr stops
+        # reading stdin, which blocks write_frame(), which is a hang with
+        # no timeout on either side. A file has no capacity to reach.
+        document = self.ass_document()
+        ass_path = self._write_ass(document) if document is not None else None
+        self._sidecar_document = document
+
+        self._stderr_file = tempfile.TemporaryFile()
         try:
-            argv = self._build_argv()
+            argv = self._build_argv(ass_path)
             self._proc = subprocess.Popen(
                 argv,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
+                stderr=self._stderr_file,
             )
         except Exception:
-            # Nothing will call close(), so drop the temporary ASS script
-            # here rather than leaving it in the system temp directory.
+            # close() never runs when start() fails, so both of these have
+            # to be released here: the stderr file, or a caller that
+            # retries leaks one per attempt, and the temporary ASS script,
+            # or it is left behind in the system temp directory.
+            self._stderr_file.close()
+            self._stderr_file = None
             self._cleanup_ass()
             raise
 
@@ -442,31 +616,88 @@ class FfmpegEncoder:
             self._cleanup_ass()
             return
         try:
-            if self._proc.stdin is not None:
-                self._proc.stdin.close()
-            rc = self._proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            self._proc.kill()
-            self._proc.wait()
-            raise RuntimeError("ffmpeg did not exit within {}s".format(timeout))
+            try:
+                if self._proc.stdin is not None:
+                    self._proc.stdin.close()
+            except BrokenPipeError:
+                # ffmpeg has already gone. Letting this out would report
+                # the broken pipe -- a symptom that names nothing -- and
+                # skip the exit status and stderr below, which say why it
+                # went. Fall through and let those do the talking.
+                pass
+            try:
+                rc = self._proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+                self._proc.wait()
+                # Drain before the finally closes the file. A hang is the
+                # case where ffmpeg's own words matter most and the one
+                # where they used to be dropped: the message named only
+                # the timeout, while the finally computed the stderr and
+                # then discarded it.
+                raise RuntimeError(
+                    "ffmpeg did not exit within {}s and was killed: {}".format(
+                        timeout, self._drain_stderr() or _NO_STDERR
+                    )
+                )
         finally:
             err = self._drain_stderr()
             self._proc = None
             # ffmpeg has exited, so libass is done with the script.
             self._cleanup_ass()
+            if self._stderr_file is not None:
+                self._stderr_file.close()
+                self._stderr_file = None
         if rc != 0:
             raise RuntimeError(
-                "ffmpeg exited with status {}: {}".format(rc, err)
+                "ffmpeg exited with status {}: {}".format(rc, err or _NO_STDERR)
             )
 
-    def _drain_stderr(self) -> str:
-        if self._proc is None or self._proc.stderr is None:
+        # Only now. A sidecar published before the encode ran would
+        # describe a recording that does not exist, and would already
+        # have replaced whatever was at that path.
+        document, self._sidecar_document = self._sidecar_document, None
+        if self.subtitle_sidecar and document is not None:
+            self._publish_sidecar(document)
+
+    def _drain_stderr(self, limit: int = 64 * 1024) -> str:
+        """Read what ffmpeg has written to stderr so far.
+
+        Reads the temp file rather than a pipe, so this never blocks and
+        can be called while ffmpeg is still running — which write_frame()
+        does, on a pipe that has just broken.
+
+        Positional reads, not seek()+read(): subprocess hands the child a
+        dup of this file's descriptor, and a dup shares the file
+        *description*, offset included. Seeking here would move where
+        ffmpeg's next write lands and scribble over its own log.
+
+        Only the tail is returned. The file is unbounded by design, and a
+        run that produced megabytes of diagnostics would otherwise put
+        all of it into an exception message; the last lines are the ones
+        that say why ffmpeg stopped.
+        """
+        handle = self._stderr_file
+        if handle is None:
             return ""
         try:
-            data = self._proc.stderr.read() or b""
+            fd = handle.fileno()
+            size = os.fstat(fd).st_size
+            start = max(0, size - limit)
+            if hasattr(os, "pread"):
+                data = os.pread(fd, size - start, start) or b""
+            else:
+                # No pread off Unix. Recording is X11-only, so this is a
+                # fallback for completeness rather than a supported path;
+                # the offset caveat above applies to it.
+                handle.seek(start)
+                data = handle.read() or b""
         except Exception:
             return ""
-        return data.decode("utf-8", errors="replace").strip()
+        text = data.decode("utf-8", errors="replace").strip()
+        if start:
+            text = "[...{} earlier bytes omitted...] {}".format(start, text)
+        return text
 
     def __enter__(self):
         self.start()

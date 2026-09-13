@@ -23,6 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         xdotool \
         procps \
         cage \
+        wlr-randr \
         libwayland-client0 \
         libwayland-dev \
         wayland-protocols \

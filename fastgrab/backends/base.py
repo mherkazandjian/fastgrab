@@ -25,25 +25,62 @@ backend honours it yet. Known gaps, so this docstring is not read as a
 promise the code keeps:
 
 * ``x11`` and ``macos`` honour it.
-* ``wlr`` honours it for full-output capture. Sub-region capture takes
-  the region in *logical* coordinates (a ``wlr-screencopy`` protocol
-  requirement), which matches device pixels only on an output that is
-  both unscaled and untransformed — wlroots applies the transform
-  before the scale, so a rotation transposes the frame even at scale 1.
-  The backend refuses a sub-region request on any other output rather
-  than returning the wrong one. See issue #38.
-* ``windows`` reports and captures in whatever DPI context the host
-  process happens to have. Windows virtualizes screen metrics for
-  DPI-unaware threads and ``BitBlt`` takes logical units, and neither
-  the backend nor CPython's manifest establishes per-monitor awareness,
-  so at a display scale other than 100% these are not physical pixels.
-  See issue #39.
+* ``wlr`` honours it. ``wlr-screencopy`` takes a sub-region in *logical*
+  coordinates, so the backend converts the device-pixel bbox through
+  the output's ``xdg_output`` logical size, rounds the region outward,
+  and crops the returned frame back to the exact bbox. One gap is left:
+  wlroots applies the output transform *before* the scale, so on a
+  rotated or flipped output the region lands on a transposed backing
+  store — the backend refuses a sub-region request there rather than
+  returning the wrong one. Full-output capture is unaffected either
+  way. See issue #38.
+* ``windows`` honours it on Windows 10 1607 and later, where the
+  backend temporarily gives its own thread per-monitor-v2 DPI
+  awareness around the metrics query, the screen-DC acquisition and
+  the blit, so neither the host process's DPI context nor the display
+  scale changes what it reports or captures. On older Windows
+  ``SetThreadDpiAwarenessContext`` does not exist; there the backend
+  falls back to the host's context and, at a display scale other than
+  100%, back to logical units. Primary monitor only in either case —
+  the desktop DC's origin is the primary monitor's top-left, and
+  reaching a second monitor at its own scale is the future
+  ``Screenshot(display=N)`` feature, not a DPI question.
 * ``portal`` is a placeholder that raises ``NotImplementedError``.
 """
 from abc import ABC, abstractmethod
 
 
 class BaseBackend(ABC):
+    _closed = False
+    """Set on the instance by :meth:`close`; a class attribute so that a
+    backend needs no ``__init__`` of its own to have one."""
+
+    def close(self):
+        """Release any OS resources this backend holds.
+
+        The default is a no-op, which is right for a backend that keeps
+        nothing between calls: ``x11`` shares one process-wide connection
+        owned by the C extension, and ``macos`` re-resolves the display
+        every time. A backend that allocates a frame buffer per instance
+        — ``wlr``'s SHM buffer, ``windows``' DIBSection — overrides this
+        and must also refuse to capture afterwards, because the handles
+        it would blit through are gone.
+
+        Closing is optional. Each such backend keeps its handles in a
+        small helper object carrying a :mod:`weakref` finalizer, so
+        dropping the backend frees them too; ``close`` only makes the
+        moment deterministic. It must be safe to call twice.
+        """
+        self._closed = True
+
+    def _check_open(self):
+        """Raise if :meth:`close` has already run."""
+        if self._closed:
+            raise RuntimeError(
+                "this backend has been closed; construct a new "
+                "Screenshot() rather than reusing a closed one"
+            )
+
     @abstractmethod
     def resolution(self):
         """Return ``(width, height)`` of the primary screen/output.

@@ -32,7 +32,12 @@ rather than all ~150 of them.
 import os
 from dataclasses import dataclass
 
-from .encoder import _escape_drawtext, _escape_filter_value, _find_font
+from .encoder import (
+    _escape_drawtext,
+    _escape_filter_value,
+    _find_font,
+    _quote_drawtext_text,
+)
 
 
 @dataclass
@@ -112,12 +117,12 @@ def build_subtitle_filters(subtitles, style=None) -> "str | None":
     parts = []
     for sub in subtitles:
         parts.append(
-            "drawtext=fontfile={font}:text='{text}':"
+            "drawtext=fontfile={font}:text={text}:expansion=none:"
             "fontcolor={color}:fontsize={size}:"
             "box=1:boxcolor={box}:boxborderw={border}:"
             "{xy}:enable='between(t,{start},{end})'".format(
                 font=font,
-                text=_escape_drawtext(sub.text),
+                text=_quote_drawtext_text(sub.text),
                 color=style.font_color,
                 size=style.font_size,
                 box=style.box_color,

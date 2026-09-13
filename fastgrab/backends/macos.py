@@ -20,6 +20,14 @@ and wlr. The bitmap-info bits are double-checked at runtime; an
 unexpected layout raises :class:`RuntimeError` with a clear message
 rather than silently scrambling channels.
 
+Getting the pixels *out* of the returned ``CGImage`` has two paths.
+Normally the image's data provider holds exactly its own rows, and they
+are read straight out of it. When it does not — the provider is allowed
+to be larger than ``bytesPerRow * height``, and on Apple Silicon a
+capture arrives padded out to the 16 KiB page — the image is redrawn
+into a bitmap context whose layout we chose, which is the only way to
+place the pixels without guessing. See :meth:`MacosBackend.screenshot`.
+
 **TCC permission caveat:** macOS 10.15+ requires the running app to
 have *Screen Recording* permission via System Settings → Privacy
 & Security. CI runners (``macos-latest``) typically have this granted
@@ -41,6 +49,14 @@ from .base import BaseBackend
 # CGImageAlphaInfo bits — keep in sync with CoreGraphics/CGImage.h
 _K_CG_BITMAP_BYTE_ORDER_MASK = 0x7000
 _K_CG_BITMAP_BYTE_ORDER_32_LITTLE = 2 << 12  # kCGBitmapByteOrder32Little
+_K_CG_IMAGE_ALPHA_PREMULTIPLIED_FIRST = 2  # kCGImageAlphaPremultipliedFirst
+
+# The layout we ask a bitmap context for: alpha "first" within the 32-bit
+# word, and 32-little reverses that word's bytes, so memory reads B, G,
+# R, A -- fastgrab's cross-platform contract. Screen captures are opaque,
+# so premultiplication is a no-op and only fixes the alpha byte at 255.
+_BGRA_BITMAP_INFO = (_K_CG_IMAGE_ALPHA_PREMULTIPLIED_FIRST
+                     | _K_CG_BITMAP_BYTE_ORDER_32_LITTLE)
 
 
 def _ceil_div(numerator, denominator):
@@ -143,6 +159,29 @@ def _load_frameworks():
     cg.CGDataProviderCopyData.argtypes = [ctypes.c_void_p]
     cg.CGDataProviderCopyData.restype = ctypes.c_void_p
 
+    # The redraw path (see MacosBackend._bitmap_copy).
+    cg.CGImageGetColorSpace.argtypes = [ctypes.c_void_p]
+    cg.CGImageGetColorSpace.restype = ctypes.c_void_p
+    cg.CGColorSpaceCreateDeviceRGB.argtypes = []
+    cg.CGColorSpaceCreateDeviceRGB.restype = ctypes.c_void_p
+    cg.CGColorSpaceRelease.argtypes = [ctypes.c_void_p]
+    cg.CGColorSpaceRelease.restype = None
+    cg.CGBitmapContextCreate.argtypes = [
+        ctypes.c_void_p,   # data
+        ctypes.c_size_t,   # width
+        ctypes.c_size_t,   # height
+        ctypes.c_size_t,   # bitsPerComponent
+        ctypes.c_size_t,   # bytesPerRow
+        ctypes.c_void_p,   # space
+        ctypes.c_uint32,   # bitmapInfo
+    ]
+    cg.CGBitmapContextCreate.restype = ctypes.c_void_p
+    cg.CGContextDrawImage.argtypes = [ctypes.c_void_p, CGRect,
+                                      ctypes.c_void_p]
+    cg.CGContextDrawImage.restype = None
+    cg.CGContextRelease.argtypes = [ctypes.c_void_p]
+    cg.CGContextRelease.restype = None
+
     # ----- CoreFoundation types -----
     cf.CFDataGetBytePtr.argtypes = [ctypes.c_void_p]
     cf.CFDataGetBytePtr.restype = ctypes.c_void_p
@@ -155,6 +194,23 @@ def _load_frameworks():
 
 
 class MacosBackend(BaseBackend):
+    # Class-level so a backend built without __init__ (the tests do this
+    # to bypass framework loading) still has them.
+    #
+    # _draw_via_bitmap latches once a provider is seen that cannot be
+    # read directly, so later frames skip the CGDataProviderCopyData
+    # probe entirely. It only ever turns on: the redraw is correct for
+    # every layout, so a needless one costs speed, never pixels.
+    _draw_via_bitmap = False
+    # Whether to keep offering the image's own colour space to
+    # CGBitmapContextCreate; cleared for good the first time one is
+    # refused, so a display with such a profile does not pay for a
+    # failed create -- and its CoreGraphics stderr complaint -- per
+    # frame.
+    _bitmap_space_from_image = True
+    # Destination for the redraw, reused while the size holds.
+    _scratch = None
+
     def __init__(self):
         cg, cf, CGPoint, CGSize, CGRect = _load_frameworks()
         self._cg = cg
@@ -179,6 +235,10 @@ class MacosBackend(BaseBackend):
         if display == 0:
             raise RuntimeError("CGMainDisplayID returned 0; no main display?")
         self._display = display
+        # A different display can have a different image layout, so let
+        # the next capture re-probe rather than inherit this one's verdict.
+        self._draw_via_bitmap = False
+        self._bitmap_space_from_image = True
 
     def _display_geometry(self):
         """Return ``(pixel_w, pixel_h, point_w, point_h)``.
@@ -332,69 +392,170 @@ class MacosBackend(BaseBackend):
                     "offset {},{}".format(img_w, img_h, w, h, off_x, off_y)
                 )
 
-            provider = self._cg.CGImageGetDataProvider(image)
-            cf_data = self._cg.CGDataProviderCopyData(provider)
-            if not cf_data:
-                raise RuntimeError("CGDataProviderCopyData returned NULL")
+            if row_stride < img_w * 4:
+                # Not a layout any fallback rescues: a 32-bit row cannot
+                # be shorter than four bytes a pixel, so one of these
+                # numbers does not mean what we think it means.
+                raise RuntimeError(
+                    "unsupported row stride: CGImage reports {} bytes "
+                    "per row for a {}-pixel-wide 32-bit image, which "
+                    "needs at least {}. Please open an issue."
+                    .format(row_stride, img_w, img_w * 4)
+                )
 
-            try:
-                src_ptr = self._cf.CFDataGetBytePtr(cf_data)
-                if not src_ptr:
-                    raise RuntimeError("CFDataGetBytePtr returned NULL")
+            # Two ways out of a CGImage, and which one is safe depends
+            # on the provider.
+            #
+            # Reading the provider bytes directly assumes they start at
+            # this image's own top-left with the stride reported above.
+            # A CGImage backed by a *parent* bitmap breaks that: the
+            # stride is the parent's, the data begins at the parent's
+            # origin, and offset 0 is somebody else's pixels.
+            #
+            # Only an exact extent — the provider holding precisely this
+            # image's rows — makes the direct read sound, and it is not
+            # something CoreGraphics promises: CGImageCreate takes the
+            # provider and the extent as separate inputs and requires
+            # only that the buffer hold at least bytesPerRow*height, so
+            # a larger provider is legal. It is also *common*. Issue #46
+            # reports a 1920x1080 capture whose CFData is 8306688 bytes
+            # rather than 8294400 — the pixels rounded up to a whole
+            # 16 KiB page, the arm64 page size. A larger provider cannot
+            # be told apart from a shared parent by size alone, so
+            # anything but an exact match goes the layout-agnostic way
+            # rather than guessing (or, as before, refusing to run).
+            #
+            # A *short* provider stays fatal. That one contradicts
+            # CGImageCreate's own minimum, so our reading of the image
+            # is wrong in some way no fallback repairs, and the direct
+            # read would run off the end of the buffer.
+            copied = False
+            if not self._draw_via_bitmap:
+                provider = self._cg.CGImageGetDataProvider(image)
+                cf_data = self._cg.CGDataProviderCopyData(provider)
+                if not cf_data:
+                    raise RuntimeError("CGDataProviderCopyData returned NULL")
 
-                # The copy trusts that the provider bytes start at this
-                # image's own top-left with the stride reported above. A
-                # CGImage backed by a *parent* bitmap breaks that: the
-                # stride is the parent's and the data begins at the
-                # parent's origin.
-                #
-                # Requiring the provider to hold exactly this image's rows
-                # catches the common shape of that layout, and bounds the
-                # read either way. It cannot *prove* the logical origin —
-                # only a provider of a different extent is detectable —
-                # and it is a deliberate fastgrab invariant rather than a
-                # documented CoreGraphics one: CGImageCreate takes the
-                # provider and the extent as separate inputs and only
-                # requires the buffer to be at least bytesPerRow*height,
-                # so an over-allocated provider is not forbidden. Failing
-                # closed is the right trade here — the alternative is
-                # returning someone else's pixels.
-                if row_stride < img_w * 4:
-                    raise RuntimeError(
-                        "unsupported row stride: CGImage reports {} bytes "
-                        "per row for a {}-pixel-wide 32-bit image, which "
-                        "needs at least {}. Please open an issue."
-                        .format(row_stride, img_w, img_w * 4)
-                    )
+                try:
+                    src_ptr = self._cf.CFDataGetBytePtr(cf_data)
+                    if not src_ptr:
+                        raise RuntimeError("CFDataGetBytePtr returned NULL")
 
-                data_len = self._cf.CFDataGetLength(cf_data)
-                expected = row_stride * img_h
-                if data_len != expected:
-                    raise RuntimeError(
-                        "unsupported provider extent: CFData holds {} bytes "
-                        "for a {}x{} image with a {}-byte row stride, where "
-                        "{} was expected. fastgrab reads the provider bytes "
-                        "directly and cannot locate the image inside a "
-                        "buffer of another size. Please open an issue."
-                        .format(data_len, img_w, img_h, row_stride, expected)
-                    )
+                    data_len = self._cf.CFDataGetLength(cf_data)
+                    minimum = row_stride * img_h
+                    if data_len < minimum:
+                        raise RuntimeError(
+                            "truncated provider: CFData holds {} bytes for a "
+                            "{}x{} image with a {}-byte row stride, which "
+                            "needs at least {}. Reading it would run past "
+                            "the end of the buffer. Please open an issue."
+                            .format(data_len, img_w, img_h, row_stride,
+                                    minimum)
+                        )
 
-                # One strided view over the provider bytes, sliced to the
-                # requested region and copied in a single C-level pass.
-                # Row padding (Apple often aligns to 16 bytes) and a
-                # snapped left edge are both just slicing here; done with
-                # per-row memmoves they cost an interpreter round trip
-                # per row, and a snapped left edge is the common case for
-                # sub-rect captures on a 2x display.
-                src = numpy.frombuffer(
-                    (ctypes.c_ubyte * (row_stride * img_h)).from_address(
-                        src_ptr),
-                    dtype=numpy.uint8,
-                ).reshape(img_h, row_stride)
+                    if data_len == minimum:
+                        # One strided view over the provider bytes,
+                        # sliced to the requested region and copied in a
+                        # single C-level pass. Row padding (Apple often
+                        # aligns to 16 bytes) and a snapped left edge are
+                        # both just slicing here; done with per-row
+                        # memmoves they cost an interpreter round trip
+                        # per row, and a snapped left edge is the common
+                        # case for sub-rect captures on a 2x display.
+                        src = numpy.frombuffer(
+                            (ctypes.c_ubyte * minimum).from_address(src_ptr),
+                            dtype=numpy.uint8,
+                        ).reshape(img_h, row_stride)
+                        img[:] = src[
+                            off_y:off_y + h, off_x * 4:(off_x + w) * 4
+                        ].reshape(h, w, 4)
+                        copied = True
+                    else:
+                        # Latch, so the next frame goes straight to the
+                        # redraw instead of paying for this copy to
+                        # re-learn the same answer.
+                        self._draw_via_bitmap = True
+                finally:
+                    self._cf.CFRelease(cf_data)
+
+            if not copied:
+                src = self._bitmap_copy(image, img_w, img_h)
                 img[:] = src[
                     off_y:off_y + h, off_x * 4:(off_x + w) * 4
                 ].reshape(h, w, 4)
-            finally:
-                self._cf.CFRelease(cf_data)
         finally:
             self._cg.CGImageRelease(image)
+
+    def _bitmap_copy(self, image, img_w, img_h):
+        """Redraw ``image`` into a bitmap whose layout we chose.
+
+        ``CGContextDrawImage`` is the layout-agnostic way to get pixels
+        out of a ``CGImage``: CoreGraphics resolves the provider, the
+        stride and any parent-bitmap origin itself, so none of them can
+        be guessed wrong here, and the destination is BGRA8 because we
+        asked for BGRA8.
+
+        Returns an ``(img_h, img_w * 4)`` uint8 array — the same shape
+        the direct read produces, so the caller slices it identically.
+        The buffer is reused across captures of the same size.
+        """
+        stride = img_w * 4
+        scratch = self._scratch
+        if scratch is None or scratch.shape != (img_h, stride):
+            # zeros rather than empty: were a draw ever to fail without
+            # saying so, the caller gets black, not heap contents.
+            scratch = numpy.zeros((img_h, stride), numpy.uint8)
+            self._scratch = scratch
+
+        # Offer the image's own colour space first. Source and
+        # destination spaces matching is what keeps this a pure layout
+        # conversion — CoreGraphics colour-matches between differing
+        # spaces, which would quietly hand back different pixel values
+        # than the direct read does on a wide-gamut display. Device RGB
+        # is the fallback for a space a bitmap context will not accept
+        # (an extended-range/EDR profile needs float components), and it
+        # does convert.
+        space = None
+        own_space = False
+        if self._bitmap_space_from_image:
+            # Get rule: that reference is the image's, not ours to release.
+            space = self._cg.CGImageGetColorSpace(image)
+        context = None
+        if space:
+            context = self._cg.CGBitmapContextCreate(
+                scratch.ctypes.data, img_w, img_h, 8, stride, space,
+                _BGRA_BITMAP_INFO)
+            if not context:
+                self._bitmap_space_from_image = False
+        if not context:
+            # Create rule: we own this one and must release it.
+            space = self._cg.CGColorSpaceCreateDeviceRGB()
+            own_space = True
+            if space:
+                context = self._cg.CGBitmapContextCreate(
+                    scratch.ctypes.data, img_w, img_h, 8, stride, space,
+                    _BGRA_BITMAP_INFO)
+
+        try:
+            if not context:
+                raise RuntimeError(
+                    "CGBitmapContextCreate returned NULL for a {}x{} BGRA8 "
+                    "bitmap; fastgrab cannot convert this CGImage. Please "
+                    "open an issue.".format(img_w, img_h)
+                )
+            # Exactly the image's own size, so the transform is the
+            # identity and nothing is resampled. A bitmap context's
+            # first row in memory is its top row, so this lands upright
+            # despite the y-up coordinate space.
+            rect = self._CGRect(
+                origin=self._CGPoint(x=0.0, y=0.0),
+                size=self._CGSize(width=float(img_w), height=float(img_h)),
+            )
+            self._cg.CGContextDrawImage(context, rect, image)
+        finally:
+            if context:
+                self._cg.CGContextRelease(context)
+            if own_space and space:
+                self._cg.CGColorSpaceRelease(space)
+
+        return scratch

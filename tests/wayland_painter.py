@@ -2,15 +2,24 @@
 
 Runs as cage's child app. Cage gives this client the entire output. The
 painter listens on the UNIX socket at ``$XDG_RUNTIME_DIR/fastgrab-painter.sock``
-for newline-terminated commands of the form::
+for newline-terminated commands::
 
     paint #RRGGBB
+    blocks
 
-and redraws its fullscreen surface in that solid color (premultiplied
-ARGB8888 SHM buffer). The surface is set to fullscreen and the painter
-responds to ``xdg_toplevel.configure`` events to keep its buffer the
-same size as the output the compositor gives it — otherwise solid-color
-asserts in the wlr integration tests would see uncovered border pixels.
+``paint`` redraws the fullscreen surface in a solid color (premultiplied
+ARGB8888 SHM buffer). ``blocks`` draws an 8x8 block pattern whose block
+coordinates go into the red and green channels — a solid color cannot
+tell a correctly placed sub-region capture from a displaced one, and
+that placement is the whole subject of issue #38.
+
+The surface is set to fullscreen and the painter responds to
+``xdg_toplevel.configure`` events to keep its buffer the same size as
+the output the compositor gives it — otherwise solid-color asserts in
+the wlr integration tests would see uncovered border pixels. A
+configure also re-applies whichever of the two patterns was last asked
+for, so a mid-test output reconfiguration (the scale change the
+``wlr_output_scale`` fixture makes) does not silently revert the scene.
 
 This file intentionally has no production dependency — it lives under
 ``tests/`` and is only invoked by the test compose service.
@@ -49,6 +58,7 @@ class Painter:
         self.target_w = DEFAULT_W
         self.target_h = DEFAULT_H
         self.color_bgra = (0, 0, 0, 0xFF)
+        self.pattern = "solid"  # "solid" | "blocks"
         self.configured = False
 
         self.display = Display()
@@ -143,10 +153,38 @@ class Painter:
         self.mm.seek(0)
         self.mm.write(pixel * (w * h))
 
+    def _fill_blocks(self, w, h, block=8):
+        """Write an 8x8 block pattern that encodes its own coordinates.
+
+        Red carries the block column, green the block row, so a capture
+        taken from the wrong place holds different values rather than
+        the same flat color. Rows repeat every ``block`` pixels, so the
+        rows are built once each and reused.
+        """
+        rows = {}
+        out = bytearray()
+        for y in range(h):
+            key = (y // block) % 256
+            row = rows.get(key)
+            if row is None:
+                row = bytearray()
+                for x in range(w):
+                    row += struct.pack(
+                        "<BBBB", 0x40, key, (x // block) % 256, 0xFF
+                    )
+                row = bytes(row)
+                rows[key] = row
+            out += row
+        self.mm.seek(0)
+        self.mm.write(bytes(out))
+
     def _redraw(self):
-        b, g, r, a = self.color_bgra
         w, h, _ = self.size
-        self._fill(b, g, r, a, w, h)
+        if self.pattern == "blocks":
+            self._fill_blocks(w, h)
+        else:
+            b, g, r, a = self.color_bgra
+            self._fill(b, g, r, a, w, h)
         self.surface.attach(self.wl_buffer, 0, 0)
         self.surface.damage(0, 0, w, h)
         self.surface.commit()
@@ -159,6 +197,11 @@ class Painter:
         g = int(hex_color[3:5], 16)
         b = int(hex_color[5:7], 16)
         self.color_bgra = (b, g, r, 0xFF)
+        self.pattern = "solid"
+        self._redraw()
+
+    def blocks(self):
+        self.pattern = "blocks"
         self._redraw()
 
 
@@ -217,6 +260,9 @@ def main():
                     try:
                         if line.startswith("paint "):
                             painter.paint(line[6:].strip())
+                            cs.sendall(b"ok\n")
+                        elif line == "blocks":
+                            painter.blocks()
                             cs.sendall(b"ok\n")
                         elif line == "ping":
                             cs.sendall(b"pong\n")
