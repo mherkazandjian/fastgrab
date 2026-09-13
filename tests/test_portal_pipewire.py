@@ -404,6 +404,48 @@ def test_a_cached_read_does_not_clone_the_whole_display(node_id):
     assert cached is fresh, "the cached read copied the whole frame"
 
 
+def test_a_frame_does_not_alias_the_gstreamer_buffer(node_id):
+    """The mapping is borrowed and handed straight back for refilling.
+
+    The unpadded case is the dangerous one: with stride == width * 4 the
+    strided view is already C-contiguous, so ascontiguousarray() returns
+    it unchanged and the "copy" is a view over memory GStreamer is about
+    to reuse. The cached frame then changes under the caller, or reads
+    memory that has been freed.
+
+    Written against a buffer this test still owns, so it can be
+    overwritten afterwards and the frame checked against what it was.
+    """
+    import gi
+    gi.require_version("Gst", "1.0")
+    from gi.repository import Gst
+
+    width, height = 4, 2                 # tightly packed: stride == 16
+    raw = bytes(bytearray(range(width * height * 4)))
+    buffer = Gst.Buffer.new_allocate(None, len(raw), None)
+    buffer.fill(0, raw)
+    caps = Gst.Caps.from_string(
+        "video/x-raw,format=BGRx,width=%d,height=%d" % (width, height))
+    sample = Gst.Sample.new(buffer, caps, None, None)
+
+    reader = PipeWireVideoReader(node_id, timeout=2.0)
+    try:
+        reader.start()
+        reader._sink.try_pull_sample = lambda _ns: sample
+        frame = reader.read()
+        was = frame.copy()
+        # What GStreamer does next with a buffer it has taken back.
+        buffer.fill(0, b"\xff" * len(raw))
+    finally:
+        reader.close()
+
+    assert numpy.array_equal(frame, was), (
+        "the frame changed when the GStreamer buffer was refilled, so "
+        "it was a view over borrowed memory rather than a copy"
+    )
+    assert not (frame == 0xFF).all()
+
+
 def test_close_is_idempotent(node_id):
     reader = PipeWireVideoReader(node_id)
     reader.read()

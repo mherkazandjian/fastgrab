@@ -282,6 +282,70 @@ def test_the_handshake_works_from_a_thread_with_its_own_glib_context(portal):
     assert outcome["streams"], "no streams came back"
 
 
+def test_a_reader_that_fails_to_start_is_shut_down(portal):
+    """start() can fail after the pipeline is already PLAYING.
+
+    That reader never reaches self._reader, so neither close() nor the
+    finalizer can ever see it -- it would go on running for the life of
+    the process.
+    """
+    from fastgrab.backends.portal import PortalBackend
+    portal()
+    backend = PortalBackend(timeout=30)
+    closed = []
+    real = backend._reader_class
+
+    class Stubborn(object):
+        def __init__(self, node_id, **kwargs):
+            self._real = real(node_id, **kwargs)
+
+        def start(self):
+            self._real.start()          # really reaches PLAYING
+            raise KeyboardInterrupt("interrupted after PLAYING")
+
+        def close(self):
+            closed.append(True)
+            self._real.close()
+
+    backend._reader_class = Stubborn
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            backend.resolution()
+    finally:
+        backend.close()
+
+    assert closed, (
+        "a reader whose start() was interrupted after PLAYING was left "
+        "running, unreachable by close() or the finalizer"
+    )
+
+
+def test_forgetting_a_transient_token_leaves_the_saved_one_alone(
+    tmp_path, clean_token_store
+):
+    """The file belongs to persistent mode.
+
+    Deleting it because a *transient* token was rejected throws away a
+    saved approval over an unrelated failure -- and the transient retry
+    keeps its replacement in memory only, so the next process would be
+    prompted for nothing.
+    """
+    from fastgrab.backends.portal import PERSIST_MODES, _forget_token
+
+    clean_token_store.write_text("saved-approval")
+
+    _forget_token(PERSIST_MODES["transient"])
+    assert clean_token_store.exists(), (
+        "a transient failure deleted the persistent token file"
+    )
+    assert clean_token_store.read_text() == "saved-approval"
+
+    _forget_token(PERSIST_MODES["persistent"])
+    assert not clean_token_store.exists(), (
+        "forgetting the persistent token left the file behind"
+    )
+
+
 def test_ctrl_c_during_the_chooser_is_not_swallowed():
     """The wait runs on a private GLib context, and that has a cost.
 

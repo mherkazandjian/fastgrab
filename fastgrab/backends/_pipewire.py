@@ -235,7 +235,15 @@ class PipeWireVideoReader:
             rows = numpy.lib.stride_tricks.as_strided(
                 flat[offset:], shape=(height, width * 4),
                 strides=(stride, 1))
-            frame = numpy.ascontiguousarray(rows).reshape(height, width, 4)
+            # numpy.array(), not ascontiguousarray(): the latter is a
+            # no-op when its input is already C-contiguous, which is
+            # exactly the ordinary unpadded case (stride == width * 4).
+            # It would hand back a view over the borrowed mapping, and
+            # that mapping is unmapped in the finally below and the
+            # buffer handed back to GStreamer to refill -- so the cached
+            # frame would quietly change under the caller, or read freed
+            # memory. This always owns its bytes.
+            frame = numpy.array(rows).reshape(height, width, 4)
         finally:
             buffer.unmap(info)
         self._last = frame

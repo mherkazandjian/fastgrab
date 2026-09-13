@@ -274,10 +274,17 @@ def _forget_token(mode=None):
     else:
         _PROCESS_TOKEN.pop(mode, None)
     _PROCESS_TOKEN.pop("connection", None)
-    try:
-        os.remove(_token_path())
-    except (IOError, OSError):
-        pass
+    # Only the mode that owns the file. The stored token belongs to
+    # persistent mode alone, so deleting it because a *transient* token
+    # was rejected would throw away a perfectly good saved approval over
+    # an unrelated failure -- and the transient retry keeps its
+    # replacement in memory only, so the next process would be prompted
+    # for nothing.
+    if mode is None or mode == PERSIST_MODES["persistent"]:
+        try:
+            os.remove(_token_path())
+        except (IOError, OSError):
+            pass
 
 
 def _release_portal(state):
@@ -461,10 +468,18 @@ class PortalBackend(BaseBackend):
         holding on to this one.
         """
         fd = self._session.open_pipewire_remote()
+        reader = None
         try:
             reader = self._reader_class(self._session.node_id, fd=fd)
             reader.start()
         except BaseException:
+            # The reader too, not just the descriptor. start() can fail
+            # or be interrupted *after* the pipeline reaches PLAYING,
+            # and this one never reaches self._reader -- so neither
+            # close() nor the finalizer would ever see it, and it would
+            # keep running for the life of the process.
+            if reader is not None:
+                reader.close()
             os.close(fd)
             raise
         self._fd = fd
