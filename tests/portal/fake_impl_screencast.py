@@ -86,9 +86,16 @@ class FakeScreenCastImpl:
             return
         if method == "SelectSources":
             options = params.unpack()[3]
-            self._record("select %s %s" % (
+            # restore_data, not restore_token, is what a desktop backend
+            # sees on a restore: the frontend owns the token database,
+            # resolves the client's token itself and hands us back the
+            # data we returned from Start. Recording it is the only
+            # evidence that a restore actually happened.
+            restored = options.get("restore_data")
+            self._record("select %s %s %s" % (
                 options.get("restore_token") or "-",
-                options.get("persist_mode", "-")))
+                options.get("persist_mode", "-"),
+                "restored" if restored else "-"))
             invocation.return_value(GLib.Variant("(ua{sv})", (0, {})))
             return
         if method == "Start":
@@ -105,9 +112,17 @@ class FakeScreenCastImpl:
             streams = [(self.node_id,
                         {"size": GLib.Variant("(ii)", (320, 240))})]
             results = {"streams": GLib.Variant("a(ua{sv})", streams)}
-            # A real backend rotates this on every Start when the client
-            # asked to persist. Handing one back is what lets the next
-            # session skip the chooser.
+            # restore_data (suv), which is what the impl contract
+            # actually returns: (vendor, version, vendor-defined data).
+            # The *frontend* stores it and issues the client a UUID
+            # restore_token of its own. Returning a restore_token from
+            # here instead creates no restorable permission at all --
+            # the string is passed through to the client and then fails
+            # the frontend's UUID validation when it is offered back, so
+            # the persistence path never actually restores anything.
+            if os.environ.get("FASTGRAB_FAKE_RESTORE"):
+                results["restore_data"] = GLib.Variant(
+                    "(suv)", ("fastgrabfake", 1, GLib.Variant("s", "ok")))
             token = os.environ.get("FASTGRAB_FAKE_TOKEN")
             if token:
                 results["restore_token"] = GLib.Variant("s", token)

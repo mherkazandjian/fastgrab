@@ -301,10 +301,20 @@ def clean_token_store(tmp_path, monkeypatch):
     portal_module._PROCESS_TOKEN.clear()
 
 
+def _selections(state_file):
+    """What the desktop backend was handed, one dict per SelectSources."""
+    out = []
+    for line in state_file.read_text().strip().splitlines():
+        fields = line.split()
+        out.append({"token": fields[1], "persist_mode": fields[2],
+                    "restored": fields[3] == "restored"})
+    return out
+
+
 def _offered(state_file):
-    """What the desktop backend was handed on the first SelectSources."""
-    first = state_file.read_text().strip().splitlines()[0].split()
-    return {"token": first[1], "persist_mode": first[2]}
+    """What it was handed on the *first* SelectSources."""
+    first = _selections(state_file)[0]
+    return {"token": first["token"], "persist_mode": first["persist_mode"]}
 
 
 def test_a_persistent_approval_is_kept_for_the_next_process(
@@ -335,6 +345,66 @@ def test_a_persistent_approval_is_kept_for_the_next_process(
     assert mode == 0o600, (
         "the token reopens the screen share without asking, so it must "
         "not be readable by anyone else (found %s)" % oct(mode)
+    )
+
+
+def test_a_persisted_approval_actually_restores_without_asking(
+    portal, tmp_path, clean_token_store
+):
+    """The other persistence tests prove plumbing, not restoration.
+
+    They check that a token is offered, rotated and stored. None of
+    them shows a restore ever *succeeding*, because the fake used to
+    return an arbitrary `restore_token` string -- and that is not the
+    impl contract. A desktop backend returns `restore_data (suv)`; the
+    frontend stores it, issues the client a UUID of its own, and on the
+    next session resolves that UUID back into restore_data for the
+    implementation. A made-up string creates no restorable permission
+    at all and fails the frontend's UUID validation when offered back,
+    so the persistence path was passing without ever restoring.
+
+    This drives two sessions and asserts the second one arrives at the
+    desktop already restored -- which is what "do not ask me again"
+    means.
+    """
+    from fastgrab.backends import portal as portal_module
+    from fastgrab.backends.portal import PortalBackend
+
+    state = tmp_path / "fake-state"
+    portal(extra_env={"FASTGRAB_FAKE_STATE": str(state),
+                      "FASTGRAB_FAKE_RESTORE": "1"})
+
+    first = PortalBackend(persist="persistent", timeout=30)
+    try:
+        first.resolution()
+    finally:
+        first.close()
+
+    stored = clean_token_store.read_text().strip()
+    assert stored, "the frontend issued no restore token to store"
+    # What a *later process* starts from: nothing cached, token on disk.
+    portal_module._PROCESS_TOKEN.clear()
+
+    second = PortalBackend(persist="persistent", timeout=30)
+    try:
+        try:
+            second.resolution()
+        except RuntimeError:
+            # Expected here and not a backend failure: the fixture's
+            # provider is `pipewiresink mode=provide` and exits with its
+            # first consumer, so there is no node left to read. The
+            # handshake is what this test is about, and it is recorded
+            # below either way.
+            pass
+    finally:
+        second.close()
+
+    seen = _selections(state)
+    assert len(seen) >= 2, "the second session never reached the desktop"
+    assert not seen[0]["restored"], "the first session restored something"
+    assert seen[1]["restored"], (
+        "the second session reached the desktop with no restore data, so "
+        "the user would have been asked again despite persist='persistent'"
     )
 
 

@@ -117,10 +117,19 @@ def _autodetect():
         except Exception as exc:
             # A declined screen-share must not become a silent fallback:
             # XWayland would then capture the very screen the user just
-            # refused to share. Everything else here means "this backend
-            # is not usable", which is what the fallback is for.
+            # refused to share.
             if type(exc).__name__ == "PortalCancelled":
                 raise
+            # Nor must a typo. $FASTGRAB_PORTAL_PERSIST is validated in
+            # the constructor, and "this value is not a persist mode" is
+            # a configuration error, not "this backend is unavailable" --
+            # swallowing it would answer a misspelt setting by quietly
+            # capturing through XWayland instead, losing native Wayland
+            # windows, with nothing said.
+            if isinstance(exc, ValueError):
+                raise
+            # Everything else here does mean the backend is unusable,
+            # which is what the fallback is for.
         # Wayland session but no working Wayland backend — fall through to
         # X11/XWayland, which still works for X11 clients in a Wayland session.
 

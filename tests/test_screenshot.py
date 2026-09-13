@@ -541,3 +541,31 @@ def test_backend_options_need_an_explicit_backend():
     """
     with pytest.raises(TypeError, match="persist"):
         screenshot.Screenshot(persist="none")
+
+
+@pytest.mark.no_display
+def test_autodetect_does_not_swallow_a_bad_persist_setting(monkeypatch):
+    """A typo is a configuration error, not an unavailable backend.
+
+    $FASTGRAB_PORTAL_PERSIST is validated when the portal backend is
+    constructed, and auto-detection decides by constructing. Treating
+    that failure as "this backend is unusable" would answer a misspelt
+    setting by quietly capturing through XWayland instead -- losing
+    native Wayland windows, with nothing said about the typo.
+    """
+    from fastgrab import backends
+
+    class Fallback(object):
+        pass
+
+    _pretend_linux_wayland(monkeypatch)
+    _stub_backend(monkeypatch, "wlr", "WlrBackend",
+                  _raises(OSError("no wlroots")))
+    _stub_backend(monkeypatch, "portal", "PortalBackend",
+                  _raises(ValueError(
+                      "FASTGRAB_PORTAL_PERSIST must be one of none, "
+                      "persistent, transient, got 'presistent'")))
+    _stub_backend(monkeypatch, "x11", "X11Backend", Fallback)
+
+    with pytest.raises(ValueError, match="FASTGRAB_PORTAL_PERSIST"):
+        backends._autodetect()
