@@ -455,6 +455,19 @@ def build_ass_document(subtitles, style=None, width=1920, height=1080) -> str:
     libass falls back to a default face when the named font is missing,
     so the ASS backend still renders on a system where no font file was
     discovered.
+    
+
+    Two timing differences from the drawtext backend, both measured by
+    rendering at 100 fps and counting lit pixels per frame:
+
+    * the end is *exclusive*. For a cue of 0.5 to 1.0, both backends draw
+      from frame 0.50, and at exactly 1.00 drawtext still draws while ASS
+      has stopped -- one frame's difference, and the format's own
+      semantics rather than something to paper over.
+    * timestamps are centiseconds, so a cue shorter than 10 ms rounds to
+      zero length and can never be drawn. That is refused here rather
+      than written out, since the alternative is a subtitle missing from
+      both the video and the sidecar with nothing to explain it.
     """
     style = style or SubtitleStyle()
     lines = [
@@ -474,10 +487,26 @@ def build_ass_document(subtitles, style=None, width=1920, height=1080) -> str:
         "Format: " + _ASS_EVENT_FORMAT,
     ]
     for sub in subtitles or ():
+        start, end = _ass_time(sub.start), _ass_time(sub.end)
+        if start == end:
+            # ASS timestamps are centiseconds, so a cue shorter than 10 ms
+            # rounds to zero length and libass never draws it. Measured:
+            # 1.001-1.004 becomes 0:00:01.00,0:00:01.00 and renders
+            # nothing at any frame. Emitting it anyway would be a
+            # subtitle silently missing from the video and from the
+            # sidecar, with nothing to explain why.
+            raise ValueError(
+                "subtitle {!r} lasts {:.4f}s, which rounds to nothing at "
+                "ASS's centisecond resolution ({} to {}), so it would "
+                "never be shown. Give it at least 0.01s, or use the "
+                "drawtext backend.".format(
+                    sub.text, sub.end - sub.start, start, end
+                )
+            )
         lines.append(
             "Dialogue: 0,{start},{end},{style},,0,0,0,,{text}".format(
-                start=_ass_time(sub.start),
-                end=_ass_time(sub.end),
+                start=start,
+                end=end,
                 style=_ASS_STYLE_NAME,
                 text=_escape_ass(sub.text),
             )

@@ -116,6 +116,11 @@ file (``$FASTGRAB_FONT`` or the bundled DejaVu search paths).
 ### ASS subtitles
 
 By default every subtitle becomes an ffmpeg ``drawtext`` filter.
+Two timing notes for the ASS backend: a cue's end time is exclusive, so
+it stops one frame earlier than the drawtext chain does, and ASS
+timestamps are centiseconds, so a cue shorter than 10 ms is refused
+rather than silently written as one that can never appear.
+
 ``--subtitle-backend ass`` instead generates an Advanced SubStation Alpha
 script from the same ``--subtitle`` lines and burns it in with libass
 (needs an ffmpeg built ``--enable-libass``, which the Debian/Ubuntu one

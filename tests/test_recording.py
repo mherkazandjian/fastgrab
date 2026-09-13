@@ -2178,3 +2178,65 @@ def test_the_colour_error_blames_the_name_not_the_format():
     assert "sidecar" in message, "say that it bites with drawtext too"
     # and the colour itself is expressible, which is the point
     assert subtitles_mod._ass_color("0x7FFF00").startswith("&H")
+
+
+# -------- ASS cue timing --------
+
+def test_a_cue_too_short_for_a_centisecond_is_refused():
+    """It would round to zero length and never be drawn.
+
+    Measured: 1.001-1.004 becomes "0:00:01.00,0:00:01.00" and renders
+    nothing at any frame. Writing it anyway means a subtitle missing from
+    the video and from the sidecar, with nothing to say why.
+    """
+    with pytest.raises(ValueError, match="centisecond"):
+        subtitles_mod.build_ass_document(
+            [Subtitle(text="blink", start=1.001, end=1.004)]
+        )
+
+
+def test_a_cue_of_exactly_one_centisecond_is_fine():
+    """The boundary itself must not be refused."""
+    doc = subtitles_mod.build_ass_document(
+        [Subtitle(text="brief", start=1.00, end=1.01)]
+    )
+    assert "0:00:01.00,0:00:01.01" in doc
+
+
+@requires_ffmpeg
+def test_the_ass_cue_end_is_exclusive(tmp_path):
+    """One frame's difference from drawtext, and the format's own rule.
+
+    Rendered at 100 fps: for a 0.5-1.0 cue both backends draw from 0.50,
+    and at exactly 1.00 drawtext still draws while ASS has stopped.
+    """
+    font = encoder_mod._find_font()
+    if font is None:
+        pytest.skip("no usable font on this host")
+    style = SubtitleStyle(font_path=font)
+    subs = [Subtitle(text="HELLO", start=0.5, end=1.0)]
+
+    script = tmp_path / "cue.ass"
+    script.write_text(
+        subtitles_mod.build_ass_document(subs, style, width=480, height=80),
+        encoding="utf-8")
+    ass_vf = "ass=filename=" + encoder_mod._escape_filter_path(str(script))
+    draw_vf = subtitles_mod.build_subtitle_filters(subs, style)
+
+    def strip(vf):
+        proc = subprocess.run(
+            ["ffmpeg", "-v", "error", "-f", "lavfi",
+             "-i", "color=black:s=480x80:d=2:r=100", "-vf", vf,
+             "-frames:v", "110", "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+            capture_output=True)
+        assert proc.returncode == 0, proc.stderr.decode()[:200]
+        arr = numpy.frombuffer(proc.stdout, dtype=numpy.uint8)
+        n = len(arr) // (80 * 480)
+        return [(f > 40).sum() for f in arr[: n * 80 * 480].reshape(n, 80, 480)]
+
+    drawn, assed = strip(draw_vf), strip(ass_vf)
+    assert drawn[49] == 0 and assed[49] == 0, "drawn before the cue started"
+    assert drawn[50] > 0 and assed[50] > 0, "both must start at 0.50"
+    assert drawn[99] > 0 and assed[99] > 0, "both must still be up at 0.99"
+    assert drawn[100] > 0, "drawtext includes the end instant"
+    assert assed[100] == 0, "ASS excludes it — this is the documented gap"
