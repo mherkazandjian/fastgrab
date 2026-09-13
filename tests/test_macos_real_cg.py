@@ -64,12 +64,14 @@ def _pattern(width, height):
     A redraw that flips, shifts or transposes the image produces wrong
     values here rather than merely a differently-shaped array.
     """
-    rows = numpy.arange(height, dtype=numpy.uint8).reshape(height, 1)
-    cols = numpy.arange(width, dtype=numpy.uint8).reshape(1, width)
+    # Reduced mod 256 in a wide dtype before casting: a display is taller
+    # than 255 pixels, and numpy 2 raises rather than wrapping.
+    rows = numpy.arange(height).reshape(height, 1)
+    cols = numpy.arange(width).reshape(1, width)
     out = numpy.zeros((height, width, 4), dtype=numpy.uint8)
-    out[:, :, 0] = cols                      # B varies across
-    out[:, :, 1] = rows                      # G varies down
-    out[:, :, 2] = (cols + rows) % 256       # R varies both ways
+    out[:, :, 0] = (cols % 256).astype(numpy.uint8)          # B across
+    out[:, :, 1] = (rows % 256).astype(numpy.uint8)          # G down
+    out[:, :, 2] = ((cols + rows) % 256).astype(numpy.uint8)  # R both
     out[:, :, 3] = 255
     return out
 
