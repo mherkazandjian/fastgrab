@@ -8,6 +8,8 @@ import sys
 import threading
 
 from .clicks import CLICK_PATTERNS, ClickStyle
+from .encoder import _local_output_path
+from .encoder import SUBTITLE_BACKENDS
 from .recorder import Recorder
 from .subtitles import Subtitle, SubtitleStyle
 
@@ -100,6 +102,40 @@ def _parse_subtitle(value: str):
         )
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc))
+
+
+def _resolve_sidecar(value, output: str):
+    """Resolve ``--subtitle-sidecar`` into a path, or ``None``.
+
+    The flag is optional-valued: absent is ``None``, a bare
+    ``--subtitle-sidecar`` arrives as ``""`` (its ``const``) and means
+    "name it after the video", so ``demo.mp4`` gives ``demo.ass`` — the
+    pairing mpv and VLC look for when they auto-load a subtitle track.
+
+    The name is derived from the *path* ffmpeg will write, not from the
+    string as typed: ``-o file:demo.mp4`` writes ``demo.mp4``, and
+    deriving from the raw string produced the literal filename
+    ``file:demo.ass``. A destination that is not a local file has no name
+    to derive from at all, and is refused rather than guessed at.
+    """
+    if value is None:
+        return None
+    if value:
+        return value
+    local = _local_output_path(output)
+    if local is None:
+        raise ValueError(
+            "--subtitle-sidecar needs a path of its own when the output "
+            "is not a local file ({!r})".format(output)
+        )
+    derived = os.path.splitext(local)[0] + ".ass"
+    if _local_output_path(derived) is None:
+        # The derived name would itself read as a protocol URL, which is
+        # how "-o file:clip:part1.mp4" produced "clip:part1.ass" and then
+        # had its own recording refused. Absolute, it cannot: the leading
+        # separator stops anything before the colon looking like a scheme.
+        derived = os.path.abspath(derived)
+    return derived
 
 
 def build_parser():
@@ -195,6 +231,26 @@ def build_parser():
     p.add_argument(
         "--subtitle-position", default="bottom", choices=["top", "bottom"],
         help="where subtitles are placed (default: bottom)",
+    )
+    p.add_argument(
+        "--subtitle-backend", default="drawtext", choices=list(SUBTITLE_BACKENDS),
+        help="how subtitles are rendered: 'drawtext' (default) draws each "
+             "line with ffmpeg, 'ass' generates an Advanced SubStation Alpha "
+             "script and burns it in with libass",
+    )
+    p.add_argument(
+        "--subtitle-font-name", default=None, metavar="FAMILY",
+        help="font family for --subtitle-backend ass, e.g. 'DejaVu Sans'. "
+             "libass resolves families, not file paths (default: guessed "
+             "from --subtitle-font)",
+    )
+    p.add_argument(
+        "--subtitle-sidecar", nargs="?", const="", default=None, metavar="PATH",
+        help="also write the subtitles as an editable .ass file; without a "
+             "PATH it is named after the output (demo.mp4 -> demo.ass), "
+             "as an editable copy. The subtitles are burned into the "
+             "video either way, so a player that also loads the file "
+             "shows them twice",
     )
     p.add_argument(
         "--gui", action="store_true",
@@ -304,26 +360,17 @@ def _stdout_countdown():
 def _missing_output(output):
     """The local file ffmpeg should have written, if it is absent.
 
-    Returns ``None`` when there is nothing to complain about -- either the
-    file is there, or the destination is not a local file at all.
-
-    ffmpeg accepts protocol URLs as outputs, so the configured string is
-    not always a path. ``file:`` names a local path with the prefix
-    stripped; it exists precisely so a filename containing a colon, or
-    one starting with a dash, can be given unambiguously. Anything else
-    carrying a scheme (``rtmp://``, ``tcp://``, ``pipe:``) is not on this
-    filesystem and there is nothing to look for. Checking the raw string
-    failed a perfectly good recording: ``-o file:out.mp4`` writes
-    ``out.mp4``, and os.path.exists never found it under that name.
+    ``None`` when there is nothing to complain about — either the file is
+    there, or the destination is not a local file at all. The
+    classification itself lives in
+    :func:`fastgrab.recording.encoder._local_output_path`, so the CLI and
+    the encoder agree on what counts as a path; a second copy here
+    disagreed on composed schemes such as ``crypto+file:``.
     """
-    if output.startswith("file:"):
-        output = output[len("file:"):]
-    else:
-        scheme = output.split(":", 1)[0]
-        # A single-letter scheme is a Windows drive, not a protocol.
-        if ":" in output and len(scheme) > 1 and scheme.isalpha():
-            return None
-    return None if os.path.exists(output) else output
+    local = _local_output_path(output)
+    if local is None:
+        return None
+    return None if os.path.exists(local) else local
 
 
 def main(argv=None):
@@ -393,21 +440,32 @@ def _main(argv=None):
         font_color=args.subtitle_color,
         box_color=args.subtitle_box_color,
         position=args.subtitle_position,
+        font_name=args.subtitle_font_name,
     )
-
-    recorder = Recorder(
-        output_path=args.output,
-        bbox=bbox,
-        fps=args.fps,
-        backend=args.backend,
-        title=args.title,
-        overlay_text=args.overlay_text,
-        show_clicks=args.show_clicks,
-        click_style=click_style,
-        show_cursor=args.show_cursor,
-        subtitles=args.subtitle,
-        subtitle_style=subtitle_style,
-    )
+    # Both of these validate what the user typed, and both can refuse.
+    # They sit outside the recording try/except below, so without this a
+    # bad --subtitle-backend or an underivable sidecar ended the command
+    # with a traceback instead of a message.
+    try:
+        sidecar = _resolve_sidecar(args.subtitle_sidecar, args.output)
+        recorder = Recorder(
+            output_path=args.output,
+            bbox=bbox,
+            fps=args.fps,
+            backend=args.backend,
+            title=args.title,
+            overlay_text=args.overlay_text,
+            show_clicks=args.show_clicks,
+            click_style=click_style,
+            show_cursor=args.show_cursor,
+            subtitles=args.subtitle,
+            subtitle_style=subtitle_style,
+            subtitle_backend=args.subtitle_backend,
+            subtitle_sidecar=sidecar,
+        )
+    except (RuntimeError, ValueError) as exc:
+        print("error: {}".format(exc), file=sys.stderr)
+        return 1
 
     stop_event = threading.Event()
 

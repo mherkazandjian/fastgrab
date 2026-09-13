@@ -19,11 +19,13 @@ import numpy
 import pytest
 
 from fastgrab.recording import (
+    SUBTITLE_BACKENDS,
     ClickStyle,
     FfmpegEncoder,
     Recorder,
     Subtitle,
     SubtitleStyle,
+    build_ass_document,
     infer_codec,
 )
 from fastgrab.recording import cli as recording_cli
@@ -266,7 +268,7 @@ def test_build_subtitle_filters(tmp_path, monkeypatch):
     assert "Hello\\: world" in vf
     # The path is escaped like the text — on Windows it contains ':' and
     # '\\', so compare against the escaped form, not the raw string.
-    assert "fontfile=" + encoder_mod._escape_drawtext(str(fake_font)) in vf
+    assert "fontfile=" + encoder_mod._escape_filter_path(str(fake_font)) in vf
 
 
 def test_build_subtitle_filters_style_overrides(tmp_path, monkeypatch):
@@ -293,21 +295,20 @@ def test_build_subtitle_filters_empty_and_fontless(monkeypatch):
     assert subtitles_mod.build_subtitle_filters(subs) is None
 
 
-def test_font_path_is_escaped_in_drawtext():
-    # A ':' inside the font path would be read as an option separator by
-    # the filter parser, so it has to be escaped like the text is. The
-    # path is synthetic (explicit font_path= skips the existence check)
-    # because ':' is not a legal filename character on Windows.
-    font = "/fonts:odd/fake.ttf"
-    escaped = "/fonts\\:odd/fake.ttf"
+def test_font_path_is_escaped_as_a_filter_value(tmp_path, monkeypatch):
+    """A font path is an option value, not drawtext text.
 
-    vf = encoder_mod._build_drawtext_filter(title="t", font_path=font)
-    assert "fontfile=" + escaped + ":" in vf
-    assert "fontfile=" + font + ":" not in vf
-
-    subs = [Subtitle(text="x", start=0.0, end=1.0)]
-    vf = subtitles_mod.build_subtitle_filters(subs, SubtitleStyle(font_path=font))
-    assert "fontfile=" + escaped + ":" in vf
+    Escaped the old way -- the same single pass used for text -- a path
+    containing an apostrophe, colon, comma or bracket made ffmpeg reject
+    the whole filtergraph, and one containing a backslash rendered
+    different pixels. Escaping for both of ffmpeg's parse passes fixes
+    all five; see test_a_font_path_with_awkward_characters_still_renders.
+    """
+    fake_font = tmp_path / "fake.ttf"
+    fake_font.write_bytes(b"")
+    monkeypatch.setenv("FASTGRAB_FONT", str(fake_font))
+    vf = encoder_mod._build_drawtext_filter(title="hi")
+    assert "fontfile=" + encoder_mod._escape_filter_path(str(fake_font)) in vf
 
 
 def test_encoder_argv_includes_subtitles(tmp_path, monkeypatch):
@@ -322,6 +323,388 @@ def test_encoder_argv_includes_subtitles(tmp_path, monkeypatch):
     vf_value = argv[argv.index("-vf") + 1]
     assert "between(t,0.5,2.0)" in vf_value
     assert "sub" in vf_value
+
+
+# --------------------------------------------------------------------------
+# ASS subtitle backend
+# --------------------------------------------------------------------------
+
+
+def _ass_lines(document, prefix):
+    """Every line of ``document`` starting with ``prefix``, prefix stripped."""
+    return [
+        line[len(prefix):] for line in document.splitlines()
+        if line.startswith(prefix)
+    ]
+
+
+def _ass_style_row(document):
+    """The ``Style:`` line as a ``{field name: value}`` mapping."""
+    names = [name.strip() for name in _ass_lines(document, "Format: ")[0].split(",")]
+    values = _ass_lines(document, "Style: ")[0].split(",")
+    assert len(names) == len(values), "Style: row does not match its Format:"
+    return dict(zip(names, values))
+
+
+def test_ass_document_structure(tmp_path, monkeypatch):
+    fake_font = tmp_path / "fake.ttf"
+    fake_font.write_bytes(b"")
+    monkeypatch.setenv("FASTGRAB_FONT", str(fake_font))
+    subs = [
+        Subtitle(text="first", start=0.0, end=1.5),
+        Subtitle(text="second", start=1.5, end=3.0),
+    ]
+    doc = build_ass_document(subs, width=640, height=480)
+    # The three sections an ASS script needs, in the order players expect.
+    assert doc.index("[Script Info]") < doc.index("[V4+ Styles]")
+    assert doc.index("[V4+ Styles]") < doc.index("[Events]")
+    assert "ScriptType: v4.00+" in doc
+    # PlayRes has to match the video, or libass rescales every size and
+    # margin we computed in pixels.
+    assert "PlayResX: 640" in doc
+    assert "PlayResY: 480" in doc
+    # Style:/Dialogue: rows are positional, so their field counts must
+    # match the Format: lines that declare them.
+    _ass_style_row(doc)  # asserts the style row lines up
+    events_format = _ass_lines(doc, "Format: ")[1].split(",")
+    dialogues = _ass_lines(doc, "Dialogue: ")
+    assert len(dialogues) == 2
+    for line in dialogues:
+        # Text is the last field and may itself contain commas.
+        assert len(line.split(",", len(events_format) - 1)) == len(events_format)
+    assert dialogues[0].startswith("0,0:00:00.00,0:00:01.50,Default,,0,0,0,,first")
+    assert doc.endswith("\n")
+
+
+@pytest.mark.parametrize("seconds,expected", [
+    (0, "0:00:00.00"),
+    (0.25, "0:00:00.25"),
+    (1.5, "0:00:01.50"),
+    (59.999, "0:01:00.00"),   # rounds up into the next minute
+    (3600.0, "1:00:00.00"),
+    (3661.5, "1:01:01.50"),
+    (36000, "10:00:00.00"),   # hours are not capped at a single digit
+    (-2.0, "0:00:00.00"),     # Subtitle allows a negative start; clamp it
+])
+def test_ass_timecode_boundaries(seconds, expected):
+    assert subtitles_mod._ass_time(seconds) == expected
+
+
+@pytest.mark.parametrize("spec,expected", [
+    ("white", "&H00FFFFFF"),
+    ("black", "&H00000000"),
+    # ASS alpha is transparency, so 0.55 opaque becomes 0x73, not 0x8C.
+    ("black@0.55", "&H73000000"),
+    # &HAABBGGRR is byte-reversed: pure red lands in the last byte.
+    ("red", "&H000000FF"),
+    ("yellow", "&H0000FFFF"),
+    ("0xFF8000", "&H000080FF"),
+    ("#00FF00", "&H0000FF00"),
+    ("0x00FF0080", "&H7F00FF00"),   # trailing AA is opacity
+    ("red@0x80", "&H7F0000FF"),     # hex alpha suffix
+    ("white@0", "&HFFFFFFFF"),      # fully transparent
+    ("white@2", "&H00FFFFFF"),      # out-of-range opacity clamps
+])
+def test_ass_color_conversion(spec, expected):
+    assert subtitles_mod._ass_color(spec) == expected
+
+
+def test_ass_color_rejects_what_it_cannot_translate():
+    # drawtext passes colour names straight to ffmpeg, so it accepts all
+    # ~150 of them; the ASS backend has to convert and only knows a
+    # common subset. Failing beats silently painting the wrong colour.
+    with pytest.raises(ValueError, match="0xRRGGBB"):
+        subtitles_mod._ass_color("chartreuse")
+    with pytest.raises(ValueError, match="hexadecimal"):
+        subtitles_mod._ass_color("0xZZZZZZ")
+    with pytest.raises(ValueError, match="alpha"):
+        subtitles_mod._ass_color("white@opaque")
+
+
+def test_ass_text_escaping():
+    esc = subtitles_mod._escape_ass
+    # Braces open an override block and would swallow the rest of the line.
+    assert esc("a {b} c") == "a \\{b\\} c"
+    # Newlines cannot appear in a Dialogue line; \r\n collapses to one break.
+    assert esc("one\ntwo") == "one\\Ntwo"
+    assert esc("one\r\ntwo") == "one\\Ntwo"
+    assert esc("one\rtwo") == "one\\Ntwo"
+    # libass renders an unrecognised \x as a literal backslash, so a path
+    # survives untouched — doubling it would paint two backslashes.
+    assert esc("C:\\Users\\dir") == "C:\\Users\\dir"
+    # ... except before n/N/h, where the pair would be eaten as a space,
+    # a line break or a non-breaking space.
+    # Separated by a zero-width space, not doubled: doubling leaves
+    # the control sequence active and libass still broke
+    # "left\\Nright" across two lines.
+    assert esc("C:\\new") == "C:\\" + subtitles_mod._ZWSP + "new"
+    assert esc("a\\Nb") == "a\\" + subtitles_mod._ZWSP + "Nb"
+    assert esc("a\\hb") == "a\\" + subtitles_mod._ZWSP + "hb"
+    # A user backslash before a brace still round-trips: libass reads the
+    # '\\' as a literal backslash and then '\{' as a literal brace.
+    assert esc("a\\{b") == "a\\\\{b"
+    # Nothing to do for ordinary text.
+    assert esc("plain text, with a comma") == "plain text, with a comma"
+
+
+def test_ass_style_maps_subtitle_style():
+    style = SubtitleStyle(
+        font_size=40, font_color="yellow", box_color="blue@0.5",
+        border=12, position="top", font_name="DejaVu Sans",
+    )
+    row = _ass_style_row(build_ass_document([Subtitle("x", 0.0, 1.0)], style))
+    assert row["Fontname"] == "DejaVu Sans"
+    assert row["Fontsize"] == "40"
+    assert row["PrimaryColour"] == "&H0000FFFF"
+    # BorderStyle 3 paints an opaque box filled with OutlineColour, which
+    # is the closest thing ASS has to drawtext's box=1 + boxcolor.
+    assert row["BorderStyle"] == "3"
+    assert row["OutlineColour"] == subtitles_mod._ass_color("blue@0.5")
+    assert row["Outline"] == "12"     # boxborderw becomes the box padding
+    assert row["Shadow"] == "0"       # SubtitleStyle has no shadow field
+    assert row["Alignment"] == "8"    # top centre
+    assert row["MarginV"] == "30"     # matches drawtext's y=30
+
+    bottom = _ass_style_row(build_ass_document([Subtitle("x", 0.0, 1.0)]))
+    assert bottom["Alignment"] == "2"
+    assert bottom["MarginV"] == "40"  # matches drawtext's y=h-text_h-40
+
+
+def test_ass_font_name_guessed_from_font_path(tmp_path, monkeypatch):
+    fake_font = tmp_path / "MyFont-Bold.ttf"
+    fake_font.write_bytes(b"")
+    monkeypatch.setenv("FASTGRAB_FONT", str(fake_font))
+    # libass resolves families, not paths, so the stem is the best guess
+    # and the containing directory is offered to it as fontsdir.
+    row = _ass_style_row(build_ass_document([Subtitle("x", 0.0, 1.0)]))
+    assert row["Fontname"] == "MyFont-Bold"
+    assert subtitles_mod.ass_fonts_dir() == str(tmp_path)
+    # A comma would shift every field after Fontname by one.
+    with pytest.raises(ValueError, match="comma"):
+        build_ass_document([Subtitle("x", 0.0, 1.0)],
+                           SubtitleStyle(font_name="Bad, Font"))
+
+
+def test_ass_document_renders_without_a_font_file(monkeypatch):
+    monkeypatch.setattr(encoder_mod, "_FONT_CANDIDATES", ())
+    monkeypatch.delenv("FASTGRAB_FONT", raising=False)
+    subs = [Subtitle(text="x", start=0.0, end=1.0)]
+    # drawtext needs a font file and skips when there is none; libass
+    # falls back to a default face, so the ASS backend still renders.
+    assert subtitles_mod.build_subtitle_filters(subs) is None
+    assert "Style: Default,Sans," in build_ass_document(subs)
+    assert subtitles_mod.ass_fonts_dir() is None
+
+
+def test_ass_filter_escapes_the_path_twice():
+    # ffmpeg unescapes a filter option value twice: once splitting the
+    # graph into filters, once splitting a filter's args into key=value.
+    # Escaping only once is the trap — ffmpeg then reads the surviving
+    # quote as an opening quote and opens a different file.
+    path = "/tmp/it's, a:path.ass"
+    once = encoder_mod._escape_filter_value(path)
+    twice = encoder_mod._escape_filter_value(once)
+    vf = subtitles_mod.build_ass_filter(path)
+    assert vf == "ass=filename=" + twice
+    assert "\\\\\\'" in vf   # ' -> \' -> \\\'
+    assert "\\\\\\:" in vf
+    assert "\\\\\\," in vf
+    assert path not in vf    # nothing left raw for the parser to trip on
+    # Windows separators are escape characters to the filter parser too.
+    assert subtitles_mod.build_ass_filter("C:\\subs\\x.ass") == (
+        "ass=filename=C\\\\\\:\\\\\\\\subs\\\\\\\\x.ass"
+    )
+    with_dir = subtitles_mod.build_ass_filter("/a/x.ass", fontsdir="/f:onts")
+    assert with_dir.endswith(":fontsdir=/f\\\\\\:onts")
+
+
+def test_encoder_ass_backend_writes_and_cleans_up_the_script(tmp_path, monkeypatch):
+    fake_font = tmp_path / "fake.ttf"
+    fake_font.write_bytes(b"")
+    monkeypatch.setenv("FASTGRAB_FONT", str(fake_font))
+    enc = FfmpegEncoder(
+        str(tmp_path / "x.mp4"), 64, 48, fps=10,
+        subtitles=[Subtitle(text="sub", start=0.5, end=2.0)],
+        subtitle_backend="ass",
+    )
+    # start() writes the script; this is that step on its own.
+    script = enc._write_ass(enc.ass_document())
+    argv = enc._build_argv(script)
+    vf_value = argv[argv.index("-vf") + 1]
+    assert vf_value.startswith("ass=filename=")
+    assert "drawtext=" not in vf_value          # ASS replaces the chain
+
+    assert os.path.exists(script)
+    with open(script, encoding="utf-8") as fobj:
+        doc = fobj.read()
+    assert "Dialogue: 0,0:00:00.50,0:00:02.00,Default,,0,0,0,,sub" in doc
+    assert "PlayResX: 64" in doc                # the encoder's frame size
+    # close() without a start() still removes the temporary script.
+    enc.close()
+    assert not os.path.exists(script)
+    assert enc._ass_path is None
+
+
+def test_encoder_ass_backend_keeps_title_drawtext(tmp_path, monkeypatch):
+    fake_font = tmp_path / "fake.ttf"
+    fake_font.write_bytes(b"")
+    monkeypatch.setenv("FASTGRAB_FONT", str(fake_font))
+    enc = FfmpegEncoder(
+        str(tmp_path / "x.mp4"), 64, 48, fps=10, title="Demo",
+        subtitles=[Subtitle(text="sub", start=0.0, end=1.0)],
+        subtitle_backend="ass",
+    )
+    argv = enc._build_argv(enc._write_ass(enc.ass_document()))
+    vf_value = argv[argv.index("-vf") + 1]
+    # title/overlay are a separate feature and stay on drawtext; the ASS
+    # filter is appended after them in the same chain.
+    assert vf_value.index("drawtext=") < vf_value.index("ass=filename=")
+    enc.close()
+
+
+def test_encoder_default_subtitle_backend_is_unchanged_drawtext(tmp_path, monkeypatch):
+    fake_font = tmp_path / "fake.ttf"
+    fake_font.write_bytes(b"")
+    monkeypatch.setenv("FASTGRAB_FONT", str(fake_font))
+    subs = [Subtitle(text="sub", start=0.5, end=2.0)]
+    enc = FfmpegEncoder(str(tmp_path / "x.mp4"), 64, 48, fps=10, subtitles=subs)
+    assert enc.subtitle_backend == "drawtext"
+    argv = enc._build_argv()
+    vf_value = argv[argv.index("-vf") + 1]
+    # Byte-for-byte what the drawtext builder produces, and no ASS
+    # anywhere: adding the backend must not perturb the default path.
+    assert vf_value == subtitles_mod.build_subtitle_filters(subs)
+    assert "ass=" not in vf_value
+    assert enc._ass_path is None       # nothing written to disk either
+
+
+def test_unknown_subtitle_backend_is_rejected(tmp_path):
+    assert SUBTITLE_BACKENDS == ("drawtext", "ass")
+    with pytest.raises(ValueError, match="subtitle_backend"):
+        FfmpegEncoder(str(tmp_path / "x.mp4"), 64, 48, subtitle_backend="srt")
+    # Recorder validates before it opens the display, like it does fps.
+    with pytest.raises(ValueError, match="subtitle_backend"):
+        Recorder(str(tmp_path / "x.mp4"), subtitle_backend="srt")
+
+
+@requires_ffmpeg
+def test_subtitle_sidecar_is_published_only_after_a_successful_encode(
+    tmp_path, monkeypatch
+):
+    """The blocker, in one test.
+
+    Building the command line used to write the sidecar. That is why a
+    mistyped --subtitle-sidecar destroyed the named file before any
+    capture happened, on the default drawtext backend. Now argv is pure
+    and the sidecar appears only once ffmpeg has exited cleanly.
+    """
+    fake_font = tmp_path / "fake.ttf"
+    fake_font.write_bytes(b"")
+    monkeypatch.setenv("FASTGRAB_FONT", str(fake_font))
+    sidecar = tmp_path / "clip.ass"
+    subs = [Subtitle(text="sub", start=0.0, end=1.0)]
+    enc = FfmpegEncoder(
+        str(tmp_path / "clip.mp4"), 64, 48, fps=10, subtitles=subs,
+        subtitle_sidecar=str(sidecar),
+    )
+    argv = enc._build_argv()
+    vf_value = argv[argv.index("-vf") + 1]
+    # A sidecar is orthogonal to the backend: the burn-in is still drawtext.
+    assert "drawtext=" in vf_value
+    assert "ass=filename=" not in vf_value
+    assert not sidecar.exists(), "building argv wrote the caller's file"
+
+    enc._build_argv = lambda *a, **k: [sys.executable, "-c",
+                                       "import sys; sys.stdin.buffer.read()"]
+    enc.start()
+    enc.close()
+    assert sidecar.exists()
+    assert "[Events]" in sidecar.read_text(encoding="utf-8")
+    assert enc._ass_path is None
+
+
+@requires_ffmpeg
+def test_subtitle_sidecar_that_cannot_be_written_reports_clearly(tmp_path):
+    enc = FfmpegEncoder(
+        str(tmp_path / "clip.mp4"), 64, 48, fps=10,
+        subtitles=[Subtitle(text="sub", start=0.0, end=1.0)],
+        subtitle_sidecar=str(tmp_path / "no-such-dir" / "clip.ass"),
+    )
+    enc._build_argv = lambda *a, **k: [sys.executable, "-c",
+                                       "import sys; sys.stdin.buffer.read()"]
+    enc.start()
+    # The CLI only prints RuntimeError/ValueError, so a bad path handed
+    # in by the user must not surface as a bare OSError traceback.
+    with pytest.raises(RuntimeError, match="subtitle sidecar"):
+        enc.close()
+
+
+def test_cli_subtitle_backend_and_sidecar_flags():
+    parser = recording_cli.build_parser()
+    args = parser.parse_args(["--fullscreen", "-o", "x.mp4"])
+    assert args.subtitle_backend == "drawtext"
+    assert args.subtitle_sidecar is None
+    args = parser.parse_args([
+        "--fullscreen", "-o", "x.mp4", "--subtitle-backend", "ass",
+        "--subtitle-font-name", "DejaVu Sans", "--subtitle-sidecar",
+    ])
+    assert args.subtitle_backend == "ass"
+    assert args.subtitle_font_name == "DejaVu Sans"
+    assert args.subtitle_sidecar == ""     # bare flag -> derive from output
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--fullscreen", "-o", "x.mp4",
+                           "--subtitle-backend", "srt"])
+
+
+def test_cli_resolve_sidecar():
+    assert recording_cli._resolve_sidecar(None, "demo.mp4") is None
+    assert recording_cli._resolve_sidecar("", "demo.mp4") == "demo.ass"
+    assert recording_cli._resolve_sidecar("", "/tmp/a.b/demo.webm") == "/tmp/a.b/demo.ass"
+    assert recording_cli._resolve_sidecar("/tmp/other.ass", "demo.mp4") == "/tmp/other.ass"
+
+
+@requires_ffmpeg
+def test_encoder_burns_ass_subtitles(tmp_path):
+    out = tmp_path / "ass.mp4"
+    # Text with a brace and a backslash goes through the real libass
+    # parser, which rejects a malformed script outright.
+    subs = [Subtitle(text="burned {in} C:\\path", start=0.0, end=1.0)]
+    enc = FfmpegEncoder(
+        str(out), 64, 48, fps=10, subtitles=subs, subtitle_backend="ass",
+    )
+    frame = numpy.zeros((48, 64, 4), dtype=numpy.uint8)
+    script = None
+    with enc:
+        script = enc._ass_path
+        for _ in range(8):
+            enc.write_frame(frame)
+    assert out.exists()
+    assert out.stat().st_size > 0
+    assert not os.path.exists(script)   # temp script removed after encoding
+
+
+@requires_ffmpeg
+@pytest.mark.skipif(
+    os.name == "nt", reason="':' is not a legal filename character on Windows",
+)
+def test_encoder_burns_ass_from_a_path_full_of_filter_metacharacters(tmp_path):
+    # ':' separates filter options, ',' separates filters and "'" quotes,
+    # so an under-escaped path makes ffmpeg either fail to parse the graph
+    # or quietly open a file that does not exist. Both surface here as a
+    # RuntimeError out of close().
+    sidecar = tmp_path / "we'ird, na:me.ass"
+    out = tmp_path / "nasty.mp4"
+    enc = FfmpegEncoder(
+        str(out), 64, 48, fps=10,
+        subtitles=[Subtitle(text="hi", start=0.0, end=1.0)],
+        subtitle_backend="ass", subtitle_sidecar=str(sidecar),
+    )
+    frame = numpy.zeros((48, 64, 4), dtype=numpy.uint8)
+    with enc:
+        for _ in range(6):
+            enc.write_frame(frame)
+    assert sidecar.exists()
+    assert out.stat().st_size > 0
 
 
 def test_cli_parse_subtitle():
@@ -577,7 +960,7 @@ _NOISY_CHILD = (
 def _encoder_over(tmp_path, volume, status=0):
     """An encoder whose 'ffmpeg' is a child with a known stderr volume."""
     enc = FfmpegEncoder(str(tmp_path / "out.mp4"), 64, 48, fps=30)
-    enc._build_argv = lambda: [
+    enc._build_argv = lambda *a, **k: [
         sys.executable, "-c",
         _NOISY_CHILD.format(volume=volume, status=status),
     ]
@@ -1173,7 +1556,7 @@ _DYING_CHILD = (
 
 def _encoder_running(tmp_path, source):
     enc = FfmpegEncoder(str(tmp_path / "out.mp4"), 64, 48, fps=30)
-    enc._build_argv = lambda: [sys.executable, "-c", source]
+    enc._build_argv = lambda *a, **k: [sys.executable, "-c", source]
     enc.start()
     return enc
 
@@ -1438,3 +1821,422 @@ def test_the_handler_is_installed_while_recording(monkeypatch, tmp_path):
     assert rc == 0
     assert seen["handler"] is not seen["default"], "the loop ran unprotected"
     assert seen["stopped"], "a Ctrl-C mid-recording did not ask it to stop"
+
+
+# -------- the sidecar must never destroy anything --------
+#
+# Reproduced before it was fixed: with the DEFAULT drawtext backend,
+# FfmpegEncoder(subtitle_sidecar=<an existing video>) followed by
+# _build_argv() truncated a 2500-byte file to a 678-byte ASS script. No
+# ffmpeg process, no capture, no opt-in to ASS at all. These pin the
+# properties that stop it, none of which a rendering test can see.
+
+
+def _sidecar_encoder(tmp_path, sidecar, output="clip.mp4", **kw):
+    return FfmpegEncoder(
+        str(tmp_path / output), 64, 48, fps=10,
+        subtitles=[Subtitle(text="sub", start=0.0, end=1.0)],
+        subtitle_sidecar=str(sidecar), **kw
+    )
+
+
+def test_building_argv_never_touches_the_sidecar_path(tmp_path):
+    """The exact shape of the original bug."""
+    victim = tmp_path / "precious.mp4"
+    victim.write_bytes(b"A REAL VIDEO" * 200)
+    before = victim.read_bytes()
+
+    enc = _sidecar_encoder(tmp_path, victim)
+    enc._build_argv()
+    enc._build_argv()          # twice, in case the first was the only write
+
+    assert victim.read_bytes() == before, "argv construction rewrote the file"
+
+
+def test_a_sidecar_that_is_the_output_file_is_refused(tmp_path):
+    """The one overwrite that is never what anyone meant."""
+    out = tmp_path / "clip.mp4"
+    with pytest.raises(ValueError, match="output file"):
+        FfmpegEncoder(
+            str(out), 64, 48, fps=10,
+            subtitles=[Subtitle(text="s", start=0.0, end=1.0)],
+            subtitle_sidecar=str(out),
+        )
+
+
+def test_the_output_alias_check_does_not_need_the_file_to_exist(tmp_path):
+    """Refused before the recording, not after it has overwritten itself."""
+    out = tmp_path / "not-yet.mp4"
+    assert not out.exists()
+    with pytest.raises(ValueError, match="output file"):
+        FfmpegEncoder(
+            str(out), 64, 48, fps=10,
+            subtitles=[Subtitle(text="s", start=0.0, end=1.0)],
+            subtitle_sidecar="file:" + str(out),
+        )
+
+
+def test_a_symlinked_alias_is_still_the_output_file(tmp_path):
+    out = tmp_path / "clip.mp4"
+    out.write_bytes(b"video")
+    link = tmp_path / "alias.mp4"
+    link.symlink_to(out)
+    with pytest.raises(ValueError, match="output file"):
+        _sidecar_encoder(tmp_path, link)
+
+
+def test_a_sidecar_without_subtitles_is_refused(tmp_path):
+    """Otherwise it silently produces nothing at all."""
+    with pytest.raises(ValueError, match="no subtitles"):
+        FfmpegEncoder(
+            str(tmp_path / "clip.mp4"), 64, 48, fps=10,
+            subtitle_sidecar=str(tmp_path / "clip.ass"),
+        )
+
+
+def test_a_remote_sidecar_destination_is_refused(tmp_path):
+    """There is nothing local to write, and ffmpeg will not do it for us."""
+    with pytest.raises(ValueError, match="local path"):
+        _sidecar_encoder(tmp_path, "rtmp://example.invalid/live/clip.ass")
+
+
+@requires_ffmpeg
+def test_a_failed_encode_leaves_an_existing_sidecar_alone(tmp_path):
+    """Publishing after success means a failure changes nothing on disk."""
+    sidecar = tmp_path / "clip.ass"
+    sidecar.write_text("MY EARLIER CAPTIONS", encoding="utf-8")
+
+    enc = _sidecar_encoder(tmp_path, sidecar)
+    enc._build_argv = lambda *a, **k: [sys.executable, "-c",
+                                       "import sys; sys.stdin.buffer.read();"
+                                       " sys.exit(4)"]
+    enc.start()
+    with pytest.raises(RuntimeError, match="status 4"):
+        enc.close()
+    assert sidecar.read_text(encoding="utf-8") == "MY EARLIER CAPTIONS"
+
+
+def test_the_script_ffmpeg_reads_is_never_the_callers_sidecar(tmp_path):
+    """ffmpeg opens the script lazily, so it must own a private copy.
+
+    Deleting the script after Popen returns but before the first frame
+    still fails ASS initialisation — a successful Popen does not mean it
+    has been read. Two recordings pointed at one sidecar would otherwise
+    be able to consume each other's.
+    """
+    sidecar = tmp_path / "clip.ass"
+    enc = _sidecar_encoder(tmp_path, sidecar, subtitle_backend="ass")
+    script = enc._write_ass(enc.ass_document())
+    argv = enc._build_argv(script)
+    vf_value = argv[argv.index("-vf") + 1]
+    assert str(sidecar) not in vf_value, "ffmpeg was pointed at the caller's file"
+    assert script != str(sidecar)
+    enc.close()
+
+
+def test_the_temporary_script_goes_away_when_start_fails(tmp_path):
+    enc = _sidecar_encoder(tmp_path, tmp_path / "clip.ass",
+                           subtitle_backend="ass")
+    enc._build_argv = lambda *a, **k: ["/nonexistent-binary-for-fastgrab"]
+    with pytest.raises(Exception):
+        enc.start()
+    assert enc._ass_path is None
+    assert enc._stderr_file is None
+
+
+@requires_ffmpeg
+@pytest.mark.parametrize("name", [
+    "it's.ttf", "a:b.ttf", "a,b.ttf", "a[b].ttf",
+    pytest.param("a\\b.ttf", marks=pytest.mark.skipif(
+        os.name == "nt",
+        reason="a backslash is a path separator on Windows, not a filename",
+    )),
+])
+def test_a_font_path_with_awkward_characters_still_renders(name, tmp_path):
+    """The real oracle: the same font under an awkward name must render
+    identically to the same font under a plain one.
+
+    Measured before the fix: apostrophe, colon, comma and bracket each
+    made ffmpeg reject the filtergraph outright, and backslash produced
+    1191 lit pixels against the reference's 1920.
+    """
+    base = encoder_mod._find_font()
+    if base is None:
+        pytest.skip("no usable font on this host")
+
+    reference, err = _render_gray(
+        encoder_mod._build_drawtext_filter(title="Demo", font_path=base)
+    )
+    assert reference is not None, err
+    assert (reference > 40).sum() > 0, "the reference rendered nothing"
+
+    awkward = tmp_path / name
+    shutil.copy(base, awkward)
+    got, err = _render_gray(
+        encoder_mod._build_drawtext_filter(title="Demo", font_path=str(awkward))
+    )
+    assert got is not None, "ffmpeg rejected the filter for {!r}: {}".format(
+        name, err
+    )
+    assert numpy.array_equal(got, reference), (
+        "{!r} rendered differently: {} lit pixels vs {}".format(
+            name, int((got > 40).sum()), int((reference > 40).sum())
+        )
+    )
+
+
+def test_publishing_refuses_a_sidecar_that_became_the_recording(tmp_path):
+    """The publish-time guard, driven directly.
+
+    The construction check cannot answer this: when neither file exists,
+    samefile() raises and comparing realpath strings says two names are
+    two files. They may not be -- a case-insensitive filesystem is the
+    real case -- and by publish time that file holds the recording.
+
+    Driven straight at _publish_sidecar rather than through a fake
+    ffmpeg. The first version of this test ran a child that wrote the
+    output only after close() sent it EOF, so the alias was never
+    actually created and the test passed against the *unguarded* code
+    too. A regression test that cannot fail is worse than none.
+    """
+    out = tmp_path / "clip.mp4"
+    sidecar = tmp_path / "captions.ass"
+    enc = FfmpegEncoder(
+        str(out), 64, 48, fps=10,
+        subtitles=[Subtitle(text="s", start=0.0, end=1.0)],
+        subtitle_sidecar=str(sidecar),
+    )   # accepted: at this point neither path exists
+
+    # Now they are the same file, exactly as the encode finishing would
+    # leave them on a filesystem that folds case.
+    out.write_bytes(b"THE RECORDING")
+    os.link(out, sidecar)
+
+    with pytest.raises(RuntimeError, match="recording that was just written"):
+        enc._publish_sidecar("[Script Info]\n")
+    assert out.read_bytes() == b"THE RECORDING"
+
+
+def test_publishing_still_works_when_the_sidecar_is_a_separate_file(tmp_path):
+    """The guard must not refuse the ordinary case."""
+    out = tmp_path / "clip.mp4"
+    sidecar = tmp_path / "captions.ass"
+    enc = FfmpegEncoder(
+        str(out), 64, 48, fps=10,
+        subtitles=[Subtitle(text="s", start=0.0, end=1.0)],
+        subtitle_sidecar=str(sidecar),
+    )
+    out.write_bytes(b"THE RECORDING")
+    enc._publish_sidecar("[Script Info]\n")
+    assert sidecar.read_text(encoding="utf-8") == "[Script Info]\n"
+    assert out.read_bytes() == b"THE RECORDING"
+
+
+# -------- a literal backslash in a subtitle must stay one line --------
+#
+# ASS reads \n, \N and \h as a soft break, a hard break and a
+# non-breaking space, so a subtitle carrying a literal one has to be
+# defused. The branch doubled the backslash; measured through libass that
+# does not work -- "left\Nright" still rendered as two lines, corrupting
+# both the burned-in video and the exported sidecar.
+
+_ASS_HEAD = (
+    "[Script Info]\nScriptType: v4.00+\nPlayResX: 640\nPlayResY: 120\n\n"
+    "[V4+ Styles]\n"
+    "Format: Name,Fontname,Fontsize,PrimaryColour,Alignment,MarginV\n"
+    "Style: D,DejaVu Sans,36,&H00FFFFFF,2,10\n\n"
+    "[Events]\n"
+    "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n"
+)
+
+
+def _render_ass_line(text_field, tmp_path):
+    """Render one Dialogue line through libass; return (ink, height, width)."""
+    script = tmp_path / "line.ass"
+    script.write_text(
+        _ASS_HEAD + "Dialogue: 0,0:00:00.00,0:00:05.00,D,,0,0,0,,%s\n"
+        % text_field, encoding="utf-8")
+    frame, err = _render_gray(
+        "ass=filename=" + encoder_mod._escape_filter_path(str(script)),
+        width=640, height=120,
+    )
+    if frame is None:
+        return None, err
+    ys, xs = numpy.nonzero(frame > 40)
+    if not len(ys):
+        return (0, 0, 0), ""
+    return (int((frame > 40).sum()),
+            int(ys.max() - ys.min() + 1),
+            int(xs.max() - xs.min() + 1)), ""
+
+
+@requires_ffmpeg
+@pytest.mark.parametrize("letter", ["n", "N", "h"])
+def test_a_literal_backslash_before_a_control_letter_stays_on_one_line(
+    letter, tmp_path
+):
+    """The escaped form must render as the plain text plus a backslash.
+
+    Width is the reliable measure: exactly ten pixels wider than the same
+    text without the backslash, at this size and font, and on one line.
+    """
+    plain, _ = _render_ass_line("left" + letter + "right", tmp_path)
+    if plain is None or plain[0] == 0:
+        pytest.skip("libass rendered nothing here; no usable font")
+
+    escaped_field = subtitles_mod._escape_ass("left\\" + letter + "right")
+    escaped, err = _render_ass_line(escaped_field, tmp_path)
+    assert escaped is not None, err
+
+    assert escaped[1] == plain[1], (
+        "escaped \\{} wrapped onto {} lines' worth of height ({} vs {})"
+        .format(letter, escaped[1] / float(plain[1]), escaped[1], plain[1])
+    )
+    # The backslash's width is measured with whatever font libass
+    # actually resolved, not hardcoded: DejaVu Sans is 10px here and
+    # Liberation Mono, which libass substitutes when DejaVu is missing,
+    # is 18. A fixed number turns this into a test of the host's fonts.
+    with_inert, _ = _render_ass_line("left\\zright", tmp_path)
+    without, _ = _render_ass_line("leftzright", tmp_path)
+    backslash_width = with_inert[2] - without[2]
+    assert backslash_width > 0, "could not measure the backslash in this font"
+
+    assert escaped[2] == plain[2] + backslash_width, (
+        "expected the plain text plus one backslash ({}px in this font), "
+        "got width {} vs {}".format(backslash_width, escaped[2], plain[2])
+    )
+
+
+@requires_ffmpeg
+def test_the_zero_width_space_does_not_disturb_a_working_backslash(tmp_path):
+    """z is not an ASS tag, so that backslash already rendered correctly.
+
+    Inserting the separator there must change nothing at all — that is
+    what makes it safe to insert before n, N and h.
+    """
+    without, _ = _render_ass_line("left\\zright", tmp_path)
+    if without is None or without[0] == 0:
+        pytest.skip("libass rendered nothing here; no usable font")
+    with_sep, err = _render_ass_line(
+        "left\\" + subtitles_mod._ZWSP + "zright", tmp_path)
+    assert with_sep is not None, err
+    assert with_sep == without
+
+
+# -------- CLI: deriving and refusing a sidecar --------
+
+def test_a_bare_sidecar_flag_derives_from_the_path_ffmpeg_writes():
+    """`-o file:demo.mp4` writes demo.mp4, so the sidecar is demo.ass.
+
+    Deriving from the string as typed produced the literal filename
+    "file:demo.ass".
+    """
+    assert recording_cli._resolve_sidecar("", "demo.mp4") == "demo.ass"
+    assert recording_cli._resolve_sidecar("", "file:demo.mp4") == "demo.ass"
+    assert recording_cli._resolve_sidecar("", "/tmp/a.b/demo.webm") == "/tmp/a.b/demo.ass"
+
+
+def test_an_explicit_sidecar_path_is_taken_as_given():
+    assert recording_cli._resolve_sidecar("caps.ass", "file:demo.mp4") == "caps.ass"
+
+
+def test_a_bare_sidecar_flag_needs_a_local_output():
+    """There is no name to derive from a stream URL."""
+    with pytest.raises(ValueError, match="needs a path of its own"):
+        recording_cli._resolve_sidecar("", "rtmp://example.invalid/live/x.mp4")
+
+
+def test_no_sidecar_flag_stays_none():
+    assert recording_cli._resolve_sidecar(None, "demo.mp4") is None
+
+
+def test_a_refused_sidecar_prints_instead_of_tracebacking(capsys, tmp_path):
+    """Both this and Recorder's own validation sit outside the recording
+    try/except, so an unroutable refusal used to end in a traceback."""
+    rc = recording_cli.main([
+        "--region", "0,0,64,48", "-o", "rtmp://example.invalid/live/x.mp4",
+        "--subtitle", "0.0-1.0:hi", "--subtitle-sidecar",
+    ])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "error:" in captured.err
+    assert "needs a path of its own" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_the_colour_error_blames_the_name_not_the_format():
+    """chartreuse converts fine as 0x7FFF00; the lookup table is the limit.
+
+    Saying it "cannot be converted to ASS" sent the reader looking for a
+    format limitation that does not exist.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        subtitles_mod._ass_color("chartreuse")
+    message = str(excinfo.value)
+    assert "unsupported colour name" in message
+    assert "0xRRGGBB" in message
+    assert "sidecar" in message, "say that it bites with drawtext too"
+    # and the colour itself is expressible, which is the point
+    assert subtitles_mod._ass_color("0x7FFF00").startswith("&H")
+
+
+# -------- ASS cue timing --------
+
+def test_a_cue_too_short_for_a_centisecond_is_refused():
+    """It would round to zero length and never be drawn.
+
+    Measured: 1.001-1.004 becomes "0:00:01.00,0:00:01.00" and renders
+    nothing at any frame. Writing it anyway means a subtitle missing from
+    the video and from the sidecar, with nothing to say why.
+    """
+    with pytest.raises(ValueError, match="centisecond"):
+        subtitles_mod.build_ass_document(
+            [Subtitle(text="blink", start=1.001, end=1.004)]
+        )
+
+
+def test_a_cue_of_exactly_one_centisecond_is_fine():
+    """The boundary itself must not be refused."""
+    doc = subtitles_mod.build_ass_document(
+        [Subtitle(text="brief", start=1.00, end=1.01)]
+    )
+    assert "0:00:01.00,0:00:01.01" in doc
+
+
+@requires_ffmpeg
+def test_the_ass_cue_end_is_exclusive(tmp_path):
+    """One frame's difference from drawtext, and the format's own rule.
+
+    Rendered at 100 fps: for a 0.5-1.0 cue both backends draw from 0.50,
+    and at exactly 1.00 drawtext still draws while ASS has stopped.
+    """
+    font = encoder_mod._find_font()
+    if font is None:
+        pytest.skip("no usable font on this host")
+    style = SubtitleStyle(font_path=font)
+    subs = [Subtitle(text="HELLO", start=0.5, end=1.0)]
+
+    script = tmp_path / "cue.ass"
+    script.write_text(
+        subtitles_mod.build_ass_document(subs, style, width=480, height=80),
+        encoding="utf-8")
+    ass_vf = "ass=filename=" + encoder_mod._escape_filter_path(str(script))
+    draw_vf = subtitles_mod.build_subtitle_filters(subs, style)
+
+    def strip(vf):
+        proc = subprocess.run(
+            ["ffmpeg", "-v", "error", "-f", "lavfi",
+             "-i", "color=black:s=480x80:d=2:r=100", "-vf", vf,
+             "-frames:v", "110", "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+            capture_output=True)
+        assert proc.returncode == 0, proc.stderr.decode()[:200]
+        arr = numpy.frombuffer(proc.stdout, dtype=numpy.uint8)
+        n = len(arr) // (80 * 480)
+        return [(f > 40).sum() for f in arr[: n * 80 * 480].reshape(n, 80, 480)]
+
+    drawn, assed = strip(draw_vf), strip(ass_vf)
+    assert drawn[49] == 0 and assed[49] == 0, "drawn before the cue started"
+    assert drawn[50] > 0 and assed[50] > 0, "both must start at 0.50"
+    assert drawn[99] > 0 and assed[99] > 0, "both must still be up at 0.99"
+    assert drawn[100] > 0, "drawtext includes the end instant"
+    assert assed[100] == 0, "ASS excludes it — this is the documented gap"

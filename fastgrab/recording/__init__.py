@@ -13,17 +13,20 @@ Public surface:
 * :class:`ClickStyle`    — click-overlay pattern / colour / timing
 * :class:`Subtitle`      — one timed subtitle line
 * :class:`SubtitleStyle` — font / colour / placement for subtitles
+* :data:`SUBTITLE_BACKENDS` — subtitle renderers (``drawtext``, ``ass``)
+* :func:`build_ass_document` — render subtitles as an ASS script
 
 The module imports cleanly without ``ffmpeg`` on PATH; the check is
 deferred to :meth:`FfmpegEncoder.start` so callers get a clear error
 only when they actually try to encode.
 """
 from .clicks import ClickStyle
-from .encoder import FfmpegEncoder, infer_codec
+from .encoder import SUBTITLE_BACKENDS, FfmpegEncoder, infer_codec
 from .recorder import Recorder
-from .subtitles import Subtitle, SubtitleStyle
+from .subtitles import Subtitle, SubtitleStyle, build_ass_document
 
 __all__ = [
     "Recorder", "FfmpegEncoder", "infer_codec",
     "ClickStyle", "Subtitle", "SubtitleStyle",
+    "SUBTITLE_BACKENDS", "build_ass_document",
 ]

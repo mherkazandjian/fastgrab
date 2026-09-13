@@ -5,7 +5,12 @@ import time
 from fastgrab.screenshot import Screenshot
 
 from .clicks import ClickStyle, MouseTracker, draw_cursor, overlay_clicks
-from .encoder import FfmpegEncoder, infer_codec, validate_fps
+from .encoder import (
+    FfmpegEncoder,
+    infer_codec,
+    validate_fps,
+    validate_subtitle_backend,
+)
 
 
 class Recorder:
@@ -18,8 +23,12 @@ class Recorder:
     ``title`` and ``overlay_text`` are baked into the encode by ffmpeg
     drawtext filters. ``subtitles`` (a list of
     :class:`fastgrab.recording.subtitles.Subtitle`, styled via
-    ``subtitle_style``) are rendered the same way, each during its own
-    start/end window.
+    ``subtitle_style``) are rendered the same way by default, each during
+    its own start/end window. Passing ``subtitle_backend='ass'`` renders
+    them through libass from a generated Advanced SubStation Alpha script
+    instead, and ``subtitle_sidecar='demo.ass'`` keeps that script next
+    alongside the video as an editable copy. It is not a selectable
+    track -- the subtitles are burned in either way.
 
     ``show_clicks`` overlays a click animation (see
     :class:`fastgrab.recording.clicks.ClickStyle`, passed as
@@ -35,7 +44,9 @@ class Recorder:
                  show_clicks: bool = False, click_style=None,
                  show_cursor: bool = False, cursor_color=(255, 255, 255),
                  cursor_scale: float = 1.0,
-                 subtitles=None, subtitle_style=None):
+                 subtitles=None, subtitle_style=None,
+                 subtitle_backend: str = "drawtext",
+                 subtitle_sidecar: str = None):
         self.output_path = output_path
         self.bbox = bbox  # (x, y, w, h) or None for fullscreen
         # Validate before touching the display so bad input fails fast
@@ -51,6 +62,8 @@ class Recorder:
         self.cursor_scale = cursor_scale
         self.subtitles = subtitles
         self.subtitle_style = subtitle_style
+        self.subtitle_backend = validate_subtitle_backend(subtitle_backend)
+        self.subtitle_sidecar = subtitle_sidecar
         self._grab = Screenshot(backend=backend)
 
     def _resolved_bbox(self):
@@ -114,6 +127,8 @@ class Recorder:
             self.output_path, width, height, fps=self.fps, codec=self.codec,
             title=self.title, overlay_text=self.overlay_text,
             subtitles=self.subtitles, subtitle_style=self.subtitle_style,
+            subtitle_backend=self.subtitle_backend,
+            subtitle_sidecar=self.subtitle_sidecar,
         )
         tracker = (
             MouseTracker(
