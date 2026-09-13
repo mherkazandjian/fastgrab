@@ -395,35 +395,37 @@ def test_a_stale_token_is_offered_then_dropped_rather_than_wedging_capture(
     )
 
 
-def test_an_existing_permissive_token_file_is_made_private(
-    portal, tmp_path, clean_token_store
+def test_writing_over_a_permissive_token_file_makes_it_private(
+    tmp_path, monkeypatch
 ):
     """O_CREAT's mode only applies when the file is created.
 
-    A token file that already exists group- or world-readable -- copied
-    between machines, restored from a backup, written by an older
-    version -- would otherwise keep those permissions and be handed the
-    rotated capability anyway. It reopens the screen share without
-    asking, so it must not be readable by anyone else.
+    A token file already sitting there group- or world-readable --
+    copied between machines, restored from a backup, written by an
+    older version -- would otherwise keep those permissions and be
+    handed the rotated capability anyway. It reopens the screen share
+    without asking, so nobody else may read it.
+
+    Driven straight at _write_token rather than through a capture: the
+    stale-token recovery path *deletes* the file before rewriting it,
+    so the end-to-end route never reaches the overwrite this is about
+    and passes whether or not the bug is present.
     """
-    from fastgrab.backends.portal import PortalBackend
+    from fastgrab.backends import portal as portal_module
 
-    clean_token_store.write_text("stale")
-    os.chmod(str(clean_token_store), 0o644)
-    portal(extra_env={"FASTGRAB_FAKE_TOKEN": "tok-rotated"})
+    path = tmp_path / "portal-restore-token"
+    path.write_text("older-token")
+    os.chmod(str(path), 0o644)
+    monkeypatch.setenv("FASTGRAB_PORTAL_TOKEN_FILE", str(path))
 
-    backend = PortalBackend(persist="persistent", timeout=30)
-    try:
-        backend.resolution()
-    finally:
-        backend.close()
+    portal_module._write_token("tok-rotated")
 
-    mode = os.stat(str(clean_token_store)).st_mode & 0o777
+    assert path.read_text() == "tok-rotated"
+    mode = os.stat(str(path)).st_mode & 0o777
     assert mode == 0o600, (
         "an already-permissive token file kept mode %s and was given "
         "the rotated capability" % oct(mode)
     )
-    assert clean_token_store.read_text() == "tok-rotated"
 
 
 def test_a_transient_token_keeps_its_bus_connection_alive(
