@@ -218,11 +218,11 @@ Per-platform extras:
  - **Linux/X11**: the C extension is compiled on install, so you need a C
    toolchain plus the Python and X11 headers:
 
-   - Debian/Ubuntu: ``sudo apt install build-essential python3-dev libx11-dev``
-   - Fedora: ``sudo dnf install gcc python3-devel libX11-devel``
+   - Debian/Ubuntu: ``sudo apt install build-essential python3-dev libx11-dev libxext-dev``
+   - Fedora: ``sudo dnf install gcc python3-devel libX11-devel libXext-devel``
 
-   Runtime needs only ``libX11`` and ``libgomp1`` (``libgomp`` on Fedora),
-   which are present on any desktop. ``Python.h: No such file`` means the
+   Runtime needs only ``libX11``, ``libXext`` and ``libgomp1``
+   (``libgomp`` on Fedora), which are present on any desktop. ``Python.h: No such file`` means the
    Python headers are missing (``python3-dev``); ``stdio.h: No such file``
    means the toolchain headers are (``build-essential``). Tested on
    Debian-based Python images, Ubuntu 24.04 and Fedora 44, Python 3.10–3.14.
@@ -234,6 +234,19 @@ Per-platform extras:
    fastgrab refuses that layout with a message naming the masks it found
    rather than returning wrong colours. ``xdpyinfo | grep "depth of root"``
    says which you have.
+
+   Capture uses the **MIT-SHM** X extension when it can: the server
+   writes the region straight into a shared memory segment instead of
+   pushing every pixel through the X socket, which is worth roughly
+   4-10x depending on resolution. It needs client and server on the same
+   machine, so a remote ``DISPLAY`` (or a server built without the
+   extension) falls back to ``XGetImage`` automatically — one failed
+   probe per connection, not per frame. Rows are copied out across an
+   OpenMP team once a frame is large enough to pay for it. Two
+   environment variables override the defaults, mostly for debugging:
+   ``FASTGRAB_NO_XSHM=1`` forces the plain path, and
+   ``FASTGRAB_OMP_MIN_BYTES`` sets the frame size in bytes above which
+   the copy is parallelised (``0`` keeps it serial always).
  - **Linux/Wayland (wlroots)**: a wlroots-based compositor (Sway,
    Hyprland, river, niri, cage) for the no-prompt path; the ``[wayland]``
    extra (``pip install fastgrab[wayland]``) pulls in ``pywayland``.
