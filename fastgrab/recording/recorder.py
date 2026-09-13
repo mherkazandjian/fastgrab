@@ -27,7 +27,8 @@ class Recorder:
     its own start/end window. Passing ``subtitle_backend='ass'`` renders
     them through libass from a generated Advanced SubStation Alpha script
     instead, and ``subtitle_sidecar='demo.ass'`` keeps that script next
-    to the video as an editable, player-toggleable track.
+    alongside the video as an editable copy. It is not a selectable
+    track -- the subtitles are burned in either way.
 
     ``show_clicks`` overlays a click animation (see
     :class:`fastgrab.recording.clicks.ClickStyle`, passed as

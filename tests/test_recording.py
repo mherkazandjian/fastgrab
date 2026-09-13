@@ -587,6 +587,7 @@ def test_unknown_subtitle_backend_is_rejected(tmp_path):
         Recorder(str(tmp_path / "x.mp4"), subtitle_backend="srt")
 
 
+@requires_ffmpeg
 def test_subtitle_sidecar_is_published_only_after_a_successful_encode(
     tmp_path, monkeypatch
 ):
@@ -622,6 +623,7 @@ def test_subtitle_sidecar_is_published_only_after_a_successful_encode(
     assert enc._ass_path is None
 
 
+@requires_ffmpeg
 def test_subtitle_sidecar_that_cannot_be_written_reports_clearly(tmp_path):
     enc = FfmpegEncoder(
         str(tmp_path / "clip.mp4"), 64, 48, fps=10,
@@ -1898,6 +1900,7 @@ def test_a_remote_sidecar_destination_is_refused(tmp_path):
         _sidecar_encoder(tmp_path, "rtmp://example.invalid/live/clip.ass")
 
 
+@requires_ffmpeg
 def test_a_failed_encode_leaves_an_existing_sidecar_alone(tmp_path):
     """Publishing after success means a failure changes nothing on disk."""
     sidecar = tmp_path / "clip.ass"
@@ -2118,3 +2121,60 @@ def test_the_zero_width_space_does_not_disturb_a_working_backslash(tmp_path):
         "left\\" + subtitles_mod._ZWSP + "zright", tmp_path)
     assert with_sep is not None, err
     assert with_sep == without
+
+
+# -------- CLI: deriving and refusing a sidecar --------
+
+def test_a_bare_sidecar_flag_derives_from_the_path_ffmpeg_writes():
+    """`-o file:demo.mp4` writes demo.mp4, so the sidecar is demo.ass.
+
+    Deriving from the string as typed produced the literal filename
+    "file:demo.ass".
+    """
+    assert recording_cli._resolve_sidecar("", "demo.mp4") == "demo.ass"
+    assert recording_cli._resolve_sidecar("", "file:demo.mp4") == "demo.ass"
+    assert recording_cli._resolve_sidecar("", "/tmp/a.b/demo.webm") == "/tmp/a.b/demo.ass"
+
+
+def test_an_explicit_sidecar_path_is_taken_as_given():
+    assert recording_cli._resolve_sidecar("caps.ass", "file:demo.mp4") == "caps.ass"
+
+
+def test_a_bare_sidecar_flag_needs_a_local_output():
+    """There is no name to derive from a stream URL."""
+    with pytest.raises(ValueError, match="needs a path of its own"):
+        recording_cli._resolve_sidecar("", "rtmp://example.invalid/live/x.mp4")
+
+
+def test_no_sidecar_flag_stays_none():
+    assert recording_cli._resolve_sidecar(None, "demo.mp4") is None
+
+
+def test_a_refused_sidecar_prints_instead_of_tracebacking(capsys, tmp_path):
+    """Both this and Recorder's own validation sit outside the recording
+    try/except, so an unroutable refusal used to end in a traceback."""
+    rc = recording_cli.main([
+        "--region", "0,0,64,48", "-o", "rtmp://example.invalid/live/x.mp4",
+        "--subtitle", "0.0-1.0:hi", "--subtitle-sidecar",
+    ])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "error:" in captured.err
+    assert "needs a path of its own" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_the_colour_error_blames_the_name_not_the_format():
+    """chartreuse converts fine as 0x7FFF00; the lookup table is the limit.
+
+    Saying it "cannot be converted to ASS" sent the reader looking for a
+    format limitation that does not exist.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        subtitles_mod._ass_color("chartreuse")
+    message = str(excinfo.value)
+    assert "unsupported colour name" in message
+    assert "0xRRGGBB" in message
+    assert "sidecar" in message, "say that it bites with drawtext too"
+    # and the colour itself is expressible, which is the point
+    assert subtitles_mod._ass_color("0x7FFF00").startswith("&H")

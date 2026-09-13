@@ -18,7 +18,9 @@ something ffmpeg understands, selected with ``subtitle_backend``:
     (:func:`build_ass_filter`). ASS is a real subtitle format, so the
     script can also be kept as an editable sidecar next to the video
     (``subtitle_sidecar=``), where players such as mpv and VLC pick it up
-    automatically as a toggleable track.
+    automatically. Note it is an editable copy, not a selectable
+    track: the subtitles are burned into the video either way, so a
+    player that loads the sidecar as well shows the text twice.
 
 Both paths are pure string generation — the rendering is done entirely by
 ffmpeg, so there are no new Python runtime dependencies.
@@ -260,9 +262,19 @@ def _parse_ffmpeg_color(spec) -> tuple:
         else:
             digits = None
         if digits is None or len(digits) not in (6, 8):
+            # Careful with the wording: the *colour* is expressible in
+            # ASS perfectly well -- chartreuse is 0x7FFF00 and converts
+            # fine. What is missing is the name, because ffmpeg knows
+            # ~150 of them and this writer knows a handful. Saying "not
+            # supported in ASS" would send the reader looking in the
+            # wrong place.
             raise ValueError(
-                "cannot convert colour {!r} to ASS: use 0xRRGGBB[AA], "
-                "#RRGGBB[AA], or one of {}".format(
+                "unsupported colour name {!r} for ASS output: drawtext "
+                "takes any ffmpeg colour name, but the ASS writer only "
+                "knows {}. Give it as 0xRRGGBB[AA] or #RRGGBB[AA] "
+                "instead. This applies whenever an ASS script is "
+                "produced, including a --subtitle-sidecar exported while "
+                "drawtext does the rendering.".format(
                     spec, ", ".join(sorted(_COLOR_NAMES))
                 )
             )

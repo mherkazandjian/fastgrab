@@ -379,7 +379,8 @@ class FfmpegEncoder:
     file and burns it in with libass. ``subtitle_sidecar`` is a path to
     write that ASS script to and keep — it works with either backend, and
     naming it after the video (``demo.mp4`` → ``demo.ass``) is enough for
-    mpv or VLC to offer it as a toggleable track.
+    an editable copy. It is not a selectable track: the subtitles
+    are burned into the video either way.
     """
 
     def __init__(self, output_path: str, width: int, height: int,
@@ -510,9 +511,13 @@ class FfmpegEncoder:
         """
         self._cleanup_ass()
         handle, path = tempfile.mkstemp(prefix="fastgrab-", suffix=".ass")
+        # Recorded before the write, not after: the file exists from
+        # mkstemp onwards, so a write that fails part-way -- a full disk
+        # is the obvious way -- would otherwise leave a script that even
+        # an explicit close() had no way to find.
+        self._ass_path = path
         with os.fdopen(handle, "w", encoding="utf-8") as fobj:
             fobj.write(document)
-        self._ass_path = path
         return path
 
     def _publish_sidecar(self, document: str) -> None:
@@ -591,11 +596,24 @@ class FfmpegEncoder:
         # own diagnostics -- and an ffmpeg blocked on stderr stops
         # reading stdin, which blocks write_frame(), which is a hang with
         # no timeout on either side. A file has no capacity to reach.
-        document = self.ass_document()
-        ass_path = self._write_ass(document) if document is not None else None
-        self._sidecar_document = document
+        # The whole preparation is guarded, not just the Popen: the
+        # script and the stderr file are both created before anything can
+        # be started, so a failure between them used to leave the earlier
+        # one behind with nothing left holding a reference to it.
+        try:
+            document = self.ass_document()
+            ass_path = (
+                self._write_ass(document) if document is not None else None
+            )
+            self._sidecar_document = document
+            self._stderr_file = tempfile.TemporaryFile()
+        except Exception:
+            self._cleanup_ass()
+            if self._stderr_file is not None:
+                self._stderr_file.close()
+                self._stderr_file = None
+            raise
 
-        self._stderr_file = tempfile.TemporaryFile()
         try:
             argv = self._build_argv(ass_path)
             self._proc = subprocess.Popen(
