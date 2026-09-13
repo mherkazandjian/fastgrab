@@ -214,19 +214,28 @@ class PipeWireVideoReader:
             raise RuntimeError("could not map the PipeWire buffer")
         try:
             flat = numpy.frombuffer(info.data, dtype=numpy.uint8)
-            needed = offset + stride * height
+            # Through the last *pixel*, not the last row: a strided
+            # buffer is only obliged to carry padding *between* rows, so
+            # requiring offset + stride * height rejects a perfectly
+            # good frame whose final row simply ends where the pixels
+            # do. A 7x3 BGRx frame at stride 48 needs 132 bytes, not
+            # 152.
+            needed = offset + (height - 1) * stride + width * 4
             if flat.size < needed:
                 raise RuntimeError(
                     "PipeWire buffer is {} bytes, too short for {}x{} at "
                     "stride {} (offset {})".format(
                         flat.size, width, height, stride, offset)
                 )
-            # Copied, not viewed: the mapping is borrowed and is unmapped
-            # again below, so a view would dangle. Trimming the padding
-            # off each row is what makes this a copy rather than a
-            # reshape.
-            rows = flat[offset:needed].reshape(height, stride)
-            frame = rows[:, : width * 4].reshape(height, width, 4).copy()
+            # A strided view over the rows, then copied out: the mapping
+            # is borrowed and unmapped again below, so a view would
+            # dangle. Viewing rather than reshaping through the padding
+            # is also what keeps the bound above honest -- there may be
+            # nothing after the last pixel to reshape through.
+            rows = numpy.lib.stride_tricks.as_strided(
+                flat[offset:], shape=(height, width * 4),
+                strides=(stride, 1))
+            frame = numpy.ascontiguousarray(rows).reshape(height, width, 4)
         finally:
             buffer.unmap(info)
         self._last = frame

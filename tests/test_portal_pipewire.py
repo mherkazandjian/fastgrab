@@ -256,14 +256,17 @@ def test_a_padded_row_stride_is_honoured(node_id):
     width, height = 7, 3
     stride = width * 4 + 20          # 20 bytes of padding per row
     offset = 8                       # and the plane does not start at 0
-    raw = bytearray(offset + stride * height)
+    # Exactly through the last pixel, with no padding after the final
+    # row: a strided buffer only has to pad *between* rows, and a bound
+    # of offset + stride * height would reject this valid frame.
+    raw = bytearray(offset + (height - 1) * stride + width * 4)
     for y in range(height):
         for x in range(width):
             at = offset + y * stride + x * 4
             raw[at:at + 4] = bytes((x, y, 200, 255))
     # The padding is filled with a value no real pixel here carries, so
     # leaking any of it into the result is unmistakable.
-    for y in range(height):
+    for y in range(height - 1):          # no row after the last one
         at = offset + y * stride + width * 4
         raw[at:at + (stride - width * 4)] = b"\xee" * (stride - width * 4)
 

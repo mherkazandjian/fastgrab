@@ -181,6 +181,16 @@ def _persist_mode(explicit=None):
 
 #: Tokens seen in this process, so a second Screenshot in one program
 #: does not re-prompt even when nothing is written to disk.
+#:
+#: Keyed by persist mode, because the modes must not share. A restore
+#: *consumes* its token and the portal issues a replacement; a transient
+#: backend keeps that replacement only in memory, so if it were allowed
+#: to pick up the persistent token from disk it would spend it and leave
+#: the stored one dead -- and the next process, the one persistence
+#: exists for, would be prompted after all.
+#:
+#: The retained bus connection lives under its own key: it belongs to
+#: the process, not to a mode. See _save_token.
 _PROCESS_TOKEN = {}
 
 TOKEN_ENV = "FASTGRAB_PORTAL_TOKEN_FILE"
@@ -251,8 +261,18 @@ def _write_token(token):
                 pass
 
 
-def _forget_token():
-    _PROCESS_TOKEN.pop("token", None)
+def _forget_token(mode=None):
+    """Drop a rejected token. One mode's, or every mode's.
+
+    The connection goes too: it was retained only to keep a remembered
+    token usable, and there is no longer one to keep.
+    """
+    if mode is None:
+        for key in list(_PROCESS_TOKEN):
+            if key != "connection":
+                _PROCESS_TOKEN.pop(key, None)
+    else:
+        _PROCESS_TOKEN.pop(mode, None)
     _PROCESS_TOKEN.pop("connection", None)
     try:
         os.remove(_token_path())
@@ -361,7 +381,7 @@ class PortalBackend(BaseBackend):
         """
         if self._persist == PERSIST_MODES["none"]:
             return None
-        token = _PROCESS_TOKEN.get("token")
+        token = _PROCESS_TOKEN.get(self._persist)
         if token is None and self._persist == PERSIST_MODES["persistent"]:
             token = _read_token()
         return token
@@ -369,7 +389,7 @@ class PortalBackend(BaseBackend):
     def _save_token(self, token, session=None):
         if not token or self._persist == PERSIST_MODES["none"]:
             return
-        _PROCESS_TOKEN["token"] = token
+        _PROCESS_TOKEN[self._persist] = token
         # The bus connection is kept with it, and deliberately not the
         # session. A transient permission belongs to the D-Bus *client*,
         # and Gio's shared session bus does not outlive its last
@@ -414,7 +434,7 @@ class PortalBackend(BaseBackend):
             # A stored token the desktop no longer honours would
             # otherwise wedge capture until somebody found and deleted
             # the file. Drop it and ask properly, once.
-            _forget_token()
+            _forget_token(self._persist)
             # use_token=False rather than trusting the deletion.
             # _forget_token() cannot guarantee the file is gone -- an
             # unwritable directory makes the unlink fail and it

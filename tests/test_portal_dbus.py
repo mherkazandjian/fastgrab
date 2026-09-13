@@ -282,6 +282,91 @@ def test_the_handshake_works_from_a_thread_with_its_own_glib_context(portal):
     assert outcome["streams"], "no streams came back"
 
 
+def test_ctrl_c_during_the_chooser_is_not_swallowed():
+    """The wait runs on a private GLib context, and that has a cost.
+
+    loop.run() blocks inside C, and PyGObject's signal-wakeup watch is
+    installed on the *global default* context -- which the private one
+    does not iterate. Without something Python-side ticking, Ctrl-C
+    while the chooser is on screen would go unnoticed until the portal
+    answered or the timeout expired, up to a minute of an apparently
+    frozen program.
+
+    The interrupt is caught here rather than allowed to escape: pytest
+    reads an escaping KeyboardInterrupt as "abandon the run", so a
+    regression would stop the session instead of naming what broke.
+    """
+    import _thread
+    import threading
+
+    class SilentConnection(object):
+        def get_unique_name(self):
+            return ":1.99"
+
+        def signal_subscribe(self, *_args, **_kwargs):
+            return 1
+
+        def signal_unsubscribe(self, _subscription):
+            pass
+
+        def call_sync(self, *_args, **_kwargs):
+            return None
+
+    session = ScreenCastSession(app_id="fastgrab-test", timeout=30)
+    session._conn = SilentConnection()
+
+    interrupt = threading.Timer(0.5, _thread.interrupt_main)
+    interrupt.start()
+    started = time.monotonic()
+    try:
+        session.open()
+    except KeyboardInterrupt:
+        elapsed = time.monotonic() - started
+    except PortalUnavailable:
+        pytest.fail(
+            "Ctrl-C was ignored until the request timed out: the private "
+            "GLib context never returns to Python, so the signal handler "
+            "does not run"
+        )
+    else:
+        pytest.fail("open() returned even though nothing ever answered")
+    finally:
+        interrupt.cancel()
+
+    assert elapsed < 10, (
+        "Ctrl-C took %.1fs to take effect" % elapsed
+    )
+
+
+def test_a_transient_capture_does_not_spend_the_persistent_token(
+    tmp_path, clean_token_store
+):
+    """The modes must not share a token.
+
+    A restore consumes its token and the portal issues a replacement.
+    A transient backend keeps that replacement in memory only -- so if
+    it were allowed to pick up the token stored on disk it would spend
+    it and leave a dead one behind, and the next process, the one
+    persistence exists for, would be prompted after all.
+    """
+    from fastgrab.backends.portal import PERSIST_MODES, PortalBackend
+    from fastgrab.backends import portal as portal_module
+
+    clean_token_store.write_text("tok-on-disk")
+    portal_module._PROCESS_TOKEN[PERSIST_MODES["persistent"]] = "tok-persist"
+
+    transient = object.__new__(PortalBackend)
+    transient._persist = PERSIST_MODES["transient"]
+    assert transient._load_token() is None, (
+        "a transient backend picked up the persistent token and would "
+        "have spent it"
+    )
+
+    persistent = object.__new__(PortalBackend)
+    persistent._persist = PERSIST_MODES["persistent"]
+    assert persistent._load_token() == "tok-persist"
+
+
 def test_an_abandoned_request_is_closed():
     """Unsubscribing stops us listening; it does not stop the request.
 
@@ -574,7 +659,9 @@ def test_a_transient_token_keeps_its_bus_connection_alive(
     del backend
     gc.collect()
 
-    assert portal_module._PROCESS_TOKEN.get("token") == "tok-transient"
+    from fastgrab.backends.portal import PERSIST_MODES
+    assert portal_module._PROCESS_TOKEN.get(
+        PERSIST_MODES["transient"]) == "tok-transient"
     assert portal_module._PROCESS_TOKEN.get("connection") is not None, (
         "the token was remembered without the connection it belongs to"
     )

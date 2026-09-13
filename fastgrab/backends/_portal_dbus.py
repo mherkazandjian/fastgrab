@@ -191,6 +191,20 @@ class ScreenCastSession:
             timer = GLib.timeout_source_new(int(self.timeout * 1000))
             timer.set_callback(give_up)
             timer.attach(context)
+
+            # A heartbeat, so Ctrl-C still works while we wait.
+            # loop.run() blocks inside C: PyGObject's signal-wakeup
+            # watch lives on the *global default* context, which this
+            # private one does not iterate, so Python's SIGINT handler
+            # would not run until the portal answered or the timeout
+            # fired -- up to a minute of an unresponsive Ctrl-C while
+            # the chooser is on screen. Invoking any Python callback
+            # gives the interpreter its chance to notice a pending
+            # signal, so an idle tick is enough; the cost is ten
+            # no-op wakeups a second while a human decides.
+            heartbeat = GLib.timeout_source_new(100)
+            heartbeat.set_callback(lambda *_a: True)
+            heartbeat.attach(context)
             try:
                 conn.call_sync(
                     PORTAL_BUS, PORTAL_PATH, SCREENCAST_IFACE, method,
@@ -203,6 +217,7 @@ class ScreenCastSession:
                 # path that is already reporting a real failure.
                 if not fired:
                     timer.destroy()
+                heartbeat.destroy()
                 conn.signal_unsubscribe(subscription)
                 if "response" not in result:
                     # Leaving without an answer -- timed out, or
