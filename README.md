@@ -19,13 +19,27 @@ resolution    | fps
 4K            | 340
 8K            | 109
 
-Measured with [examples/benchmark.py](https://github.com/mherkazandjian/fastgrab/blob/main/examples/benchmark.py)
-on 8 cores of an AMD EPYC 9555 under Linux/X11, 800 frames per resolution,
-against a local X server — so the MIT-SHM fast path is in use and large
-frames have an OpenMP team to copy them. A **remote** display cannot use
-shared memory and falls back to ``XGetImage``, which costs roughly an order
-of magnitude: on the same machine that is 221 fps at 1080p rather than 2601.
-Figures on other machines will differ.
+Measured with [examples/benchmark.py](https://github.com/mherkazandjian/fastgrab/blob/main/examples/benchmark.py),
+800 frames per resolution, on:
+
+ - **CPU**: AMD EPYC 9555 (64-core Zen 5), **8 cores** used for the run
+   (``taskset -c 0-7``)
+ - **GPU**: NVIDIA RTX PRO 6000 Blackwell Server Edition, 96 GB, driver
+   580.178.04 — **not involved in these numbers**. Capture ran against an
+   ``Xvfb`` software framebuffer in system RAM, so no pixel goes near the
+   GPU. Capturing a real GPU-driven X screen is *slower*, not faster,
+   because the framebuffer then lives in VRAM and has to be read back
+   across PCIe.
+ - **OS**: Ubuntu 22.04.5 LTS, kernel 7.0.0, Python 3.10.12
+ - **Display**: ``Xvfb`` at 7680x4320x24 on the same machine, so the
+   MIT-SHM fast path is available and large frames get an OpenMP team to
+   copy them
+
+A **remote** display cannot use shared memory and falls back to
+``XGetImage``, which costs roughly an order of magnitude: on the same
+machine that is 221 fps at 1080p rather than 2601. Figures on other
+machines will differ — capture is bound by memory bandwidth and, below the
+parallel-copy threshold, by single-core clock.
 
 # Usage example
 
