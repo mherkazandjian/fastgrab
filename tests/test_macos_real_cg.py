@@ -56,6 +56,8 @@ def _extra_symbols(cg, cf):
         ctypes.c_bool, ctypes.c_int,           # interpolate, intent
     ]
     cg.CGImageCreate.restype = ctypes.c_void_p
+    cg.CGImageRetain.argtypes = [ctypes.c_void_p]
+    cg.CGImageRetain.restype = ctypes.c_void_p
 
 
 def _pattern(width, height):
@@ -99,7 +101,14 @@ def _padded_image(cg, cf, width, height):
 
 
 class _ImageSwap:
-    """The real cg, with the two capture calls returning our image."""
+    """The real cg, with the two capture calls returning our image.
+
+    Each hand-out is retained. Both names begin with "Create", so by the
+    Core Foundation ownership rule the backend receives a +1 reference and
+    releases it when done — quite correctly. Returning the same image
+    twice without retaining lets the first release free it, and the second
+    capture then reads a dead object: it comes back as "0 bpp".
+    """
 
     def __init__(self, cg, image):
         self._cg = cg
@@ -109,13 +118,15 @@ class _ImageSwap:
     def __getattr__(self, name):
         return getattr(self._cg, name)
 
-    def CGDisplayCreateImage(self, _display):
+    def _hand_out(self):
         self.captures += 1
-        return self._image
+        return self._cg.CGImageRetain(self._image)
+
+    def CGDisplayCreateImage(self, _display):
+        return self._hand_out()
 
     def CGDisplayCreateImageForRect(self, _display, _rect):
-        self.captures += 1
-        return self._image
+        return self._hand_out()
 
 
 @pytest.fixture
