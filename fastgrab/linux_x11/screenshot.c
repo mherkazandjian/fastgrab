@@ -16,6 +16,12 @@
 #include <unistd.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
+#include <X11/extensions/XShm.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+#include <sys/ipc.h>
+#include <sys/shm.h>
 #define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
 #include <numpy/arrayobject.h>
 
@@ -402,6 +408,264 @@ static void fg_close_display_guarded(Display *dpy)
     fg_io_disarm();
 }
 
+/* ------------------------------------------------------------------
+ * MIT-SHM
+ *
+ * XGetImage moves every pixel twice: the server writes the region into
+ * the X protocol stream and Xlib reads it back out into a freshly
+ * allocated XImage. XShmGetImage hands the server a shared memory
+ * segment instead and lets it write the pixels straight into memory
+ * this process already maps, which takes the socket transfer out of the
+ * frame entirely.
+ *
+ * It only works when client and server share a machine, so every step
+ * here is failure-tolerant: a missing extension, a refused attach or a
+ * segment that cannot be created all latch FG_SHM_OFF and send every
+ * later capture down the XGetImage path. A remote DISPLAY therefore
+ * pays one failed probe per connection rather than one per frame.
+ *
+ * The segment is cached across captures and rebuilt only when the
+ * requested size changes -- the same policy the numpy buffer on the
+ * Python side already follows.
+ * ------------------------------------------------------------------ */
+#define FG_SHM_UNTRIED 0
+#define FG_SHM_ON      1
+#define FG_SHM_OFF     2
+
+static int fg_shm_state = FG_SHM_UNTRIED;
+static XShmSegmentInfo fg_shm_info;
+static XImage *fg_shm_img = NULL;
+static int fg_shm_width = 0;
+static int fg_shm_height = 0;
+/* Captures served from shared memory since import. Read by the private
+ * _display_cache_info() so a test can assert which path actually ran
+ * rather than inferring it from a timing difference. */
+static unsigned long fg_shm_captures = 0;
+
+/* Whether the user has switched MIT-SHM off. Checked once: a capture
+ * loop should not read the environment on every frame. */
+static int fg_shm_disabled(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("FASTGRAB_NO_XSHM");
+        cached = (env != NULL && *env != '\0' && strcmp(env, "0") != 0);
+    }
+    return cached;
+}
+
+/* Tear the segment down.
+ *
+ * talk_to_server says whether XShmDetach may be sent. It may not when
+ * the connection is being abandoned rather than closed -- after a fork
+ * the socket belongs to the parent and a detach written into it would
+ * corrupt the parent's stream, which is exactly why fg_drop_display()
+ * refuses to XCloseDisplay on that path. shmdt() is local and always
+ * safe. */
+static void fg_shm_release(Display *dpy, int talk_to_server)
+{
+    if (fg_shm_img == NULL) {
+        fg_shm_width = 0;
+        fg_shm_height = 0;
+        return;
+    }
+    if (talk_to_server && dpy != NULL) {
+        XShmDetach(dpy, &fg_shm_info);
+        XSync(dpy, False);
+    }
+    /* XDestroyImage frees image->data, and for a shm image that pointer
+     * is the attached segment rather than something Xlib malloc'd.
+     * Clearing it first is what keeps this from handing shmat() memory
+     * to free(). */
+    fg_shm_img->data = NULL;
+    XDestroyImage(fg_shm_img);
+    if (fg_shm_info.shmaddr != NULL)
+        shmdt(fg_shm_info.shmaddr);
+    fg_shm_img = NULL;
+    fg_shm_info.shmaddr = NULL;
+    fg_shm_info.shmid = -1;
+    fg_shm_width = 0;
+    fg_shm_height = 0;
+}
+
+/* Make sure a segment of exactly this size is attached.
+ *
+ * Returns 1 when the caller may use fg_shm_img, 0 when it must fall
+ * back to XGetImage. Never raises: every failure is a fallback. */
+static int fg_shm_ensure(Display *dpy, int width, int height)
+{
+    Visual *visual;
+    int depth;
+    size_t nbytes;
+
+    if (fg_shm_state == FG_SHM_OFF || fg_shm_disabled())
+        return 0;
+
+    if (fg_shm_img != NULL && fg_shm_width == width && fg_shm_height == height)
+        return 1;
+
+    fg_shm_release(dpy, 1);
+
+    /* An error already pending would be misread as this attach failing,
+     * and the handler only records the first one. Leave shm alone for
+     * this frame rather than latch FG_SHM_OFF on someone else's error. */
+    if (fg_xerr_code != 0)
+        return 0;
+
+    if (!XShmQueryExtension(dpy)) {
+        fg_shm_state = FG_SHM_OFF;
+        return 0;
+    }
+
+    visual = DefaultVisual(dpy, DefaultScreen(dpy));
+    depth = DefaultDepth(dpy, DefaultScreen(dpy));
+
+    fg_shm_info.shmid = -1;
+    fg_shm_info.shmaddr = NULL;
+    fg_shm_info.readOnly = False;
+
+    fg_shm_img = XShmCreateImage(dpy, visual, (unsigned int)depth, ZPixmap,
+                                 NULL, &fg_shm_info,
+                                 (unsigned int)width, (unsigned int)height);
+    if (fg_shm_img == NULL) {
+        fg_shm_state = FG_SHM_OFF;
+        return 0;
+    }
+
+    nbytes = (size_t)fg_shm_img->bytes_per_line * (size_t)fg_shm_img->height;
+    fg_shm_info.shmid = shmget(IPC_PRIVATE, nbytes, IPC_CREAT | 0600);
+    if (fg_shm_info.shmid < 0) {
+        fg_shm_img->data = NULL;
+        XDestroyImage(fg_shm_img);
+        fg_shm_img = NULL;
+        fg_shm_state = FG_SHM_OFF;
+        return 0;
+    }
+
+    fg_shm_info.shmaddr = (char *)shmat(fg_shm_info.shmid, NULL, 0);
+    if (fg_shm_info.shmaddr == (char *)-1) {
+        fg_shm_info.shmaddr = NULL;
+        shmctl(fg_shm_info.shmid, IPC_RMID, NULL);
+        fg_shm_img->data = NULL;
+        XDestroyImage(fg_shm_img);
+        fg_shm_img = NULL;
+        fg_shm_state = FG_SHM_OFF;
+        return 0;
+    }
+    fg_shm_img->data = fg_shm_info.shmaddr;
+
+    /* A refused attach comes back as an asynchronous protocol error, so
+     * the XSync is what turns it into something this code can test. */
+    XShmAttach(dpy, &fg_shm_info);
+    XSync(dpy, False);
+    if (fg_xerr_code != 0) {
+        fg_xerr_code = 0;
+        shmdt(fg_shm_info.shmaddr);
+        shmctl(fg_shm_info.shmid, IPC_RMID, NULL);
+        fg_shm_info.shmaddr = NULL;
+        fg_shm_img->data = NULL;
+        XDestroyImage(fg_shm_img);
+        fg_shm_img = NULL;
+        fg_shm_state = FG_SHM_OFF;
+        return 0;
+    }
+
+    /* Marked for destruction while still attached: the segment lives
+     * until the last detach and then goes away by itself, so a process
+     * that dies mid-capture does not leave anything behind in ipcs. */
+    shmctl(fg_shm_info.shmid, IPC_RMID, NULL);
+
+    fg_shm_width = width;
+    fg_shm_height = height;
+    fg_shm_state = FG_SHM_ON;
+    return 1;
+}
+
+/* Copy the server's rows into the caller's buffer.
+ *
+ * Worth parallelising for two reasons. The server may pad its rows, so
+ * the general case is a copy per row rather than one big memcpy; and
+ * once MIT-SHM removes the socket transfer this copy is most of what is
+ * left of a frame. One core does not saturate memory bandwidth on a
+ * many-core host, so splitting the rows across an OpenMP team helps --
+ * but only once the frame is large enough to pay for the fork/join.
+ * Below the threshold the team costs more than the copy it replaces, so
+ * small captures stay serial.
+ *
+ * FASTGRAB_OMP_MIN_BYTES overrides the threshold; 0 disables the
+ * parallel path outright. The tests use it to drive both branches over
+ * a frame of a single size. */
+/* 4 MiB: measured on an 8-core x86-64 box, a 1080p frame (8.3 MB) gains
+ * ~1.35x from the parallel copy while a 720p one (3.7 MB) loses a few
+ * percent to the fork/join. The crossover sits between them. */
+#define FG_OMP_MIN_BYTES_DEFAULT (4u * 1024u * 1024u)
+
+/* Memory bandwidth saturates after a handful of threads, so a capture on
+ * a 128-core host should not start 128 of them every frame. OpenMP's own
+ * default is one per core; clamp it unless the caller has said otherwise
+ * through OMP_NUM_THREADS. */
+#define FG_OMP_MAX_THREADS 8
+
+static int fg_omp_threads(void)
+{
+#ifdef _OPENMP
+    static int cached = 0;
+    if (cached == 0) {
+        int want = omp_get_max_threads();
+        /* OMP_NUM_THREADS is the caller being explicit: honour it. */
+        if (getenv("OMP_NUM_THREADS") == NULL && want > FG_OMP_MAX_THREADS)
+            want = FG_OMP_MAX_THREADS;
+        cached = want < 1 ? 1 : want;
+    }
+    return cached;
+#else
+    return 1;
+#endif
+}
+
+static size_t fg_omp_min_bytes(void)
+{
+    static size_t cached = 0;
+    if (cached == 0) {
+        const char *env = getenv("FASTGRAB_OMP_MIN_BYTES");
+        cached = (size_t)FG_OMP_MIN_BYTES_DEFAULT;
+        if (env != NULL && *env != '\0') {
+            char *end = NULL;
+            unsigned long v = strtoul(env, &end, 10);
+            if (end != NULL && *end == '\0')
+                cached = (v == 0UL) ? (size_t)-1 : (size_t)v;
+        }
+    }
+    return cached;
+}
+
+static void fg_copy_image(uint8_t *dst, const uint8_t *src,
+                          size_t row_bytes, size_t src_stride, int height)
+{
+    const size_t total = row_bytes * (size_t)height;
+    int row;
+
+    if (total >= fg_omp_min_bytes()) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(fg_omp_threads())
+#endif
+        for (row = 0; row < height; row++)
+            memcpy(dst + (size_t)row * row_bytes,
+                   src + (size_t)row * src_stride, row_bytes);
+        return;
+    }
+
+    if (row_bytes == src_stride) {
+        memcpy(dst, src, total);
+        return;
+    }
+    /* The server is free to pad rows; copying straight through would
+     * shear the image by the padding on every row. */
+    for (row = 0; row < height; row++)
+        memcpy(dst + (size_t)row * row_bytes,
+               src + (size_t)row * src_stride, row_bytes);
+}
+
 /* Forget the cached connection.
  *
  * close_connection says whether XCloseDisplay may be attempted at all.
@@ -413,6 +677,10 @@ static void fg_close_display_guarded(Display *dpy)
 static void fg_drop_display(int close_connection)
 {
     if (fg_display != NULL) {
+        /* Before the connection goes: the segment is attached to *this*
+         * server, and the detach has to ride the socket that is about to
+         * be closed. */
+        fg_shm_release(fg_display, close_connection);
         if (close_connection)
             fg_close_display_guarded(fg_display);
         else
@@ -422,6 +690,9 @@ static void fg_drop_display(int close_connection)
     free(fg_display_name);
     fg_display_name = NULL;
     fg_display_pid = 0;
+    /* Re-probe on the next connection: the reason shm was unavailable
+     * may have left with the old DISPLAY. */
+    fg_shm_state = FG_SHM_UNTRIED;
 }
 
 /* Return the cached connection, opening one if needed.
@@ -583,11 +854,20 @@ struct fg_shot_ctx {
     size_t capacity;
 };
 
+/* The XGetImage path owns its image and must free it; the shm path's
+ * image is the cached segment and has to survive to the next frame. */
+static void fg_release_capture(XImage *img, int from_shm)
+{
+    if (!from_shm)
+        XDestroyImage(img);
+}
+
 static int fg_op_screenshot(Display *dpy, void *ctx)
 {
     struct fg_shot_ctx *req = (struct fg_shot_ctx *)ctx;
     XImage *img;
     int screen_width, screen_height;
+    int from_shm;
     int rc;
 
     rc = fg_root_size(dpy, &screen_width, &screen_height);
@@ -600,19 +880,40 @@ static int fg_op_screenshot(Display *dpy, void *ctx)
         req->origin_y > screen_height - req->height)
         return FG_ERR_BOUNDS;
 
-    img = XGetImage(dpy,
-                    RootWindow(dpy, DefaultScreen(dpy)),
-                    req->origin_x, req->origin_y, req->width, req->height,
-                    AllPlanes, ZPixmap);
-    if (img == NULL)
-        return fg_xerr_code ? FG_ERR_XPROTO : FG_ERR_GETIMAGE;
+    from_shm = fg_shm_ensure(dpy, req->width, req->height);
+    if (from_shm) {
+        img = fg_shm_img;
+        if (!XShmGetImage(dpy, RootWindow(dpy, DefaultScreen(dpy)), img,
+                          req->origin_x, req->origin_y, AllPlanes) ||
+            fg_xerr_code != 0) {
+            /* The segment is attached and sized correctly, so this is the
+             * server declining the request rather than a setup problem.
+             * One refusal is enough to stop asking: fall back for this
+             * frame and latch the plain path for the rest. */
+            fg_xerr_code = 0;
+            fg_shm_release(dpy, 1);
+            fg_shm_state = FG_SHM_OFF;
+            from_shm = 0;
+        } else {
+            fg_shm_captures++;
+        }
+    }
+
+    if (!from_shm) {
+        img = XGetImage(dpy,
+                        RootWindow(dpy, DefaultScreen(dpy)),
+                        req->origin_x, req->origin_y, req->width, req->height,
+                        AllPlanes, ZPixmap);
+        if (img == NULL)
+            return fg_xerr_code ? FG_ERR_XPROTO : FG_ERR_GETIMAGE;
+    }
 
     /* ZPixmap on a 32-bit visual is laid out B,G,R,A on little-endian
      * hosts, which is the byte order the Python side promises. Anything
      * else would be copied as the wrong number of bytes per pixel and
      * handed back as if it were BGRA. */
     if (img->bits_per_pixel != 32) {
-        XDestroyImage(img);
+        fg_release_capture(img, from_shm);
         return FG_ERR_DEPTH;
     }
 
@@ -634,7 +935,7 @@ static int fg_op_screenshot(Display *dpy, void *ctx)
         fg_fmt_blue = img->blue_mask;
         fg_fmt_depth = img->depth;
         fg_fmt_byte_order = img->byte_order;
-        XDestroyImage(img);
+        fg_release_capture(img, from_shm);
         return FG_ERR_FORMAT;
     }
 
@@ -645,27 +946,18 @@ static int fg_op_screenshot(Display *dpy, void *ctx)
      * the requested shape, but the size actually copied is derived from
      * what the server returned. */
     if (nbytes > req->capacity) {
-        XDestroyImage(img);
+        fg_release_capture(img, from_shm);
         return FG_ERR_CAPACITY;
     }
     if ((size_t)img->bytes_per_line < row_bytes) {
-        XDestroyImage(img);
+        fg_release_capture(img, from_shm);
         return FG_ERR_STRIDE;
     }
 
-    if ((size_t)img->bytes_per_line == row_bytes) {
-        memcpy(req->data, img->data, nbytes);
-    } else {
-        /* The server is free to pad rows; copying straight through would
-         * shear the image by the padding on every row. */
-        int row;
-        for (row = 0; row < req->height; row++)
-            memcpy(req->data + (size_t)row * row_bytes,
-                   img->data + (size_t)row * (size_t)img->bytes_per_line,
-                   row_bytes);
-    }
+    fg_copy_image(req->data, (const uint8_t *)img->data,
+                  row_bytes, (size_t)img->bytes_per_line, req->height);
 
-    XDestroyImage(img);
+    fg_release_capture(img, from_shm);
     return FG_OK;
 }
 
@@ -882,7 +1174,7 @@ static PyObject *linux_x11_display_cache_info(PyObject *self, PyObject *args)
     }
     /* QueuedAlready is a queue-length read, not a socket read: it does
      * no I/O, so it needs no armed region and cannot fault. */
-    return Py_BuildValue("{s:O,s:N,s:k,s:l,s:l,s:k}",
+    return Py_BuildValue("{s:O,s:N,s:k,s:l,s:l,s:k,s:O,s:k}",
                          "connected", fg_display != NULL ? Py_True : Py_False,
                          "display", name,
                          "opens", fg_display_opens,
@@ -891,7 +1183,13 @@ static PyObject *linux_x11_display_cache_info(PyObject *self, PyObject *args)
                          fg_display != NULL
                              ? (long)XEventsQueued(fg_display, QueuedAlready)
                              : 0L,
-                         "events_discarded", fg_events_discarded);
+                         "events_discarded", fg_events_discarded,
+                         /* Whether a shared memory segment is attached right
+                          * now, and how many frames have come through it. A
+                          * test that wants the plain path asserts on these
+                          * rather than on a stopwatch. */
+                         "shm", fg_shm_img != NULL ? Py_True : Py_False,
+                         "shm_captures", fg_shm_captures);
 }
 
 static PyObject *linux_x11_close_display(PyObject *self, PyObject *args)
