@@ -1982,47 +1982,57 @@ def test_a_font_path_with_awkward_characters_still_renders(name, tmp_path):
     )
 
 
-def test_a_case_only_sidecar_alias_is_caught_before_it_overwrites(tmp_path):
-    """The construction check cannot see this one.
+def test_publishing_refuses_a_sidecar_that_became_the_recording(tmp_path):
+    """The publish-time guard, driven directly.
 
-    Neither file exists yet, so samefile() cannot answer and comparing
-    realpath strings says clip.mp4 and CLIP.MP4 differ. On a
-    case-insensitive filesystem they are the same file, and by publish
-    time it holds the recording. Simulated here by making the two names
-    resolve to one file, which is what such a filesystem does.
+    The construction check cannot answer this: when neither file exists,
+    samefile() raises and comparing realpath strings says two names are
+    two files. They may not be -- a case-insensitive filesystem is the
+    real case -- and by publish time that file holds the recording.
+
+    Driven straight at _publish_sidecar rather than through a fake
+    ffmpeg. The first version of this test ran a child that wrote the
+    output only after close() sent it EOF, so the alias was never
+    actually created and the test passed against the *unguarded* code
+    too. A regression test that cannot fail is worse than none.
     """
     out = tmp_path / "clip.mp4"
+    sidecar = tmp_path / "captions.ass"
     enc = FfmpegEncoder(
         str(out), 64, 48, fps=10,
         subtitles=[Subtitle(text="s", start=0.0, end=1.0)],
-        subtitle_sidecar=str(tmp_path / "CLIP.MP4"),
+        subtitle_sidecar=str(sidecar),
+    )   # accepted: at this point neither path exists
+
+    # Now they are the same file, exactly as the encode finishing would
+    # leave them on a filesystem that folds case.
+    out.write_bytes(b"THE RECORDING")
+    os.link(out, sidecar)
+
+    with pytest.raises(RuntimeError, match="recording that was just written"):
+        enc._publish_sidecar("[Script Info]\n")
+    assert out.read_bytes() == b"THE RECORDING"
+
+
+def test_publishing_still_works_when_the_sidecar_is_a_separate_file(tmp_path):
+    """The guard must not refuse the ordinary case."""
+    out = tmp_path / "clip.mp4"
+    sidecar = tmp_path / "captions.ass"
+    enc = FfmpegEncoder(
+        str(out), 64, 48, fps=10,
+        subtitles=[Subtitle(text="s", start=0.0, end=1.0)],
+        subtitle_sidecar=str(sidecar),
     )
-    enc._build_argv = lambda *a, **k: [
-        sys.executable, "-c",
-        "import sys; sys.stdin.buffer.read(); "
-        "open(%r, 'wb').write(b'THE RECORDING')" % str(out),
-    ]
-    # Stand in for the case-insensitive filesystem: both names, one file.
-    alias = tmp_path / "CLIP.MP4"
-    enc.start()
-    enc.write_frame(numpy.zeros((48, 64, 4), numpy.uint8))
-    if not alias.exists():
-        os.link(out, alias) if out.exists() else None
-    try:
-        enc.close()
-    except RuntimeError as exc:
-        assert "recording that was just written" in str(exc)
-        assert out.read_bytes() == b"THE RECORDING"
-        return
-    # Not an alias on this filesystem: the sidecar is a separate file and
-    # the recording must still be intact.
+    out.write_bytes(b"THE RECORDING")
+    enc._publish_sidecar("[Script Info]\n")
+    assert sidecar.read_text(encoding="utf-8") == "[Script Info]\n"
     assert out.read_bytes() == b"THE RECORDING"
 
 
 # -------- a literal backslash in a subtitle must stay one line --------
 #
 # ASS reads \n, \N and \h as a soft break, a hard break and a
-# non-breaking space, so a subtitle containing a literal one has to be
+# non-breaking space, so a subtitle carrying a literal one has to be
 # defused. The branch doubled the backslash; measured through libass that
 # does not work -- "left\Nright" still rendered as two lines, corrupting
 # both the burned-in video and the exported sidecar.
@@ -2079,9 +2089,18 @@ def test_a_literal_backslash_before_a_control_letter_stays_on_one_line(
         "escaped \\{} wrapped onto {} lines' worth of height ({} vs {})"
         .format(letter, escaped[1] / float(plain[1]), escaped[1], plain[1])
     )
-    assert escaped[2] == plain[2] + 10, (
-        "expected the plain text plus one backslash, got width {} vs {}"
-        .format(escaped[2], plain[2])
+    # The backslash's width is measured with whatever font libass
+    # actually resolved, not hardcoded: DejaVu Sans is 10px here and
+    # Liberation Mono, which libass substitutes when DejaVu is missing,
+    # is 18. A fixed number turns this into a test of the host's fonts.
+    with_inert, _ = _render_ass_line("left\\zright", tmp_path)
+    without, _ = _render_ass_line("leftzright", tmp_path)
+    backslash_width = with_inert[2] - without[2]
+    assert backslash_width > 0, "could not measure the backslash in this font"
+
+    assert escaped[2] == plain[2] + backslash_width, (
+        "expected the plain text plus one backslash ({}px in this font), "
+        "got width {} vs {}".format(backslash_width, escaped[2], plain[2])
     )
 
 
