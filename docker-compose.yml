@@ -60,5 +60,18 @@ services:
       FASTGRAB_TEST_BACKEND: "wlr"
     command: ["start-wayland-desktop", "python", "tests/_run_pytest_clean_exit.py", "-v", "-m", "wayland", "tests"]
 
+  test-portal:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.portal
+    image: fastgrab-portal
+    init: true
+    volumes:
+      - .:/app
+      - pip-cache:/root/.cache/pip
+    environment:
+      XDG_RUNTIME_DIR: "/tmp/xdg-runtime"
+    command: ["start-portal-fixture", "python", "-m", "pytest", "-v", "-m", "portal", "tests"]
+
 volumes:
   pip-cache:
