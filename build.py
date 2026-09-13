@@ -29,12 +29,17 @@ EXT_MODULES = [
     Extension(
         "fastgrab._linux_x11",
         sources=["fastgrab/linux_x11/screenshot.c"],
-        libraries=["X11", "gomp"],
+        libraries=["X11", "Xext", "gomp"],
         extra_compile_args=[
             "-fno-strict-aliasing",
             "-std=c11",
             "-mtune=native",
+            # Without this the #pragma omp directives in screenshot.c are
+            # silently ignored -- gomp was already being linked, but nothing
+            # asked the compiler to honour the pragmas.
+            "-fopenmp",
         ],
+        extra_link_args=["-fopenmp"],
     ),
 ]
 
