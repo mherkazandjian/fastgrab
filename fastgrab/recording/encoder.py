@@ -523,6 +523,23 @@ class FfmpegEncoder:
         the old contents survive or the new ones are complete.
         """
         destination = _local_output_path(self.subtitle_sidecar)
+
+        # Checked again here, not only at construction. Back then neither
+        # file existed, so samefile() could not answer and the fallback
+        # compared realpath strings -- which on a case-insensitive
+        # filesystem says clip.mp4 and CLIP.MP4 are different. By now
+        # ffmpeg has created the video, so the question can be answered
+        # properly, and getting it wrong would replace the recording that
+        # was just made with a few hundred bytes of subtitle script.
+        target = _local_output_path(self.output_path)
+        if target is not None and _same_file(destination, target):
+            raise RuntimeError(
+                "refusing to write the subtitle sidecar {!r}: it is the "
+                "recording that was just written to {!r}".format(
+                    self.subtitle_sidecar, self.output_path
+                )
+            )
+
         folder = os.path.dirname(os.path.abspath(destination)) or "."
         handle = None
         staged = None

@@ -1939,8 +1939,13 @@ def test_the_temporary_script_goes_away_when_start_fails(tmp_path):
 
 
 @requires_ffmpeg
-@pytest.mark.parametrize("name", ["it's.ttf", "a:b.ttf", "a,b.ttf",
-                                  "a[b].ttf", "a\\b.ttf"])
+@pytest.mark.parametrize("name", [
+    "it's.ttf", "a:b.ttf", "a,b.ttf", "a[b].ttf",
+    pytest.param("a\\b.ttf", marks=pytest.mark.skipif(
+        os.name == "nt",
+        reason="a backslash is a path separator on Windows, not a filename",
+    )),
+])
 def test_a_font_path_with_awkward_characters_still_renders(name, tmp_path):
     """The real oracle: the same font under an awkward name must render
     identically to the same font under a plain one.
@@ -1972,3 +1977,40 @@ def test_a_font_path_with_awkward_characters_still_renders(name, tmp_path):
             name, int((got > 40).sum()), int((reference > 40).sum())
         )
     )
+
+
+def test_a_case_only_sidecar_alias_is_caught_before_it_overwrites(tmp_path):
+    """The construction check cannot see this one.
+
+    Neither file exists yet, so samefile() cannot answer and comparing
+    realpath strings says clip.mp4 and CLIP.MP4 differ. On a
+    case-insensitive filesystem they are the same file, and by publish
+    time it holds the recording. Simulated here by making the two names
+    resolve to one file, which is what such a filesystem does.
+    """
+    out = tmp_path / "clip.mp4"
+    enc = FfmpegEncoder(
+        str(out), 64, 48, fps=10,
+        subtitles=[Subtitle(text="s", start=0.0, end=1.0)],
+        subtitle_sidecar=str(tmp_path / "CLIP.MP4"),
+    )
+    enc._build_argv = lambda *a, **k: [
+        sys.executable, "-c",
+        "import sys; sys.stdin.buffer.read(); "
+        "open(%r, 'wb').write(b'THE RECORDING')" % str(out),
+    ]
+    # Stand in for the case-insensitive filesystem: both names, one file.
+    alias = tmp_path / "CLIP.MP4"
+    enc.start()
+    enc.write_frame(numpy.zeros((48, 64, 4), numpy.uint8))
+    if not alias.exists():
+        os.link(out, alias) if out.exists() else None
+    try:
+        enc.close()
+    except RuntimeError as exc:
+        assert "recording that was just written" in str(exc)
+        assert out.read_bytes() == b"THE RECORDING"
+        return
+    # Not an alias on this filesystem: the sidecar is a separate file and
+    # the recording must still be intact.
+    assert out.read_bytes() == b"THE RECORDING"
