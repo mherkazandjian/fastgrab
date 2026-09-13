@@ -237,8 +237,18 @@ Per-platform extras:
    uses. ``pip install fastgrab[portal]`` brings PyGObject; GStreamer and
    its introspection data are system packages pip cannot install:
 
-   - Debian/Ubuntu: ``sudo apt install python3-gi gir1.2-gst-plugins-base-1.0 gstreamer1.0-pipewire``
-   - Fedora: ``sudo dnf install python3-gobject gstreamer1-plugins-base gstreamer1-plugin-pipewire``
+   ````bash
+   sudo apt install gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 \
+                    gstreamer1.0-plugins-base gstreamer1.0-pipewire
+   ````
+
+   That is the Debian/Ubuntu set the ``test-portal`` image is built from,
+   so it is the one that is exercised. Other distributions ship the same
+   pieces under their own names (Fedora: ``gstreamer1-plugins-base``,
+   ``gstreamer1-plugin-pipewire``, ``python3-gobject``) — untested here.
+   If pip has to *build* PyGObject rather than reuse a distro
+   ``python3-gi``, it also needs ``libgirepository1.0-dev``,
+   ``libcairo2-dev``, ``pkg-config`` and a C toolchain.
 
    **This path asks your permission.** The desktop shows its own
    screen-share chooser the first time a ``Screenshot`` captures, and the

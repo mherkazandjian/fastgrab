@@ -326,6 +326,54 @@ def test_a_discarded_backend_releases_its_pipeline(portal):
     assert state["_session"] is None, "a discarded backend leaked the session"
 
 
+def test_refresh_renegotiates_the_stream_without_re_asking(portal):
+    """Consent belongs to the session, so refresh() must not touch it.
+
+    It drops the stream and the portal descriptor -- single-use per
+    consumer connection, so the next capture has to ask for a fresh one
+    -- and leaves the session, and therefore the approval, alone.
+    """
+    from fastgrab.backends.portal import PortalBackend
+    portal()
+    backend = PortalBackend(timeout=30)
+    try:
+        backend.resolution()
+        session = backend._session
+        assert backend._fd is not None
+
+        backend.refresh()
+        assert backend._session is session, "refresh() re-opened the session"
+        assert backend._reader is None, "refresh() kept the old stream"
+        assert backend._fd is None, "refresh() kept the spent descriptor"
+
+        asked = []
+        spent = session.open_pipewire_remote
+
+        def spy():
+            asked.append(True)
+            return spent()
+
+        session.open_pipewire_remote = spy
+        try:
+            backend.screenshot(0, 0, numpy.zeros((240, 320, 4), numpy.uint8))
+        except RuntimeError as exc:
+            # Expected against this fixture, and not a backend bug. Its
+            # source is `pipewiresink mode=provide`, which exits the
+            # moment its consumer disconnects -- so closing the reader
+            # above took the node off the graph with it. A real
+            # compositor keeps its node across a client reconnect. What
+            # is under test here is our half: that renegotiation was
+            # attempted, and attempted with a new descriptor rather than
+            # the spent one.
+            assert "target not found" in str(exc), (
+                "refresh() failed for some reason other than the "
+                "fixture's provider having exited: %s" % exc
+            )
+        assert asked, "the renegotiated stream reused the spent descriptor"
+    finally:
+        backend.close()
+
+
 def test_construction_probes_for_the_optional_dependencies(monkeypatch):
     """_autodetect() decides which backend to use by constructing one.
 

@@ -28,10 +28,12 @@ services:
       - .:/app
       - pip-cache:/root/.cache/pip
     # "not portal" as well as "not wayland": those tests need a PipeWire
-    # graph this image has none of. They would skip anyway, but only
-    # because PyGObject happens to be absent here -- deselecting them by
-    # marker says so on purpose, instead of depending on a missing
-    # dependency to keep the suite green.
+    # graph this image has none of. Today they never reach selection --
+    # both portal modules importorskip("gi"), which is what keeps
+    # *collection* safe here and on the Windows and macOS jobs. The
+    # marker covers the other case: the day PyGObject arrives in this
+    # image for some unrelated reason, they would collect fine and then
+    # fail against a graph that does not exist.
     command: ["xvfb-run", "-a", "-s", "-screen 0 1280x1024x24", "python", "tests/_run_pytest_clean_exit.py", "-v", "-m", "not wayland and not portal", "tests"]
 
   benchmark:
