@@ -296,6 +296,11 @@ def _ass_color(spec) -> str:
     return "&H{:02X}{:02X}{:02X}{:02X}".format(alpha, blue, green, red)
 
 
+# Separates a literal backslash from an n/N/h that would otherwise turn
+# the pair into an ASS control sequence. Renders nothing at all.
+_ZWSP = "\u200b"
+
+
 def _escape_ass(text: str) -> str:
     r"""Escape subtitle text for an ASS ``Dialogue:`` line.
 
@@ -321,11 +326,21 @@ def _escape_ass(text: str) -> str:
         ``libavcodec/ass.c`` does — would paint *two* backslashes.
 
         The exception is a backslash directly before ``n``, ``N`` or
-        ``h``, which would otherwise be eaten as a space, a line break
-        or a non-breaking space. There it is doubled, so the backslash
-        stays visible and only the following character is lost. ASS has
-        no true escape for a backslash, so this one sequence cannot be
-        represented exactly; everything else round-trips.
+        ``h``, which ASS reads as a soft break, a hard break and a
+        non-breaking space. Doubling it does **not** help: rendered
+        through libass, ``left\\Nright`` still came back as two lines,
+        because the second backslash starts a fresh ``\\N``. A
+        zero-width space is inserted between the two characters instead,
+        which separates them without drawing anything -- measured
+        against a backslash that already renders correctly,
+        ``left\\zright`` and ``left\\<zwsp>zright`` are pixel-identical,
+        and for each of ``n``, ``N`` and ``h`` the escaped form renders
+        on one line at exactly the plain width plus one backslash.
+
+        The cost is a real, if invisible, character in the text and in
+        any exported sidecar. ASS has no true escape for a backslash, so
+        something has to give; a character nobody can see is a better
+        trade than a line break nobody asked for.
     """
     out = []
     index = 0
@@ -340,7 +355,7 @@ def _escape_ass(text: str) -> str:
         if char in "\r\n":
             out.append("\\N")
         elif char == "\\":
-            out.append("\\\\" if following in ("n", "N", "h") else "\\")
+            out.append("\\" + _ZWSP if following in ("n", "N", "h") else "\\")
         elif char in "{}":
             out.append("\\" + char)
         else:

@@ -434,9 +434,12 @@ def test_ass_text_escaping():
     assert esc("C:\\Users\\dir") == "C:\\Users\\dir"
     # ... except before n/N/h, where the pair would be eaten as a space,
     # a line break or a non-breaking space.
-    assert esc("C:\\new") == "C:\\\\new"
-    assert esc("a\\Nb") == "a\\\\Nb"
-    assert esc("a\\hb") == "a\\\\hb"
+    # Separated by a zero-width space, not doubled: doubling leaves
+    # the control sequence active and libass still broke
+    # "left\\Nright" across two lines.
+    assert esc("C:\\new") == "C:\\" + subtitles_mod._ZWSP + "new"
+    assert esc("a\\Nb") == "a\\" + subtitles_mod._ZWSP + "Nb"
+    assert esc("a\\hb") == "a\\" + subtitles_mod._ZWSP + "hb"
     # A user backslash before a brace still round-trips: libass reads the
     # '\\' as a literal backslash and then '\{' as a literal brace.
     assert esc("a\\{b") == "a\\\\{b"
@@ -2014,3 +2017,85 @@ def test_a_case_only_sidecar_alias_is_caught_before_it_overwrites(tmp_path):
     # Not an alias on this filesystem: the sidecar is a separate file and
     # the recording must still be intact.
     assert out.read_bytes() == b"THE RECORDING"
+
+
+# -------- a literal backslash in a subtitle must stay one line --------
+#
+# ASS reads \n, \N and \h as a soft break, a hard break and a
+# non-breaking space, so a subtitle containing a literal one has to be
+# defused. The branch doubled the backslash; measured through libass that
+# does not work -- "left\Nright" still rendered as two lines, corrupting
+# both the burned-in video and the exported sidecar.
+
+_ASS_HEAD = (
+    "[Script Info]\nScriptType: v4.00+\nPlayResX: 640\nPlayResY: 120\n\n"
+    "[V4+ Styles]\n"
+    "Format: Name,Fontname,Fontsize,PrimaryColour,Alignment,MarginV\n"
+    "Style: D,DejaVu Sans,36,&H00FFFFFF,2,10\n\n"
+    "[Events]\n"
+    "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n"
+)
+
+
+def _render_ass_line(text_field, tmp_path):
+    """Render one Dialogue line through libass; return (ink, height, width)."""
+    script = tmp_path / "line.ass"
+    script.write_text(
+        _ASS_HEAD + "Dialogue: 0,0:00:00.00,0:00:05.00,D,,0,0,0,,%s\n"
+        % text_field, encoding="utf-8")
+    frame, err = _render_gray(
+        "ass=filename=" + encoder_mod._escape_filter_path(str(script)),
+        width=640, height=120,
+    )
+    if frame is None:
+        return None, err
+    ys, xs = numpy.nonzero(frame > 40)
+    if not len(ys):
+        return (0, 0, 0), ""
+    return (int((frame > 40).sum()),
+            int(ys.max() - ys.min() + 1),
+            int(xs.max() - xs.min() + 1)), ""
+
+
+@requires_ffmpeg
+@pytest.mark.parametrize("letter", ["n", "N", "h"])
+def test_a_literal_backslash_before_a_control_letter_stays_on_one_line(
+    letter, tmp_path
+):
+    """The escaped form must render as the plain text plus a backslash.
+
+    Width is the reliable measure: exactly ten pixels wider than the same
+    text without the backslash, at this size and font, and on one line.
+    """
+    plain, _ = _render_ass_line("left" + letter + "right", tmp_path)
+    if plain is None or plain[0] == 0:
+        pytest.skip("libass rendered nothing here; no usable font")
+
+    escaped_field = subtitles_mod._escape_ass("left\\" + letter + "right")
+    escaped, err = _render_ass_line(escaped_field, tmp_path)
+    assert escaped is not None, err
+
+    assert escaped[1] == plain[1], (
+        "escaped \\{} wrapped onto {} lines' worth of height ({} vs {})"
+        .format(letter, escaped[1] / float(plain[1]), escaped[1], plain[1])
+    )
+    assert escaped[2] == plain[2] + 10, (
+        "expected the plain text plus one backslash, got width {} vs {}"
+        .format(escaped[2], plain[2])
+    )
+
+
+@requires_ffmpeg
+def test_the_zero_width_space_does_not_disturb_a_working_backslash(tmp_path):
+    """z is not an ASS tag, so that backslash already rendered correctly.
+
+    Inserting the separator there must change nothing at all — that is
+    what makes it safe to insert before n, N and h.
+    """
+    without, _ = _render_ass_line("left\\zright", tmp_path)
+    if without is None or without[0] == 0:
+        pytest.skip("libass rendered nothing here; no usable font")
+    with_sep, err = _render_ass_line(
+        "left\\" + subtitles_mod._ZWSP + "zright", tmp_path)
+    assert with_sep is not None, err
+    assert with_sep == without
