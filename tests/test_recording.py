@@ -268,7 +268,7 @@ def test_build_subtitle_filters(tmp_path, monkeypatch):
     assert "Hello\\: world" in vf
     # The path is escaped like the text — on Windows it contains ':' and
     # '\\', so compare against the escaped form, not the raw string.
-    assert "fontfile=" + encoder_mod._escape_drawtext(str(fake_font)) in vf
+    assert "fontfile=" + encoder_mod._escape_filter_path(str(fake_font)) in vf
 
 
 def test_build_subtitle_filters_style_overrides(tmp_path, monkeypatch):
