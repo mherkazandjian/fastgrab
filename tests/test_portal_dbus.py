@@ -240,6 +240,48 @@ def test_one_backend_opens_one_session(portal):
         backend.close()
 
 
+def test_the_handshake_works_from_a_thread_with_its_own_glib_context(portal):
+    """Any GTK or Gio program can be driving this from a worker thread.
+
+    signal_subscribe() delivers on the thread-default GLib context as
+    it stands when the subscription is made; a plain MainLoop() and
+    timeout_add() use the global default one. On the main thread those
+    are the same object and the difference never shows. Push a context
+    of your own first -- which is ordinary practice in threaded GLib
+    code -- and the portal's answer arrives somewhere the loop never
+    runs, so every request times out despite the portal having replied
+    at once.
+    """
+    import threading
+
+    from gi.repository import GLib
+
+    portal()
+    outcome = {}
+
+    def run():
+        context = GLib.MainContext.new()
+        context.push_thread_default()
+        try:
+            session = ScreenCastSession(app_id="fastgrab-test", timeout=15)
+            try:
+                outcome["streams"] = session.open()
+            finally:
+                session.close()
+        except BaseException as exc:      # noqa: BLE001 - reported below
+            outcome["error"] = exc
+        finally:
+            context.pop_thread_default()
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    thread.join(90)
+
+    assert not thread.is_alive(), "the handshake never returned"
+    assert "error" not in outcome, "handshake failed: %r" % (outcome["error"],)
+    assert outcome["streams"], "no streams came back"
+
+
 # -------- remembering consent --------
 
 @pytest.fixture

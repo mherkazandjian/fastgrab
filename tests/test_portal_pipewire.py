@@ -237,6 +237,64 @@ def test_close_drops_the_cached_frame(node_id):
     )
 
 
+def test_a_padded_row_stride_is_honoured(node_id):
+    """Rows are not always width*4 apart.
+
+    A producer may pad each row out to a hardware-friendly stride, or
+    start the plane at an offset, and videoconvert passes such a buffer
+    straight through when it is already BGRx. Reshaping on width alone
+    reads the padding as pixels and shears the image further on every
+    row -- so the deliberately padded buffer here is built by hand,
+    because whether this fixture ever produces one is not something the
+    test should depend on.
+    """
+    import gi
+    gi.require_version("Gst", "1.0")
+    gi.require_version("GstVideo", "1.0")
+    from gi.repository import Gst, GstVideo
+
+    width, height = 7, 3
+    stride = width * 4 + 20          # 20 bytes of padding per row
+    offset = 8                       # and the plane does not start at 0
+    raw = bytearray(offset + stride * height)
+    for y in range(height):
+        for x in range(width):
+            at = offset + y * stride + x * 4
+            raw[at:at + 4] = bytes((x, y, 200, 255))
+    # The padding is filled with a value no real pixel here carries, so
+    # leaking any of it into the result is unmistakable.
+    for y in range(height):
+        at = offset + y * stride + width * 4
+        raw[at:at + (stride - width * 4)] = b"\xee" * (stride - width * 4)
+
+    buffer = Gst.Buffer.new_wrapped(bytes(raw))
+    GstVideo.buffer_add_video_meta_full(
+        buffer, GstVideo.VideoFrameFlags.NONE, GstVideo.VideoFormat.BGRX,
+        # Fixed-width arrays: GStreamer wants GST_VIDEO_MAX_PLANES (4)
+        # entries whatever the format's real plane count is.
+        width, height, 1, [offset, 0, 0, 0], [stride, 0, 0, 0])
+    caps = Gst.Caps.from_string(
+        "video/x-raw,format=BGRx,width=%d,height=%d" % (width, height))
+    sample = Gst.Sample.new(buffer, caps, None, None)
+
+    reader = PipeWireVideoReader(node_id, timeout=2.0)
+    try:
+        reader.start()
+        reader._sink.try_pull_sample = lambda _ns: sample
+        frame = reader.read()
+    finally:
+        reader.close()
+
+    assert frame.shape == (height, width, 4)
+    assert not (frame == 0xEE).any(), "row padding leaked into the image"
+    for y in range(height):
+        for x in range(width):
+            assert tuple(frame[y, x]) == (x, y, 200, 255), (
+                "pixel (%d, %d) came back as %s -- the rows are sheared"
+                % (x, y, tuple(frame[y, x]))
+            )
+
+
 def test_close_is_idempotent(node_id):
     reader = PipeWireVideoReader(node_id)
     reader.read()

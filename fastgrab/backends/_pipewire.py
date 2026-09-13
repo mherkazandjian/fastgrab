@@ -31,7 +31,9 @@ def _require_gst():
         ) from exc
     gi.require_version("Gst", "1.0")
     gi.require_version("GstApp", "1.0")
-    from gi.repository import Gst, GstApp  # noqa: F401  (GstApp for appsink)
+    # GstVideo for the buffer's stride and plane offset -- see read().
+    gi.require_version("GstVideo", "1.0")
+    from gi.repository import Gst, GstApp, GstVideo  # noqa: F401
     if not Gst.is_initialized():
         Gst.init(None)
     if Gst.ElementFactory.find("pipewiresrc") is None:
@@ -165,14 +167,40 @@ class PipeWireVideoReader:
         self._size = (width, height)
 
         buffer = sample.get_buffer()
+        # Rows are not necessarily width*4 apart. Gst.Buffer.map() hands
+        # back the underlying storage, and a producer is free to pad each
+        # row out to a hardware-friendly stride, or to start the plane at
+        # an offset -- videoconvert will happily pass such a buffer
+        # straight through when it is already BGRx. Reshaping on width
+        # alone then reads the padding as pixels and shears the image a
+        # little further on every row.
+        #
+        # A buffer whose layout differs from the caps default has to
+        # carry a GstVideoMeta saying so, which is what this reads. No
+        # meta means tightly packed, the common case here.
+        from gi.repository import GstVideo
+        meta = GstVideo.buffer_get_video_meta(buffer)
+        stride = meta.stride[0] if meta is not None else width * 4
+        offset = meta.offset[0] if meta is not None else 0
+
         ok, info = buffer.map(Gst.MapFlags.READ)
         if not ok:
             raise RuntimeError("could not map the PipeWire buffer")
         try:
-            # Copied, not viewed: the mapping is borrowed and is unmapped
-            # again below, so a view would dangle.
             flat = numpy.frombuffer(info.data, dtype=numpy.uint8)
-            frame = flat[: height * width * 4].reshape(height, width, 4).copy()
+            needed = offset + stride * height
+            if flat.size < needed:
+                raise RuntimeError(
+                    "PipeWire buffer is {} bytes, too short for {}x{} at "
+                    "stride {} (offset {})".format(
+                        flat.size, width, height, stride, offset)
+                )
+            # Copied, not viewed: the mapping is borrowed and is unmapped
+            # again below, so a view would dangle. Trimming the padding
+            # off each row is what makes this a copy rather than a
+            # reshape.
+            rows = flat[offset:needed].reshape(height, stride)
+            frame = rows[:, : width * 4].reshape(height, width, 4).copy()
         finally:
             buffer.unmap(info)
         self._last = frame

@@ -146,37 +146,56 @@ class ScreenCastSession:
         path = self._request_path(token)
 
         result = {}
-        loop = GLib.MainLoop()
 
-        def on_response(_c, _sender, _path, _iface, _signal, params):
-            result["response"], result["results"] = params.unpack()
-            loop.quit()
-
-        subscription = conn.signal_subscribe(
-            PORTAL_BUS, REQUEST_IFACE, "Response", path, None,
-            Gio.DBusSignalFlags.NONE, on_response)
-
-        fired = []
-
-        def give_up():
-            result.setdefault("timeout", True)
-            fired.append(True)
-            loop.quit()
-            return False
-
-        timer = GLib.timeout_add(int(self.timeout * 1000), give_up)
+        # One explicit context for all three of the subscription, the
+        # loop and the timeout, rather than whatever happens to be
+        # default. signal_subscribe() delivers on the *thread-default*
+        # context as it stands at subscription time, while MainLoop()
+        # and timeout_add() use the global default one. On the main
+        # thread those are the same object and it works by luck; inside
+        # a worker thread that has pushed a context of its own -- any
+        # GTK or Gio program -- the response is dispatched somewhere
+        # this loop never runs, and every portal request times out
+        # despite the portal having answered immediately.
+        context = GLib.MainContext.new()
+        context.push_thread_default()
         try:
-            conn.call_sync(
-                PORTAL_BUS, PORTAL_PATH, SCREENCAST_IFACE, method,
-                args_builder(token), None, Gio.DBusCallFlags.NONE, -1, None)
-            loop.run()
+            loop = GLib.MainLoop.new(context, False)
+
+            def on_response(_c, _sender, _path, _iface, _signal, params):
+                result["response"], result["results"] = params.unpack()
+                loop.quit()
+
+            subscription = conn.signal_subscribe(
+                PORTAL_BUS, REQUEST_IFACE, "Response", path, None,
+                Gio.DBusSignalFlags.NONE, on_response)
+
+            fired = []
+
+            def give_up(*_args):
+                result.setdefault("timeout", True)
+                fired.append(True)
+                loop.quit()
+                return False
+
+            timer = GLib.timeout_source_new(int(self.timeout * 1000))
+            timer.set_callback(give_up)
+            timer.attach(context)
+            try:
+                conn.call_sync(
+                    PORTAL_BUS, PORTAL_PATH, SCREENCAST_IFACE, method,
+                    args_builder(token), None, Gio.DBusCallFlags.NONE, -1,
+                    None)
+                loop.run()
+            finally:
+                # Only if it has not already fired: destroying a spent
+                # source warns, and the warning is noise on the very
+                # path that is already reporting a real failure.
+                if not fired:
+                    timer.destroy()
+                conn.signal_unsubscribe(subscription)
         finally:
-            # Only if it has not already fired: removing a spent source
-            # warns, and the warning is noise on the very path that is
-            # already reporting a real failure.
-            if not fired:
-                GLib.source_remove(timer)
-            conn.signal_unsubscribe(subscription)
+            context.pop_thread_default()
 
         if result.get("timeout"):
             raise PortalUnavailable(
