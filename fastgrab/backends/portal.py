@@ -205,6 +205,8 @@ options it does not advertise. The spike saw version 5,
 xdg-desktop-portal-gnome and Ubuntu's -gtk differ on ``cursor_mode`` /
 ``persist_mode``.
 """
+import os
+
 from .base import BaseBackend
 
 
@@ -221,30 +223,127 @@ _NOT_IMPLEMENTED_MSG = (
 )
 
 
-class PortalBackend(BaseBackend):
-    def __init__(self):
-        # Only dbus-next is worth checking: it is the one declared
-        # dependency of the extra that a real implementation would still
-        # use. pipewire-python is *not* checked because it cannot serve
-        # this backend at all (audio-only pw-cat wrapper) — and the guard
-        # this file used to run, `import pipewire`, could never have
-        # succeeded anyway, since the distribution installs the module as
-        # `pipewire_python`. See the module docstring.
-        try:
-            import dbus_next  # noqa: F401
-        except ImportError as exc:
-            raise ImportError(
-                "wayland-portal extra is not installed: "
-                "pip install fastgrab[wayland-portal]"
-            ) from exc
+#: How a session asks the desktop to remember consent. Selectable so a
+#: user can decide whether fastgrab is allowed to keep an approval, which
+#: is a privacy question and not ours to answer for them.
+#:
+#:   none        ask every time a session starts (the portal default)
+#:   transient   remember for as long as the desktop session lasts
+#:   persistent  remember across reboots, via a token the desktop stores
+PERSIST_MODES = {"none": 0, "transient": 1, "persistent": 2}
+PERSIST_ENV = "FASTGRAB_PORTAL_PERSIST"
 
-        raise NotImplementedError(_NOT_IMPLEMENTED_MSG)
+
+def _persist_mode(explicit=None):
+    """Resolve the persist mode from the argument, then the environment."""
+    value = explicit if explicit is not None else os.environ.get(PERSIST_ENV)
+    if value is None:
+        return PERSIST_MODES["transient"]
+    key = str(value).strip().lower()
+    if key not in PERSIST_MODES:
+        raise ValueError(
+            "{} must be one of {}, got {!r}".format(
+                PERSIST_ENV, ", ".join(sorted(PERSIST_MODES)), value
+            )
+        )
+    return PERSIST_MODES[key]
+
+
+class PortalBackend(BaseBackend):
+    """Capture through xdg-desktop-portal ScreenCast and PipeWire.
+
+    **Consent.** Starting a portal session is what makes the desktop ask
+    the user, and the approval belongs to that session. This backend
+    therefore keeps one session open for its whole life, so a program
+    that reuses a :class:`fastgrab.screenshot.Screenshot` is asked once.
+    A program that builds one per frame is asked per frame — which is
+    what the library's own two-line form does, so on GNOME and KDE reuse
+    is not a micro-optimisation but the difference between one prompt and
+    hundreds.
+
+    Nothing is asked at construction. Autodetection builds backends
+    speculatively, and a chooser dialog appearing because a program
+    called ``Screenshot()`` would be indefensible; the session opens on
+    first use.
+
+    ``persist`` (or ``$FASTGRAB_PORTAL_PERSIST``) chooses whether the
+    desktop may remember the approval — see :data:`PERSIST_MODES`.
+    """
+
+    def __init__(self, persist=None, timeout=60.0):
+        self._persist = _persist_mode(persist)
+        self._timeout = float(timeout)
+        self._session = None
+        self._reader = None
+        # Import here, not at module scope: the dependencies live behind
+        # the [portal] extra and importing this module must stay cheap
+        # and safe for a default install.
+        from ._portal_dbus import PortalUnavailable, ScreenCastSession
+        from ._pipewire import PipeWireVideoReader
+        self._session_class = ScreenCastSession
+        self._reader_class = PipeWireVideoReader
+        self._unavailable = PortalUnavailable
+
+    # -------- session lifetime --------
+
+    def _ensure_stream(self):
+        """Open the portal session and the reader, once."""
+        if self._reader is not None:
+            return self._reader
+        session = self._session_class(
+            app_id="fastgrab", persist_mode=self._persist,
+            timeout=self._timeout)
+        session.open()
+        reader = self._reader_class(session.node_id)
+        reader.start()
+        self._session, self._reader = session, reader
+        return reader
+
+    def close(self):
+        if self._reader is not None:
+            self._reader.close()
+            self._reader = None
+        if self._session is not None:
+            self._session.close()
+            self._session = None
+        self._closed = True
+
+    def refresh(self):
+        """Drop the stream so the next capture renegotiates.
+
+        Not the session: re-opening that would ask for consent again.
+        """
+        if self._reader is not None:
+            self._reader.close()
+            self._reader = None
+        if self._session is not None:
+            self._reader = self._reader_class(self._session.node_id)
+
+    # -------- BaseBackend --------
 
     def resolution(self):
-        raise NotImplementedError(_NOT_IMPLEMENTED_MSG)
+        """The stream's own size, from the negotiated video caps.
+
+        Not the portal's ``size`` property: that is in compositor
+        coordinates and need not match the pixels delivered.
+        """
+        self._check_open()
+        return tuple(self._ensure_stream().size)
 
     def bytes_per_pixel(self):
         return 4
 
     def screenshot(self, x, y, img):
-        raise NotImplementedError(_NOT_IMPLEMENTED_MSG)
+        self._check_open()
+        height, width = img.shape[:2]
+        frame = self._ensure_stream().read()
+        stream_h, stream_w = frame.shape[:2]
+        if (x < 0 or y < 0 or x + width > stream_w
+                or y + height > stream_h):
+            raise ValueError(
+                "region ({}, {}, {}, {}) is outside the {}x{} portal "
+                "stream".format(x, y, width, height, stream_w, stream_h)
+            )
+        # Cropped here rather than asked of the compositor: the portal
+        # hands back a whole monitor and has no sub-region concept.
+        img[:] = frame[y:y + height, x:x + width]

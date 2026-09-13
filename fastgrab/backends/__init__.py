@@ -96,8 +96,13 @@ def _autodetect():
         try:
             from .portal import PortalBackend
             return PortalBackend()
-        except Exception:
-            pass
+        except Exception as exc:
+            # A declined screen-share must not become a silent fallback:
+            # XWayland would then capture the very screen the user just
+            # refused to share. Everything else here means "this backend
+            # is not usable", which is what the fallback is for.
+            if type(exc).__name__ == "PortalCancelled":
+                raise
         # Wayland session but no working Wayland backend — fall through to
         # X11/XWayland, which still works for X11 clients in a Wayland session.
 

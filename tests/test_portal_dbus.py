@@ -10,6 +10,7 @@ import os
 import subprocess
 import time
 
+import numpy
 import pytest
 
 pytestmark = pytest.mark.portal
@@ -163,3 +164,94 @@ def test_closing_twice_is_harmless(portal):
     session.open()
     session.close()
     session.close()
+
+
+# -------- PortalBackend against the same fixture --------
+
+def test_the_backend_captures_through_the_portal(portal):
+    """The whole path: handshake, node id, PipeWire frames, BGRA out."""
+    from fastgrab.backends.portal import PortalBackend
+    portal()
+    backend = PortalBackend(timeout=30)
+    try:
+        width, height = backend.resolution()
+        assert (width, height) == (320, 240)
+        assert backend.bytes_per_pixel() == 4
+
+        frame = numpy.zeros((height, width, 4), numpy.uint8)
+        backend.screenshot(0, 0, frame)
+        assert frame[..., 2].mean() > 200, "the fixture's red should be in byte 2"
+        assert frame[..., 0].mean() < 50
+    finally:
+        backend.close()
+
+
+def test_the_backend_crops_locally(portal):
+    """The portal hands back a whole monitor; sub-regions are ours to cut."""
+    from fastgrab.backends.portal import PortalBackend
+    portal()
+    backend = PortalBackend(timeout=30)
+    try:
+        frame = numpy.zeros((40, 60, 4), numpy.uint8)
+        backend.screenshot(10, 20, frame)
+        assert frame.shape == (40, 60, 4)
+        assert frame[..., 2].mean() > 200
+    finally:
+        backend.close()
+
+
+def test_a_region_outside_the_stream_is_refused(portal):
+    from fastgrab.backends.portal import PortalBackend
+    portal()
+    backend = PortalBackend(timeout=30)
+    try:
+        with pytest.raises(ValueError, match="outside"):
+            backend.screenshot(0, 0, numpy.zeros((1000, 1000, 4), numpy.uint8))
+    finally:
+        backend.close()
+
+
+def test_construction_asks_for_nothing(portal):
+    """Autodetection builds backends speculatively.
+
+    A chooser dialog appearing because a program called Screenshot()
+    would be indefensible, so the session opens on first use instead.
+    """
+    from fastgrab.backends.portal import PortalBackend
+    portal()
+    backend = PortalBackend(timeout=30)
+    assert backend._session is None and backend._reader is None
+    backend.close()
+
+
+def test_one_backend_opens_one_session(portal):
+    """Consent belongs to the session, so reuse must not re-ask."""
+    from fastgrab.backends.portal import PortalBackend
+    portal()
+    backend = PortalBackend(timeout=30)
+    try:
+        backend.resolution()
+        session = backend._session
+        for _ in range(3):
+            backend.screenshot(0, 0, numpy.zeros((240, 320, 4), numpy.uint8))
+        assert backend._session is session, "a capture re-opened the session"
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("none", 0), ("transient", 1), ("persistent", 2), (None, 1),
+])
+def test_the_persist_mode_can_be_chosen(value, expected, monkeypatch):
+    from fastgrab.backends.portal import PortalBackend, _persist_mode
+    monkeypatch.delenv("FASTGRAB_PORTAL_PERSIST", raising=False)
+    assert _persist_mode(value) == expected
+
+
+def test_the_persist_mode_can_come_from_the_environment(monkeypatch):
+    from fastgrab.backends.portal import _persist_mode
+    monkeypatch.setenv("FASTGRAB_PORTAL_PERSIST", "persistent")
+    assert _persist_mode() == 2
+    monkeypatch.setenv("FASTGRAB_PORTAL_PERSIST", "nonsense")
+    with pytest.raises(ValueError, match="FASTGRAB_PORTAL_PERSIST"):
+        _persist_mode()

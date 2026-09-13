@@ -56,12 +56,16 @@ class ScreenCastSession:
     """
 
     def __init__(self, app_id="", multiple=False, cursor_mode=1,
-                 timeout=60.0):
+                 timeout=60.0, persist_mode=0, restore_token=None):
         self._gio, self._glib = _require_gio()
         self.app_id = app_id
         self.multiple = multiple
         self.cursor_mode = cursor_mode
         self.timeout = timeout
+        # 0 ask every time, 1 remember for this desktop session, 2 across
+        # reboots. The desktop decides whether it honours the request.
+        self.persist_mode = int(persist_mode)
+        self.restore_token = restore_token
         self._conn = None
         self._session_handle = None
         self.streams = []
@@ -150,6 +154,21 @@ class ScreenCastSession:
 
     # -------- the conversation --------
 
+    def _select_options(self, token):
+        GLib = self._glib
+        options = {
+            "handle_token": GLib.Variant("s", token),
+            "types": GLib.Variant("u", 1),          # MONITOR
+            "multiple": GLib.Variant("b", self.multiple),
+            "cursor_mode": GLib.Variant("u", self.cursor_mode),
+            "persist_mode": GLib.Variant("u", self.persist_mode),
+        }
+        if self.restore_token:
+            # Single-use: the portal replaces it on every successful
+            # restore, so a caller that keeps the old one is asked again.
+            options["restore_token"] = GLib.Variant("s", self.restore_token)
+        return options
+
     def open(self):
         """Run CreateSession, SelectSources and Start; return the streams."""
         GLib = self._glib
@@ -170,12 +189,8 @@ class ScreenCastSession:
 
         self._call_with_response(
             "SelectSources",
-            lambda token: GLib.Variant("(oa{sv})", (self._session_handle, {
-                "handle_token": GLib.Variant("s", token),
-                "types": GLib.Variant("u", 1),          # MONITOR
-                "multiple": GLib.Variant("b", self.multiple),
-                "cursor_mode": GLib.Variant("u", self.cursor_mode),
-            })),
+            lambda token: GLib.Variant("(oa{sv})", (self._session_handle,
+                                                     self._select_options(token))),
             "select")
 
         results = self._call_with_response(
@@ -184,6 +199,9 @@ class ScreenCastSession:
                 "handle_token": GLib.Variant("s", token),
             })),
             "start")
+        # Replaced on every successful restore, so it has to be read back
+        # rather than assumed to be the one that was sent.
+        self.restore_token = results.get("restore_token") or self.restore_token
         self.streams = list(results.get("streams") or [])
         if not self.streams:
             raise PortalUnavailable(
