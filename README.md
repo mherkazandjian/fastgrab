@@ -1,7 +1,7 @@
 # FastGrab
 
 ``Fastgrab`` is an opensouce high frame rate screen capture package. A typical
-capture frame rate at a resolution of 1080p on a modern machine is ~60 fps.
+capture frame rate at a resolution of 1080p on a modern machine is ~200 fps.
 There are several other such packages in the wild that are opensource as well, 
 but none of them is as fast or provides a simple way of obtaining the captures
 image as a numpy array out of the box. The default behavior of ``fastgrab`` is
@@ -13,10 +13,16 @@ Typical capture frame rate on a modern machine
 
 resolution    | fps
 ------------- | -----
-360p          | > 800
-720p          | 260
-1080p         | 200
-4K            | 20
+360p          | 3000
+720p          | 500
+1080p         | 208
+4K            | 44
+8K            | 11
+
+Measured with [examples/benchmark.py](https://github.com/mherkazandjian/fastgrab/blob/main/examples/benchmark.py)
+on a single core of an AMD EPYC 9555 under Linux/X11, 800 frames per
+resolution. Capture is single threaded, so the frame rate tracks single-core
+clock and memory bandwidth; figures on other machines will differ.
 
 # Usage example
 
