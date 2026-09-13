@@ -126,7 +126,14 @@ def _autodetect():
             # swallowing it would answer a misspelt setting by quietly
             # capturing through XWayland instead, losing native Wayland
             # windows, with nothing said.
-            if isinstance(exc, ValueError):
+            #
+            # By name, not isinstance(exc, ValueError):
+            # gi.require_version() raises a bare ValueError for a
+            # missing typelib, so catching the base class here would
+            # turn "GStreamer introspection is not installed" -- an
+            # ordinary partial install -- into a hard failure of
+            # Screenshot() instead of the XWayland fallback that works.
+            if type(exc).__name__ == "PortalConfigError":
                 raise
             # Everything else here does mean the backend is unusable,
             # which is what the fallback is for.

@@ -150,6 +150,20 @@ PERSIST_MODES = {"none": 0, "transient": 1, "persistent": 2}
 PERSIST_ENV = "FASTGRAB_PORTAL_PERSIST"
 
 
+class PortalConfigError(ValueError):
+    """A fastgrab setting is wrong, as opposed to a backend being absent.
+
+    Its own type because auto-detection has to tell the two apart, and
+    ValueError alone cannot: ``gi.require_version()`` raises ValueError
+    for a missing typelib, so keying on that would turn "GStreamer's
+    introspection data is not installed" -- an ordinary partial install,
+    and a perfectly good reason to fall back to XWayland -- into a hard
+    failure of Screenshot().
+
+    Still a ValueError, so callers that already catch one keep working.
+    """
+
+
 def _persist_mode(explicit=None):
     """Resolve the persist mode from the argument, then the environment."""
     value = explicit if explicit is not None else os.environ.get(PERSIST_ENV)
@@ -157,7 +171,7 @@ def _persist_mode(explicit=None):
         return PERSIST_MODES["transient"]
     key = str(value).strip().lower()
     if key not in PERSIST_MODES:
-        raise ValueError(
+        raise PortalConfigError(
             "{} must be one of {}, got {!r}".format(
                 PERSIST_ENV, ", ".join(sorted(PERSIST_MODES)), value
             )

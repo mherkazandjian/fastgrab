@@ -561,11 +561,42 @@ def test_autodetect_does_not_swallow_a_bad_persist_setting(monkeypatch):
     _pretend_linux_wayland(monkeypatch)
     _stub_backend(monkeypatch, "wlr", "WlrBackend",
                   _raises(OSError("no wlroots")))
+    # Named PortalConfigError, because that is what the guard keys on
+    # -- and deliberately not a bare ValueError, which is what
+    # gi.require_version() raises for a missing typelib and must keep
+    # falling back.
+    class PortalConfigError(ValueError):
+        pass
+
     _stub_backend(monkeypatch, "portal", "PortalBackend",
-                  _raises(ValueError(
+                  _raises(PortalConfigError(
                       "FASTGRAB_PORTAL_PERSIST must be one of none, "
                       "persistent, transient, got 'presistent'")))
     _stub_backend(monkeypatch, "x11", "X11Backend", Fallback)
 
     with pytest.raises(ValueError, match="FASTGRAB_PORTAL_PERSIST"):
         backends._autodetect()
+
+
+@pytest.mark.no_display
+def test_autodetect_still_falls_back_when_a_typelib_is_missing(monkeypatch):
+    """gi.require_version() raises a bare ValueError for a missing typelib.
+
+    PyGObject installed without the GStreamer introspection packages is
+    an ordinary partial install, and a perfectly good reason to use
+    XWayland. Keying the config-error guard on ValueError itself would
+    turn it into a hard failure of Screenshot().
+    """
+    from fastgrab import backends
+
+    class Fallback(object):
+        pass
+
+    _pretend_linux_wayland(monkeypatch)
+    _stub_backend(monkeypatch, "wlr", "WlrBackend",
+                  _raises(OSError("no wlroots")))
+    _stub_backend(monkeypatch, "portal", "PortalBackend",
+                  _raises(ValueError("Namespace Gst not available")))
+    _stub_backend(monkeypatch, "x11", "X11Backend", Fallback)
+
+    assert isinstance(backends._autodetect(), Fallback)

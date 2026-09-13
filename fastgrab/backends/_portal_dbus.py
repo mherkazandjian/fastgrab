@@ -204,6 +204,25 @@ class ScreenCastSession:
                 if not fired:
                     timer.destroy()
                 conn.signal_unsubscribe(subscription)
+                if "response" not in result:
+                    # Leaving without an answer -- timed out, or
+                    # interrupted. The portal keeps the Request object
+                    # alive until it answers or the client closes it,
+                    # and unsubscribing only stops *us* listening: the
+                    # request is still live at the other end and can
+                    # still go on to create a session nobody is holding.
+                    # Whoever else keeps the bus connection alive keeps
+                    # that orphan alive too.
+                    try:
+                        conn.call_sync(
+                            PORTAL_BUS, path, REQUEST_IFACE, "Close",
+                            None, None, Gio.DBusCallFlags.NONE, 2000, None)
+                    except Exception:
+                        # Already answered, already gone, or never
+                        # created: all of them mean there is nothing to
+                        # close, and none should replace the failure
+                        # being reported.
+                        pass
         finally:
             context.pop_thread_default()
 

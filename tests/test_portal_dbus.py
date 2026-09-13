@@ -18,7 +18,7 @@ pytestmark = pytest.mark.portal
 pytest.importorskip("gi", reason="the portal backend is behind the [portal] extra")
 
 from fastgrab.backends._portal_dbus import (  # noqa: E402
-    PortalCancelled, PortalUnavailable, ScreenCastSession,
+    REQUEST_IFACE, PortalCancelled, PortalUnavailable, ScreenCastSession,
 )
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -280,6 +280,51 @@ def test_the_handshake_works_from_a_thread_with_its_own_glib_context(portal):
     assert not thread.is_alive(), "the handshake never returned"
     assert "error" not in outcome, "handshake failed: %r" % (outcome["error"],)
     assert outcome["streams"], "no streams came back"
+
+
+def test_an_abandoned_request_is_closed():
+    """Unsubscribing stops us listening; it does not stop the request.
+
+    The portal keeps a Request object alive until it answers or the
+    client closes it. Walking away from a timeout leaves it live at the
+    other end, still able to create a session nobody holds -- and any
+    other Gio user, or a retained transient token, keeps the connection
+    and therefore the orphan alive.
+
+    Driven against a stand-in connection rather than the real portal.
+    Spying on the shared Gio bus poisons every portal test that follows:
+    the connection is process-wide, and holding it across the fixture's
+    teardown leaves later tests talking to a bus whose portal is gone.
+    """
+    class FakeConnection(object):
+        def __init__(self):
+            self.calls = []
+
+        def get_unique_name(self):
+            return ":1.99"
+
+        def signal_subscribe(self, *_args, **_kwargs):
+            return 1
+
+        def signal_unsubscribe(self, _subscription):
+            pass
+
+        def call_sync(self, _bus, _path, iface, method, *_a, **_k):
+            self.calls.append((iface, method))
+            return None
+
+    session = ScreenCastSession(app_id="fastgrab-test", timeout=0.2)
+    connection = FakeConnection()
+    session._conn = connection
+
+    with pytest.raises(PortalUnavailable, match="never answered"):
+        session.open()
+
+    assert (REQUEST_IFACE, "Close") in connection.calls, (
+        "the abandoned request was never closed; it stays live at the "
+        "portal and can still create a session. Calls seen: %s"
+        % (connection.calls,)
+    )
 
 
 # -------- remembering consent --------
