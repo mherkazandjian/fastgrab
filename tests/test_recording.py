@@ -30,6 +30,7 @@ from fastgrab.recording import (
 from fastgrab.recording import cli as recording_cli
 from fastgrab.recording import clicks as click_mod
 from fastgrab.recording import encoder as encoder_mod
+from fastgrab.recording import recorder as recorder_mod
 from fastgrab.recording import subtitles as subtitles_mod
 
 
@@ -548,24 +549,33 @@ def test_recorder_smoke_mp4(tmp_path):
 # Blur / redaction wiring
 # --------------------------------------------------------------------
 
-class _StubRecorder:
-    """Captures the kwargs main() builds without touching a display."""
+class _BlurStubRecorder:
+    """Captures the kwargs main() builds for the blur flags.
+
+    Named apart from the _StubRecorder further down, which upstream added
+    for the output-claim tests and which takes a stats dict positionally.
+    """
 
     last = None
 
     def __init__(self, **kwargs):
-        _StubRecorder.last = kwargs
+        _BlurStubRecorder.last = kwargs
 
     def record(self, **_kwargs):
+        # encoder_started=False because this stub genuinely writes
+        # nothing. Claiming frames for a file that does not exist is what
+        # the output-claim check upstream now (correctly) rejects, and
+        # these tests are about the kwargs main() builds, not the encode.
         return {
-            "frames": 1, "written_frames": 1, "elapsed_seconds": 1.0,
-            "achieved_fps": 1.0, "output": "stub.mp4",
+            "frames": 0, "written_frames": 0, "elapsed_seconds": 0.0,
+            "achieved_fps": 0.0, "output": "stub.mp4",
+            "encoder_started": False,
         }
 
 
 def _run_cli(monkeypatch, argv):
-    monkeypatch.setattr(recording_cli, "Recorder", _StubRecorder)
-    _StubRecorder.last = None
+    monkeypatch.setattr(recording_cli, "Recorder", _BlurStubRecorder)
+    _BlurStubRecorder.last = None
     # main() installs its own SIGINT/SIGTERM handlers so ffmpeg can
     # finalise the container on Ctrl-C. Put the originals back, or the
     # rest of the pytest session runs with Ctrl-C disarmed.
@@ -576,7 +586,7 @@ def _run_cli(monkeypatch, argv):
     finally:
         for sig, handler in saved.items():
             signal.signal(sig, handler)
-    return _StubRecorder.last
+    return _BlurStubRecorder.last
 
 
 def test_cli_parse_blur_region_allows_single_pixel_sizes():
@@ -1199,3 +1209,568 @@ def test_cli_blur_image_fit_reaches_the_style(monkeypatch, tmp_path):
             "--blur-image-fit", fit,
         ])["blur_style"]
         assert style.image_fit == fit
+# -------- what the CLI claims it wrote --------
+#
+# Ctrl-C during the countdown stops the recorder before ffmpeg is ever
+# started. The recorder says so — it returns a zero stats dict, and its
+# own comment reads "Cancelled before the first frame ... there's no
+# file" — but the CLI printed the ordinary summary anyway:
+#
+#   $ fastgrab-record --region 0,0,320,240 --countdown 5 -o out.mp4
+#   ^C
+#   wrote out.mp4: 0 frames in 0.00s (0.0 fps achieved)     # exit 0
+#   $ ls out.mp4
+#   ls: cannot access 'out.mp4': No such file or directory
+#
+# Verified end to end by SIGINTing the real CLI under xvfb.
+
+
+class _StubRecorder:
+    """Stands in for Recorder, returning a chosen stats dict."""
+
+    def __init__(self, stats):
+        self._stats = stats
+
+    def record(self, **kwargs):
+        return self._stats
+
+
+def _run_cli_with(monkeypatch, stats, tmp_path, extra=None):
+    monkeypatch.setattr(
+        recording_cli, "Recorder", lambda **kw: _StubRecorder(stats)
+    )
+    argv = ["--region", "0,0,64,48", "-o", str(tmp_path / "out.mp4")]
+    return recording_cli.main(argv + (extra or []))
+
+
+def _stats(output, frames=0, written=0, encoder_started=True):
+    return {
+        "frames": frames,
+        "written_frames": written,
+        "elapsed_seconds": 0.0 if not frames else 1.0,
+        "achieved_fps": 0.0 if not frames else float(frames),
+        "output": str(output),
+        "encoder_started": encoder_started,
+    }
+
+
+def test_a_cancelled_recording_does_not_claim_a_file(monkeypatch, tmp_path, capsys):
+    out = tmp_path / "out.mp4"
+    rc = _run_cli_with(
+        monkeypatch, _stats(out, encoder_started=False), tmp_path
+    )
+    captured = capsys.readouterr()
+    assert rc == 0, "a deliberate cancel is not an error"
+    assert "wrote" not in captured.out, captured.out
+    assert "cancelled before the first frame" in captured.err
+    assert str(out) in captured.err
+    assert not out.exists()
+
+
+def test_a_recording_that_produced_no_file_is_an_error(monkeypatch, tmp_path, capsys):
+    """Frames encoded, ffmpeg happy, nothing on disk — do not say "wrote"."""
+    out = tmp_path / "out.mp4"
+    rc = _run_cli_with(monkeypatch, _stats(out, frames=10, written=10), tmp_path)
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "wrote" not in captured.out, captured.out
+    assert "does not exist" in captured.err
+
+
+def test_a_real_recording_still_reports_what_it_wrote(monkeypatch, tmp_path, capsys):
+    """The ordinary path must be untouched."""
+    out = tmp_path / "out.mp4"
+    out.write_bytes(b"not really an mp4, but it exists")
+    rc = _run_cli_with(monkeypatch, _stats(out, frames=30, written=30), tmp_path)
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "wrote {}".format(out) in captured.out
+    assert "30 frames" in captured.out
+
+
+def test_duplicated_frames_are_still_reported(monkeypatch, tmp_path, capsys):
+    """written_frames > frames is the slow-capture case, not a cancel."""
+    out = tmp_path / "out.mp4"
+    out.write_bytes(b"x")
+    rc = _run_cli_with(monkeypatch, _stats(out, frames=10, written=25), tmp_path)
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "15 duplicated" in captured.out, captured.out
+
+
+# -------- the clip must last as long as the recording did --------
+#
+# ffmpeg stamps incoming raw frames at the fixed target rate, so a
+# capture loop that cannot keep up would produce a clip shorter than the
+# recording and played back too fast, with every subtitle window drifting
+# out of place. Recorder guards against that by writing the current frame
+# once per elapsed tick.
+#
+# The guard works — measured against real ffmpeg at up to 6x sustained
+# lag, output duration tracked wall-clock to within 15 ms — but nothing
+# pinned it. The only assertion on the mechanism was
+# `written_frames >= frames`, which is true however badly the pacing
+# behaves, so removing the duplication entirely kept the suite green.
+#
+# These drive recorder.py against a fake clock rather than sleeping. The
+# property is arithmetic — how many ticks fell inside the elapsed time —
+# and measuring it with real time made it a test of the runner's timer
+# granularity instead, which is what it failed on for Windows and macOS.
+
+
+class _FakeClock:
+    """Stands in for the time module inside recorder.py.
+
+    Nothing sleeps: sleep() just moves the clock forward, so a recording
+    of any length runs instantly and every tick lands exactly where the
+    arithmetic says it should.
+    """
+
+    def __init__(self, start=1000.0):
+        self.now = start
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        if seconds > 0:
+            self.now += seconds
+
+
+class _ScriptedGrab:
+    """A Screenshot stand-in that costs a known amount of clock time."""
+
+    def __init__(self, clock, cost=0.0, stall_at=None, stall_for=0.0):
+        self.clock = clock
+        self.cost = cost
+        self.stall_at = stall_at
+        self.stall_for = stall_for
+        self.calls = 0
+        self.screensize = (64, 48)
+
+    def capture(self, bbox=None):
+        self.calls += 1
+        if self.stall_at is not None and self.calls == self.stall_at:
+            self.clock.now += self.stall_for
+        else:
+            self.clock.now += self.cost
+        return numpy.zeros((48, 64, 4), numpy.uint8)
+
+
+class _CountingEncoder:
+    """Accepts frames and counts them; no ffmpeg involved."""
+
+    def __init__(self, *args, **kwargs):
+        self.frames = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def write_frame(self, frame):
+        self.frames += 1
+
+
+def _paced_recorder(monkeypatch, tmp_path, fps, encoder=None, **grab):
+    """A Recorder with its clock, its capture and its encoder all stubbed.
+
+    Screenshot is replaced before construction, not after: Recorder builds
+    one in __init__, and the default x11 backend imports the C extension,
+    which does not exist on the Windows and macOS runners.
+    """
+    clock = _FakeClock()
+    stub = _ScriptedGrab(clock, **grab)
+    monkeypatch.setattr(recorder_mod, "time", clock)
+    monkeypatch.setattr(recorder_mod, "Screenshot", lambda **kw: stub)
+    monkeypatch.setattr(
+        recorder_mod, "FfmpegEncoder", encoder or _CountingEncoder
+    )
+    rec = Recorder(str(tmp_path / "out.mp4"), bbox=(0, 0, 64, 48), fps=fps)
+    return rec, stub
+
+
+def _assert_tracks_wall_clock(stats, fps, tolerance=1):
+    """The clip's length, in frames, must match the time that passed."""
+    expected = stats["elapsed_seconds"] * fps
+    assert abs(stats["written_frames"] - expected) <= tolerance, (
+        "clip is {:.2f}s of video for {:.2f}s of recording ({} frames, "
+        "expected about {:.0f})".format(
+            stats["written_frames"] / float(fps), stats["elapsed_seconds"],
+            stats["written_frames"], expected,
+        )
+    )
+
+
+def test_a_capture_that_keeps_up_writes_one_frame_per_tick(monkeypatch, tmp_path):
+    rec, _ = _paced_recorder(monkeypatch, tmp_path, 20, cost=0.01)
+    stats = rec.record(duration=1.0)
+    _assert_tracks_wall_clock(stats, 20)
+    assert stats["written_frames"] == stats["frames"], (
+        "a capture comfortably inside the tick should need no duplicates"
+    )
+
+
+def test_a_capture_four_times_too_slow_still_fills_the_clip(monkeypatch, tmp_path):
+    """The case the duplication exists for: the loop cannot keep up."""
+    rec, _ = _paced_recorder(monkeypatch, tmp_path, 20, cost=0.20)
+    stats = rec.record(duration=1.0)
+    _assert_tracks_wall_clock(stats, 20)
+    # A quarter of the target rate: about five captures for twenty ticks.
+    assert stats["frames"] <= 6, stats
+    assert stats["written_frames"] - stats["frames"] >= 12, stats
+
+
+def test_a_single_long_stall_is_filled_with_duplicates(monkeypatch, tmp_path):
+    """One freeze, not sustained lag — the gap still has to be covered."""
+    rec, _ = _paced_recorder(
+        monkeypatch, tmp_path, 20, cost=0.01, stall_at=3, stall_for=0.5
+    )
+    stats = rec.record(duration=1.0)
+    _assert_tracks_wall_clock(stats, 20)
+    # The freeze alone spans ten ticks at 20 fps and only one frame was
+    # captured across it, so at least nine writes must be duplicates.
+    assert stats["written_frames"] - stats["frames"] >= 9, stats
+
+
+def test_stopping_early_also_tracks_wall_clock(monkeypatch, tmp_path):
+    """stop_event is how an interactive recording ends, not a deadline.
+
+    The capture costs three ticks so this exercises the duplication too;
+    at one tick the loop keeps up and the test would still pass with the
+    mechanism removed.
+    """
+    rec, grab = _paced_recorder(monkeypatch, tmp_path, 20, cost=0.15)
+    stop = threading.Event()
+
+    # Fires on the fake clock, not a real timer: stop once the recording
+    # has covered about a second of clock time.
+    original = grab.capture
+
+    def capture(bbox=None):
+        frame = original(bbox)
+        if grab.clock.now >= 1001.0:
+            stop.set()
+        return frame
+
+    grab.capture = capture
+    stats = rec.record(stop_event=stop)
+    _assert_tracks_wall_clock(stats, 20)
+    assert stats["written_frames"] > stats["frames"], stats
+
+
+def test_every_written_frame_reached_the_encoder(monkeypatch, tmp_path):
+    """written_frames is a claim about ffmpeg's input; check it is true."""
+    made = []
+
+    class _Recording(_CountingEncoder):
+        def __init__(self, *a, **kw):
+            _CountingEncoder.__init__(self, *a, **kw)
+            made.append(self)
+
+    rec, _ = _paced_recorder(
+        monkeypatch, tmp_path, 20, encoder=_Recording, cost=0.1
+    )
+    stats = rec.record(duration=1.0)
+    assert len(made) == 1
+    assert made[0].frames == stats["written_frames"]
+
+
+# -------- close() must say why ffmpeg stopped --------
+#
+# The timeout path raised "ffmpeg did not exit within 30s" and nothing
+# else. Its finally block computed the stderr and then dropped it on the
+# floor, so the one failure where ffmpeg's own words matter most — it
+# hung, and you cannot ask it anything afterwards because it gets killed
+# — was the one failure that arrived with no words at all.
+
+_HANGING_CHILD = (
+    "import sys, time\n"
+    "sys.stderr.buffer.write(b'WHY-IT-HUNG\\n')\n"
+    "sys.stderr.buffer.flush()\n"
+    "while True:\n"
+    "    time.sleep(0.05)\n"
+)
+
+_SILENT_HANGING_CHILD = (
+    "import sys, time\n"
+    "while True:\n"
+    "    time.sleep(0.05)\n"
+)
+
+_DYING_CHILD = (
+    "import sys\n"
+    "sys.stderr.buffer.write(b'DIED-BECAUSE-OF-THIS\\n')\n"
+    "sys.stderr.buffer.flush()\n"
+    "sys.exit(3)\n"
+)
+
+
+def _encoder_running(tmp_path, source):
+    enc = FfmpegEncoder(str(tmp_path / "out.mp4"), 64, 48, fps=30)
+    enc._build_argv = lambda: [sys.executable, "-c", source]
+    enc.start()
+    return enc
+
+
+@requires_ffmpeg
+def test_a_hung_encoder_reports_what_it_said_before_hanging(tmp_path):
+    enc = _encoder_running(tmp_path, _HANGING_CHILD)
+    with pytest.raises(RuntimeError) as excinfo:
+        enc.close(timeout=1.0)
+    message = str(excinfo.value)
+    assert "did not exit within 1.0s" in message, message
+    assert "WHY-IT-HUNG" in message, message
+
+
+@requires_ffmpeg
+def test_a_hung_encoder_that_said_nothing_says_so(tmp_path):
+    """An empty tail must not trail off the end of the message."""
+    enc = _encoder_running(tmp_path, _SILENT_HANGING_CHILD)
+    with pytest.raises(RuntimeError) as excinfo:
+        enc.close(timeout=1.0)
+    message = str(excinfo.value)
+    assert "did not exit within 1.0s" in message, message
+    assert "wrote nothing to stderr" in message, message
+
+
+@requires_ffmpeg
+def test_a_hung_encoder_is_killed_and_reaped(tmp_path):
+    """The timeout must not leave the process behind."""
+    enc = _encoder_running(tmp_path, _HANGING_CHILD)
+    proc = enc._proc
+    with pytest.raises(RuntimeError):
+        enc.close(timeout=1.0)
+    assert proc.poll() is not None, "the hung encoder outlived close()"
+    assert enc._proc is None
+    assert enc._stderr_file is None, "the stderr file was not released"
+
+
+@requires_ffmpeg
+def test_a_broken_pipe_on_close_does_not_hide_the_real_cause(tmp_path):
+    """ffmpeg died first, so closing its stdin fails.
+
+    Reporting that BrokenPipeError names a symptom and nothing else, and
+    it skipped the exit status and stderr that say what actually
+    happened.
+    """
+    enc = _encoder_running(tmp_path, _DYING_CHILD)
+    enc._proc.wait()
+
+    def boom():
+        raise BrokenPipeError(32, "Broken pipe")
+
+    enc._proc.stdin.close = boom
+    with pytest.raises(RuntimeError) as excinfo:
+        enc.close(timeout=5.0)
+    message = str(excinfo.value)
+    assert "status 3" in message, message
+    assert "DIED-BECAUSE-OF-THIS" in message, message
+
+
+@requires_ffmpeg
+def test_a_clean_close_still_raises_nothing(tmp_path):
+    """The ordinary path must be untouched."""
+    enc = _encoder_running(tmp_path, "import sys\nsys.stdin.buffer.read()\n")
+    enc.close(timeout=10.0)
+    assert enc._proc is None
+    assert enc._stderr_file is None
+
+
+# -------- two regressions the first version of this check introduced --------
+#
+# Both found by review of the merged change, and both confirmed by
+# running ffmpeg rather than by reading the code.
+
+def test_zero_frames_with_a_started_encoder_is_not_a_cancellation(
+    monkeypatch, tmp_path, capsys
+):
+    """A frame count of nought does not mean nothing was produced.
+
+    If the loop stops after ffmpeg starts but before the first capture,
+    ffmpeg writes and closes an empty container quite happily — measured
+    at 261 bytes for mp4 and 465 for webm, both with a clean exit. The
+    first version of this branch keyed on the frame count and so
+    announced that a file which exists "was not written", which is the
+    same lie it was added to prevent, pointing the other way.
+    """
+    out = tmp_path / "out.mp4"
+    out.write_bytes(b"\0" * 261)  # what ffmpeg leaves behind
+    rc = _run_cli_with(
+        monkeypatch, _stats(out, frames=0, written=0, encoder_started=True),
+        tmp_path,
+    )
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "was not written" not in captured.err, captured.err
+    assert "wrote {}".format(out) in captured.out, captured.out
+
+
+def test_a_file_url_output_is_resolved_before_looking_for_it(
+    monkeypatch, tmp_path, capsys
+):
+    """`-o file:out.mp4` writes out.mp4; the check must not fail it.
+
+    ffmpeg's file: protocol exists so a name containing a colon, or one
+    starting with a dash, can be given unambiguously. Confirmed against
+    real ffmpeg: `file:/tmp/url.mp4` produced /tmp/url.mp4 and exited
+    cleanly, while os.path.exists on the raw string was False — so the
+    first version of this check failed a recording that had worked.
+    """
+    real = tmp_path / "out.mp4"
+    real.write_bytes(b"a real recording")
+    rc = _run_cli_with(
+        monkeypatch, _stats("file:" + str(real), frames=10, written=10),
+        tmp_path,
+    )
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    assert "does not exist" not in captured.err
+    assert "wrote file:{}".format(real) in captured.out, captured.out
+
+
+def test_a_non_file_destination_is_not_checked_on_disk(
+    monkeypatch, tmp_path, capsys
+):
+    """ffmpeg can write to a protocol URL; there is no path to stat."""
+    rc = _run_cli_with(
+        monkeypatch, _stats("rtmp://example.invalid/live/x.mp4",
+                            frames=10, written=10),
+        tmp_path,
+    )
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    assert "does not exist" not in captured.err
+
+
+def test_a_genuinely_missing_local_file_is_still_an_error(
+    monkeypatch, tmp_path, capsys
+):
+    """The check must keep working for the ordinary case."""
+    out = tmp_path / "gone.mp4"
+    rc = _run_cli_with(monkeypatch, _stats(out, frames=10, written=10), tmp_path)
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "does not exist" in captured.err
+
+
+def test_a_missing_file_url_target_is_reported_by_its_real_path(
+    monkeypatch, tmp_path, capsys
+):
+    """Resolving must not turn a real failure into a pass."""
+    out = tmp_path / "gone.mp4"
+    rc = _run_cli_with(
+        monkeypatch, _stats("file:" + str(out), frames=10, written=10), tmp_path
+    )
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert str(out) in captured.err
+    assert "file:" not in captured.err, "report the path ffmpeg writes, not the URL"
+
+
+# -------- Ctrl-C outside the recording loop --------
+#
+# The loop installs its own SIGINT handler so a stop finalises the
+# container. Everything around it did not behave:
+#
+#   * before the handler is installed — argument parsing, the region
+#     selector, the config dialog — Ctrl-C ended the command with a bare
+#     KeyboardInterrupt traceback. The selector is the case that matters:
+#     it can sit open for as long as the user takes to drag a box.
+#     (One window stays: the ~0.22s of module import, measured, which
+#     happens before main() is called and so before any code here can
+#     catch anything. A SIGINT at 0.2s still ends in a traceback; at 0.6s
+#     it does not.)
+#   * after record() returns, the handler was still installed, so a
+#     Ctrl-C during the summary set an event nothing reads any more and
+#     the command could not be interrupted at all.
+#   * main() is importable and reachable as a library call, and it left
+#     the process's signal disposition permanently changed.
+#
+# Installing the handler earlier would fix only the first, and would buy
+# it by making the interactive setup ignore Ctrl-C, which is worse.
+
+
+def test_an_interrupt_before_recording_exits_cleanly(monkeypatch, tmp_path, capsys):
+    """No traceback, and the shell's conventional status for SIGINT."""
+
+    def interrupted(**kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(recording_cli, "Recorder", interrupted)
+    try:
+        rc = recording_cli.main(
+            ["--region", "0,0,64,48", "-o", str(tmp_path / "out.mp4")]
+        )
+    except KeyboardInterrupt:
+        # Caught here on purpose. pytest treats a KeyboardInterrupt as a
+        # request to abandon the session, so letting one escape would
+        # abort the whole run at whatever point this test happens to sit
+        # rather than reporting which behaviour regressed.
+        pytest.fail("main() let the KeyboardInterrupt escape to the caller")
+    captured = capsys.readouterr()
+    assert rc == 130, "130 is what bash reports for a child killed by SIGINT"
+    assert "fastgrab: interrupted" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_the_signal_handlers_are_restored_after_recording(monkeypatch, tmp_path):
+    """Left installed, they swallow a Ctrl-C during the summary."""
+    out = tmp_path / "out.mp4"
+    out.write_bytes(b"x")
+    before = (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM))
+
+    rc = _run_cli_with(monkeypatch, _stats(out, frames=5, written=5), tmp_path)
+
+    assert rc == 0
+    assert (signal.getsignal(signal.SIGINT),
+            signal.getsignal(signal.SIGTERM)) == before
+
+
+def test_the_signal_handlers_are_restored_when_recording_fails(
+    monkeypatch, tmp_path
+):
+    """The restore has to survive the error path too."""
+    before = (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM))
+
+    class _Failing:
+        def record(self, **kwargs):
+            raise RuntimeError("ffmpeg fell over")
+
+    monkeypatch.setattr(recording_cli, "Recorder", lambda **kw: _Failing())
+    rc = recording_cli.main(
+        ["--region", "0,0,64,48", "-o", str(tmp_path / "out.mp4")]
+    )
+
+    assert rc == 1
+    assert (signal.getsignal(signal.SIGINT),
+            signal.getsignal(signal.SIGTERM)) == before
+
+
+def test_the_handler_is_installed_while_recording(monkeypatch, tmp_path):
+    """The restore must not undo the thing it is restoring around.
+
+    A Ctrl-C mid-recording still has to set the stop event rather than
+    raise, or ffmpeg loses the chance to write its trailer.
+    """
+    out = tmp_path / "out.mp4"
+    out.write_bytes(b"x")
+    seen = {}
+
+    class _Watching:
+        def record(self, stop_event=None, **kwargs):
+            seen["handler"] = signal.getsignal(signal.SIGINT)
+            seen["default"] = signal.default_int_handler
+            # what a real SIGINT would do at this moment
+            seen["handler"](signal.SIGINT, None)
+            seen["stopped"] = stop_event.is_set()
+            return _stats(out, frames=5, written=5)
+
+    monkeypatch.setattr(recording_cli, "Recorder", lambda **kw: _Watching())
+    rc = recording_cli.main(
+        ["--region", "0,0,64,48", "-o", str(out)]
+    )
+    assert rc == 0
+    assert seen["handler"] is not seen["default"], "the loop ran unprotected"
+    assert seen["stopped"], "a Ctrl-C mid-recording did not ask it to stop"

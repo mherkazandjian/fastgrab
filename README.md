@@ -34,6 +34,24 @@ resolution    | fps
   plt.show()
 ````
 
+Reuse one ``Screenshot`` when you are capturing repeatedly — it keeps the
+buffer and the connection to the display, so a loop over ``capture()`` is
+much cheaper than a loop over ``Screenshot().capture()``. If you do build
+them per frame, each one holds an OS-level frame buffer until it is
+collected; ``close()``, or the context manager, releases it at a moment
+you choose:
+
+````python
+  from fastgrab import screenshot
+
+  with screenshot.Screenshot() as grab:
+      for _ in range(100):
+          img = grab.capture((0, 0, 640, 480))
+````
+
+``capture()`` refuses to run on a closed instance rather than returning a
+stale frame.
+
 ## Blurring and redacting regions
 
 ``fastgrab.effects`` hides parts of a capture without pulling in Pillow or
@@ -142,11 +160,19 @@ the codec (``.mp4``, ``.webm`` or ``.gif``):
   wall-clock time; the summary line reports the real capture rate and how
   many frames were duplicated.
 - ``--duration S`` stops after S seconds; without it, recording runs until
-  Ctrl-C and the file is finalised cleanly.
+  Ctrl-C and the file is finalised cleanly. Ctrl-C during the countdown
+  cancels instead: nothing has been encoded, so no file is written and the
+  command says so rather than naming one. A Ctrl-C before recording starts
+  at all — while the region selector is open, say — exits 130 without a
+  traceback.
 - ``--countdown S`` waits before the first frame — time to move the
   terminal out of shot.
 - ``--title TEXT`` shows top-centre for the first 3 seconds;
   ``--overlay-text TEXT`` is a watermark in the top-right for the whole clip.
+  Both are drawn literally: an apostrophe, a colon, a backslash or a percent
+  sign all come out as typed. That does mean ffmpeg's own ``%{...}``
+  expansions are *not* interpreted — a title reading ``%{pts}`` renders
+  those characters rather than a timestamp.
 
 Optional pointer overlays and subtitles:
 
@@ -251,6 +277,14 @@ Per-platform extras:
    Python headers are missing (``python3-dev``); ``stdio.h: No such file``
    means the toolchain headers are (``build-essential``). Tested on
    Debian-based Python images, Ubuntu 24.04 and Fedora 44, Python 3.10–3.14.
+
+   The X server must be running at **depth 24** (the default). A depth-30
+   screen — 10-bit colour, which some drivers offer for HDR-ish setups —
+   packs 10:10:10 RGB into the same 32 bits per pixel, so its channels do
+   not line up on byte boundaries and cannot be handed back as BGRA.
+   fastgrab refuses that layout with a message naming the masks it found
+   rather than returning wrong colours. ``xdpyinfo | grep "depth of root"``
+   says which you have.
  - **Linux/Wayland**: a wlroots-based compositor (Sway, Hyprland, river,
    niri, cage) for the no-prompt path; the ``[wayland]`` extra (``pip
    install fastgrab[wayland]``) pulls in ``pywayland``.

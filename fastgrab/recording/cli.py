@@ -1,6 +1,7 @@
 """``fastgrab-record`` CLI — argparse around :class:`Recorder`."""
 import argparse
 import math
+import os
 import re
 import signal
 import sys
@@ -417,7 +418,54 @@ def _stdout_countdown():
     return _cb
 
 
+def _missing_output(output):
+    """The local file ffmpeg should have written, if it is absent.
+
+    Returns ``None`` when there is nothing to complain about -- either the
+    file is there, or the destination is not a local file at all.
+
+    ffmpeg accepts protocol URLs as outputs, so the configured string is
+    not always a path. ``file:`` names a local path with the prefix
+    stripped; it exists precisely so a filename containing a colon, or
+    one starting with a dash, can be given unambiguously. Anything else
+    carrying a scheme (``rtmp://``, ``tcp://``, ``pipe:``) is not on this
+    filesystem and there is nothing to look for. Checking the raw string
+    failed a perfectly good recording: ``-o file:out.mp4`` writes
+    ``out.mp4``, and os.path.exists never found it under that name.
+    """
+    if output.startswith("file:"):
+        output = output[len("file:"):]
+    else:
+        scheme = output.split(":", 1)[0]
+        # A single-letter scheme is a Windows drive, not a protocol.
+        if ":" in output and len(scheme) > 1 and scheme.isalpha():
+            return None
+    return None if os.path.exists(output) else output
+
+
 def main(argv=None):
+    """Entry point for ``fastgrab-record``.
+
+    Only job beyond calling :func:`_main` is to keep a Ctrl-C from ending
+    the command with a traceback. The recording loop installs its own
+    SIGINT handler, but everything before that -- imports, argument
+    parsing, the interactive region selector, the config dialog -- runs
+    under Python's default one, and there a Ctrl-C raises. Aborting is
+    the right response; the traceback is only noise. Deliberately not
+    solved by installing the handler sooner: that would swap the noise
+    for a setup phase that ignores Ctrl-C, which is worse.
+    """
+    try:
+        return _main(argv)
+    except KeyboardInterrupt:
+        # 130 is the shell's conventional status for a program ended by
+        # SIGINT, and what bash reports for a child killed by one, so
+        # scripts see no change from the previous behaviour.
+        print("fastgrab: interrupted", file=sys.stderr)
+        return 130
+
+
+def _main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -585,11 +633,17 @@ def main(argv=None):
     def _on_signal(_signum, _frame):
         stop_event.set()
 
-    signal.signal(signal.SIGINT, _on_signal)
-    signal.signal(signal.SIGTERM, _on_signal)
+    # Restored once recording is over. Left installed, they would swallow
+    # a Ctrl-C during the summary below -- setting an event nothing reads
+    # any more, so the command could not be interrupted at all -- and
+    # main() is importable and reachable as a library call, which has no
+    # business permanently changing the process's signal disposition.
+    previous_handlers = {}
 
     progress_cb = None
     try:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous_handlers[signum] = signal.signal(signum, _on_signal)
         if args.gui:
             # Launched from a hotkey there's no terminal to print to, so
             # show a small window with the live frame count. It stays open
@@ -612,6 +666,9 @@ def main(argv=None):
             sys.stdout.write("\n")
         print("error: {}".format(exc), file=sys.stderr)
         return 1
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
 
     if progress_cb is not None:
         # Close off the in-place status line so the summary starts fresh.
@@ -620,6 +677,39 @@ def main(argv=None):
 
     if stats is None:
         return 0
+
+    if not stats.get("encoder_started", True):
+        # Ctrl-C during the countdown stops the recorder before ffmpeg is
+        # ever started, so there is genuinely no file. Reporting that as
+        # "wrote <path>: 0 frames" sent a script off to open something
+        # that was never created. Cancelling deliberately is not an
+        # error, so the exit status stays 0, matching the selection- and
+        # dialog-cancel paths above.
+        #
+        # Keyed on whether the encoder ran, not on the frame count: if
+        # the loop is stopped after ffmpeg starts but before the first
+        # capture, ffmpeg writes and closes an empty container quite
+        # happily -- 261 bytes for mp4, 465 for webm -- so zero frames
+        # and no file are different things.
+        print(
+            "fastgrab: cancelled before the first frame; {} was not "
+            "written".format(stats["output"]),
+            file=sys.stderr,
+        )
+        return 0
+
+    missing = _missing_output(stats["output"])
+    if missing is not None:
+        # Frames went to ffmpeg and it exited cleanly, yet nothing is
+        # there. Whatever the cause, saying "wrote" would be a lie of the
+        # same kind, so fail rather than describe a file that is absent.
+        print(
+            "error: {} frames were encoded but {} does not exist".format(
+                stats["frames"], missing
+            ),
+            file=sys.stderr,
+        )
+        return 1
 
     duplicated = stats.get("written_frames", stats["frames"]) - stats["frames"]
     print(
