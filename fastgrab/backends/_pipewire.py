@@ -50,10 +50,20 @@ class PipeWireVideoReader:
     after one is the one most likely to be missing.
     """
 
-    def __init__(self, node_id, timeout=5.0):
+    def __init__(self, node_id, timeout=5.0, fd=None):
         self._gst = _require_gst()
         self.node_id = int(node_id)
         self.timeout = float(timeout)
+        # The descriptor from OpenPipeWireRemote, when there is one. The
+        # portal hands back a connection of its own and the node id is
+        # only meaningful on it; falling back to the ambient socket
+        # happens to work when both are the same daemon and silently
+        # captures the wrong thing when they are not.
+        #
+        # Borrowed, not owned: pipewiresrc dups it, and whoever obtained
+        # it closes it. close() here must not, or a later reader would
+        # inherit the recycled number.
+        self.fd = fd
         self._pipeline = None
         self._sink = None
         self._size = None
@@ -65,11 +75,35 @@ class PipeWireVideoReader:
         # videoconvert, and no width/height in the caps: the stream's own
         # size is whatever the producer negotiated, and pinning it here
         # fails the state change outright rather than adapting.
+        # path=<node id> does bind to the node asked for: measured with
+        # two sources on one graph, a red one and a blue one, and each
+        # id returned its own colour. What it does not do is fail when
+        # the id is absent -- it falls back to any other source on the
+        # graph and returns those frames instead, reproducibly, whether
+        # one other source exists or two. That is the silent
+        # wrong-screen case, and two plausible cures were measured and
+        # rejected: autoconnect=false stops the stream connecting to
+        # *anything* (valid ids included) and then deadlocks close(),
+        # because pipewiresrc's streaming task never finishes and
+        # set_state(NULL) waits for it forever; node.dont-reconnect
+        # governs re-connection after a target disappears, not the
+        # initial fallback, and changes nothing here. So the gap stands,
+        # pinned by a test rather than papered over. It is narrow in
+        # practice: the id comes from the portal, on the portal's own
+        # connection, where the only nodes visible are the ones it
+        # shared -- which is the other half of why the fd below matters.
+        source = "pipewiresrc path={}".format(self.node_id)
+        if self.fd is not None:
+            source += " fd={}".format(int(self.fd))
+        # max-buffers=1, not 2. try_pull_sample() dequeues the *oldest*
+        # buffer appsink is holding, so a queue of two hands back the
+        # frame before last -- a capture that silently lags reality by
+        # one frame, which for a screenshot library is just "wrong
+        # picture". With drop=true a depth of one keeps the newest and
+        # discards the rest, which is the contract read() advertises.
         self._pipeline = Gst.parse_launch(
-            "pipewiresrc path={} ! videoconvert ! video/x-raw,format=BGRx "
-            "! appsink name=out max-buffers=2 drop=true sync=false".format(
-                self.node_id
-            )
+            source + " ! videoconvert ! video/x-raw,format=BGRx "
+            "! appsink name=out max-buffers=1 drop=true sync=false"
         )
         self._sink = self._pipeline.get_by_name("out")
         if self._pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:

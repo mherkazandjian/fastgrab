@@ -27,7 +27,12 @@ services:
     volumes:
       - .:/app
       - pip-cache:/root/.cache/pip
-    command: ["xvfb-run", "-a", "-s", "-screen 0 1280x1024x24", "python", "tests/_run_pytest_clean_exit.py", "-v", "-m", "not wayland", "tests"]
+    # "not portal" as well as "not wayland": those tests need a PipeWire
+    # graph this image has none of. They would skip anyway, but only
+    # because PyGObject happens to be absent here -- deselecting them by
+    # marker says so on purpose, instead of depending on a missing
+    # dependency to keep the suite green.
+    command: ["xvfb-run", "-a", "-s", "-screen 0 1280x1024x24", "python", "tests/_run_pytest_clean_exit.py", "-v", "-m", "not wayland and not portal", "tests"]
 
   benchmark:
     build:
@@ -71,7 +76,13 @@ services:
       - pip-cache:/root/.cache/pip
     environment:
       XDG_RUNTIME_DIR: "/tmp/xdg-runtime"
-    command: ["start-portal-fixture", "python", "-m", "pytest", "-v", "-m", "portal", "tests"]
+    # Named files, not "tests": pytest imports every module it collects,
+    # and tests/test_x11_lowlevel.py imports fastgrab._linux_x11 at module
+    # scope. This image never builds the C extension, so collecting the
+    # whole directory is an error on a clean checkout -- it only appears
+    # to work in a tree that still has a gitignored .so lying around.
+    command: ["start-portal-fixture", "python", "-m", "pytest", "-v", "-m", "portal",
+              "tests/test_portal_pipewire.py", "tests/test_portal_dbus.py"]
 
 volumes:
   pip-cache:

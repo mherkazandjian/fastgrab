@@ -430,6 +430,44 @@ def test_a_closed_screenshot_does_not_close_a_new_one():
 
 # -------- a declined screen-share must not become a fallback --------
 
+def _pretend_linux_wayland(monkeypatch):
+    """Make _autodetect() take the Linux/Wayland branch on any host.
+
+    sys.platform has to be patched, not just the environment. This file
+    runs on all four CI jobs, and on Windows and macOS _autodetect()
+    returns the native backend before it ever looks at
+    $WAYLAND_DISPLAY -- so tests that only set the variable pass on
+    Linux and fail on half the matrix.
+    """
+    import sys
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-test")
+    monkeypatch.setenv("DISPLAY", ":99")
+
+
+def _stub_backend(monkeypatch, name, attribute, factory):
+    """Install a fake fastgrab.backends.<name> for the duration of a test.
+
+    _autodetect() imports each candidate inside the function, so a
+    sys.modules entry is enough to stand in for a backend whose real
+    dependencies are not installed here.
+    """
+    import sys
+    import types
+
+    module = types.ModuleType("fastgrab.backends." + name)
+    setattr(module, attribute, factory)
+    monkeypatch.setitem(sys.modules, "fastgrab.backends." + name, module)
+
+
+def _raises(exception):
+    def factory(*_args, **_kwargs):
+        raise exception
+
+    return factory
+
+
 def test_autodetect_propagates_a_declined_portal_request(monkeypatch):
     """Everything else there means "this backend is unusable".
 
@@ -440,31 +478,16 @@ def test_autodetect_propagates_a_declined_portal_request(monkeypatch):
     No portal dependencies needed: the guard keys on the exception's
     name, so a stand-in with that name exercises the real branch.
     """
-    import sys
-    import types
-
     from fastgrab import backends
 
     class PortalCancelled(RuntimeError):
         pass
 
-    wlr = types.ModuleType("fastgrab.backends.wlr")
-
-    def _no_wlr(*_a, **_k):
-        raise OSError("no wlroots compositor here")
-
-    wlr.WlrBackend = _no_wlr
-
-    portal = types.ModuleType("fastgrab.backends.portal")
-
-    def _declined(*_a, **_k):
-        raise PortalCancelled("the user said no")
-
-    portal.PortalBackend = _declined
-
-    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-test")
-    monkeypatch.setitem(sys.modules, "fastgrab.backends.wlr", wlr)
-    monkeypatch.setitem(sys.modules, "fastgrab.backends.portal", portal)
+    _pretend_linux_wayland(monkeypatch)
+    _stub_backend(monkeypatch, "wlr", "WlrBackend",
+                  _raises(OSError("no wlroots compositor here")))
+    _stub_backend(monkeypatch, "portal", "PortalBackend",
+                  _raises(PortalCancelled("the user said no")))
 
     with pytest.raises(PortalCancelled):
         backends._autodetect()
@@ -474,22 +497,47 @@ def test_autodetect_still_falls_back_when_the_portal_is_merely_absent(
     monkeypatch
 ):
     """The fallback has to keep working for every other failure."""
-    import sys
-    import types
-
     from fastgrab import backends
 
-    wlr = types.ModuleType("fastgrab.backends.wlr")
-    wlr.WlrBackend = lambda *a, **k: (_ for _ in ()).throw(OSError("no wlroots"))
-    portal = types.ModuleType("fastgrab.backends.portal")
-    portal.PortalBackend = lambda *a, **k: (_ for _ in ()).throw(
-        ImportError("portal extra not installed"))
+    class Fallback(object):
+        pass
 
-    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-test")
-    monkeypatch.setitem(sys.modules, "fastgrab.backends.wlr", wlr)
-    monkeypatch.setitem(sys.modules, "fastgrab.backends.portal", portal)
+    _pretend_linux_wayland(monkeypatch)
+    _stub_backend(monkeypatch, "wlr", "WlrBackend",
+                  _raises(OSError("no wlroots")))
+    _stub_backend(monkeypatch, "portal", "PortalBackend",
+                  _raises(ImportError("portal extra not installed")))
+    # Stubbed rather than real: this test is about which branch is
+    # taken, and a real X11Backend needs both a display and the C
+    # extension, neither of which the Windows and macOS jobs have.
+    _stub_backend(monkeypatch, "x11", "X11Backend", Fallback)
 
-    # Falls through to X11 rather than raising; on this container that is
-    # a working backend, which is the point.
-    backend = backends._autodetect()
-    assert type(backend).__name__ == "X11Backend"
+    assert isinstance(backends._autodetect(), Fallback)
+
+
+# -------- backend options --------
+
+@pytest.mark.no_display
+def test_backend_options_reach_the_backend(monkeypatch):
+    """The portal backend's consent mode is only useful if it arrives."""
+    seen = {}
+
+    class Fake(object):
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+    _stub_backend(monkeypatch, "x11", "X11Backend", Fake)
+    screenshot.Screenshot(backend="x11", persist="none")
+    assert seen == {"persist": "none"}
+
+
+@pytest.mark.no_display
+def test_backend_options_need_an_explicit_backend():
+    """Refused rather than dropped.
+
+    Auto-detection can land on a backend that takes no options at all,
+    and an option that governs screen-share consent is the last thing
+    that should quietly do nothing.
+    """
+    with pytest.raises(TypeError, match="persist"):
+        screenshot.Screenshot(persist="none")

@@ -44,18 +44,22 @@ python = "^3.10"
 numpy = ">=1.26"
 pywayland = {version = "^0.4.17", optional = true}
 PyGObject = {version = ">=3.42", optional = true}
-dbus-next = {version = "^0.2.3", optional = true}
 python-xlib = {version = "*", optional = true}
 Pillow = {version = "*", optional = true}
 
 [tool.poetry.extras]
 wayland = ["pywayland"]
-wayland-portal = ["dbus-next"]
-wayland-all = ["pywayland", "dbus-next"]
 # PyGObject reaches GStreamer and Gio; both need system packages that pip
 # cannot install (gir1.2-gst-plugins-base-1.0, gstreamer1.0-pipewire and
 # a girepository build environment). Documented, not silently assumed.
 portal = ["PyGObject"]
+# The name the docs and the backend's own error messages used while this
+# was a stub. It pulled in dbus-next, which nothing imports and which
+# cannot introspect the portal anyway (see fastgrab/backends/portal.py),
+# so anyone who followed that advice installed a dead library and still
+# had no working backend. Kept as an alias so the command does not break.
+wayland-portal = ["PyGObject"]
+wayland-all = ["pywayland", "PyGObject"]
 gui = ["python-xlib", "Pillow"]
 
 [tool.poetry.scripts]

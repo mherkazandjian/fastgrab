@@ -239,6 +239,113 @@ def test_one_backend_opens_one_session(portal):
         backend.close()
 
 
+def test_the_reader_is_given_the_portals_own_pipewire_socket(portal):
+    """The node id is only meaningful on the portal's connection.
+
+    Nothing in this fixture can tell the two connections apart -- the
+    fake hands back a socket to the very daemon the ambient environment
+    would have reached anyway -- so a behavioural test here would pass
+    just as well with the descriptor thrown away. It is asserted
+    structurally instead, because on a real desktop the difference is
+    the whole point: the ambient socket shows a different graph, and
+    the same node id on it is a different node, or nothing.
+    """
+    import socket
+
+    from fastgrab.backends.portal import PortalBackend
+    portal()
+    backend = PortalBackend(timeout=30)
+    seen = {}
+    real = backend._reader_class
+
+    def spy(node_id, *args, **kwargs):
+        seen["fd"] = kwargs.get("fd")
+        return real(node_id, *args, **kwargs)
+
+    backend._reader_class = spy
+    try:
+        backend.resolution()
+        assert seen.get("fd") is not None, (
+            "the reader was built without the portal's descriptor and "
+            "fell back to the ambient PipeWire socket"
+        )
+        # A real descriptor, not the index that came off the wire:
+        # D-Bus type 'h' is an index into the message's FD list, and
+        # using it as an fd reads whatever unrelated file holds that
+        # number -- which on a small process is usually a socket too,
+        # hence checking the family rather than just openability.
+        duplicate = os.dup(seen["fd"])
+        try:
+            sock = socket.socket(fileno=duplicate)
+        except OSError:
+            os.close(duplicate)
+            pytest.fail("the descriptor handed to the reader is not a socket")
+        with sock:
+            assert sock.family == socket.AF_UNIX
+    finally:
+        backend.close()
+
+
+def test_a_discarded_backend_releases_its_pipeline(portal):
+    """The two-line form never calls close().
+
+    ``Screenshot(backend='portal').capture()`` drops the backend on the
+    same line, and the library documents that shape. Without a
+    finalizer it leaks a PLAYING GStreamer pipeline and the portal's
+    descriptor for the life of the process.
+    """
+    import gc
+
+    from fastgrab.backends.portal import PortalBackend
+    portal()
+    backend = PortalBackend(timeout=30)
+    closed = []
+    real = backend._reader_class
+
+    def spy(node_id, *args, **kwargs):
+        reader = real(node_id, *args, **kwargs)
+        original = reader.close
+
+        def close():
+            closed.append(True)
+            return original()
+
+        reader.close = close
+        return reader
+
+    backend._reader_class = spy
+    backend.resolution()
+    # The finalizer holds this dict, so it outlives the backend and
+    # shows what the teardown actually did.
+    state = backend.__dict__
+    del backend
+    gc.collect()
+
+    assert closed, "a discarded backend left its GStreamer pipeline running"
+    assert state["_fd"] is None, "a discarded backend leaked the portal's fd"
+    assert state["_session"] is None, "a discarded backend leaked the session"
+
+
+def test_construction_probes_for_the_optional_dependencies(monkeypatch):
+    """_autodetect() decides which backend to use by constructing one.
+
+    So a constructor that succeeds without PyGObject and GStreamer
+    claims every GNOME and KDE session for a backend that cannot work,
+    and the XWayland fallback that would have worked never runs -- the
+    failure surfaces from capture() instead, outside the handler that
+    exists to catch exactly this.
+    """
+    from fastgrab.backends import _pipewire
+    from fastgrab.backends.portal import PortalBackend
+
+    def missing(*_args, **_kwargs):
+        raise RuntimeError("GStreamer has no 'pipewiresrc' element")
+
+    monkeypatch.setattr(_pipewire, "_require_gst", missing)
+    with pytest.raises(RuntimeError, match="pipewiresrc"):
+        PortalBackend()
+
+
 @pytest.mark.parametrize("value,expected", [
     ("none", 0), ("transient", 1), ("persistent", 2), (None, 1),
 ])

@@ -1,51 +1,39 @@
-"""xdg-desktop-portal + PipeWire fallback backend.
+"""xdg-desktop-portal + PipeWire capture, for GNOME and KDE Wayland.
 
-Status: **stub, deliberately.**
+The backend the ``wlr`` one cannot be: GNOME and KDE do not implement
+``wlr-screencopy-v1``, so on those desktops the portal is the only way
+in. It asks the user's permission -- that is the point of it -- and the
+approval belongs to the session this backend holds open, so one
+:class:`fastgrab.screenshot.Screenshot` means one prompt.
 
-This file used to justify itself by saying the flow "cannot be
-exercised inside docker compose CI (the consent dialog on GNOME/KDE is
-a fundamental Wayland-security feature, not something we can mock away)".
-A spike in 2026-09 showed that reason was too strong, and found a
-narrower one that does hold. Both halves are recorded here so nobody
-has to run the experiment again.
+Opt-in via ``pip install fastgrab[portal]``. That brings PyGObject;
+GStreamer and its introspection data are system packages pip cannot
+install (``gir1.2-gst-plugins-base-1.0``, ``gstreamer1.0-pipewire`` on
+Debian/Ubuntu). Nothing here is imported by a default install.
 
-What the spike disproved
-------------------------
+Split in two, because the halves fail for different reasons and are
+testable in different ways:
 
-The consent dialog is a GNOME/KDE *portal backend* behaviour, not part
-of the ScreenCast API. ``xdg-desktop-portal-wlr`` picks an output with
-no UI at all when told to, via
-``$XDG_CONFIG_HOME/xdg-desktop-portal-wlr/config``::
+* :mod:`fastgrab.backends._portal_dbus` -- the ScreenCast handshake
+  (CreateSession, SelectSources, Start, OpenPipeWireRemote).
+* :mod:`fastgrab.backends._pipewire` -- reading frames off the node id
+  that handshake returns.
 
-    [screencast]
-    chooser_type=none
+How this is tested without a GPU
+--------------------------------
 
-which upstream implements as a straight list pick — no process
-spawned, nothing drawn (``src/screencast/wlr_screencast.c``,
-``xdpw_wlr_output_chooser``)::
+``docker compose run --rm test-portal``. The PipeWire half runs against
+a synthetic ``videotestsrc`` node with no compositor at all. The portal
+half runs against the *real* ``xdg-desktop-portal`` frontend, with
+``tests/portal/fake_impl_screencast.py`` standing in for the desktop's
+``org.freedesktop.impl.portal.ScreenCast`` backend -- which is the
+component GNOME and KDE each supply, and the component that shows the
+consent dialog. So the wire protocol, the Request/Response signal
+dance, the unix-FD list handling and the session lifetime are all
+exercised for real; only the human clicking "Share" is faked.
 
-    case XDPW_CHOOSER_NONE:
-        if (ctx->state->config->screencast_conf.output_name) {
-            return xdpw_wlr_output_find_by_name(&ctx->output_list, ...);
-        } else {
-            return xdpw_wlr_output_first(&ctx->output_list);
-        }
-
-Driven that way inside the existing ``test-wayland`` cage session
-(Debian 13, xdg-desktop-portal 1.20.3, xdg-desktop-portal-wlr 0.7.1,
-pipewire 1.4.2, wireplumber 0.5.8, headless cage), the whole flow ran
-unattended::
-
-    CreateSession      -> response 0, session handle
-    SelectSources      -> response 0   (types=1 monitor, cursor_mode=1)
-    Start              -> response 0, streams [(42, {size: (1280, 720)})]
-    OpenPipeWireRemote -> unix fd
-
-and one frame pulled off node 42 was byte-exact against what
-``tests/wayland_painter.py`` had just painted: 1280*720*4 = 3686400
-bytes, every pixel BGRA ``(30, 20, 10, 255)`` for ``#0A141E``. So the
-flow is implementable, and it *is* drivable with no human in the loop.
-The old objection, as written, was wrong.
+What is *not* covered is the real xdg-desktop-portal-wlr path, and the
+reason is worth keeping because it is easy to rediscover the hard way.
 
 What actually blocks it
 -----------------------
@@ -93,11 +81,10 @@ AMD one (renderD129) worked. "Does it work in ``docker compose run
 --rm test``?" would stop having a reliable answer, which is the one
 question this project most needs to keep.
 
-The declared extra is also wrong
---------------------------------
+Why PyGObject, and not the libraries the extra used to name
+-----------------------------------------------------------
 
-Two things the spike found about ``[wayland-portal]`` itself, both of
-which a future implementer has to settle before writing any flow code:
+Both alternatives were tried and neither works:
 
 * ``pipewire-python`` cannot do the job. It is a subprocess wrapper
   around the ``pw-cat`` / ``pw-play`` / ``pw-record`` CLIs; its entire
@@ -105,12 +92,7 @@ which a future implementer has to settle before writing any flow code:
   audio-only, and it can neither target a node id, nor accept the
   portal's fd, nor hand back a raw video buffer. It also installs as
   ``pipewire_python``, so the ``import pipewire`` guard this file used
-  to run raised ImportError even when the extra *was* installed. The
-  spike's frame came from ``gst-launch-1.0 pipewiresrc fd=N
-  path=<node_id>``; a real backend would need PyGObject + GStreamer, or
-  a hand-written ctypes/cffi binding to ``libpipewire`` including SPA
-  POD marshalling. Neither is small, and both are a heavy tax on a
-  project whose default install is meant to be numpy and a C extension.
+  to run raised ImportError even when the extra *was* installed.
 
 * ``dbus-next`` 0.2.3 cannot introspect the portal at all::
 
@@ -119,108 +101,41 @@ which a future implementer has to settle before writing any flow code:
 
   xdg-desktop-portal >= 1.18 exposes a hyphenated property name, and
   dbus-next rejects it (correctly, per the D-Bus spec) while parsing
-  the whole introspection document — so a single unrelated interface
-  takes down ``bus.introspect()``. It is workable: hand-write the
-  introspection XML for ``org.freedesktop.portal.ScreenCast`` and never
-  call ``introspect()``. But dbus-next has been unmaintained since 2021
-  and this is the first thing it gets wrong.
+  the whole introspection document -- so a single unrelated interface
+  takes down ``bus.introspect()``. Workable by hand-writing the
+  introspection XML, but dbus-next has been unmaintained since 2021 and
+  this is the first thing it gets wrong.
 
-What would have to change
--------------------------
+PyGObject brings Gio (D-Bus, including the unix-FD-list calls the
+portal needs for OpenPipeWireRemote) and GStreamer (``pipewiresrc``) in
+one dependency, and both are maintained. The old ``[wayland-portal]``
+extra pulled in dbus-next; it is now an alias for ``[portal]`` so the
+documented command keeps working.
 
-Any one of these reopens the question:
+Notes for anyone changing this
+------------------------------
 
-* xdpw grows a SHM-only path for screencopy v3 (upstream #289); or the
-  cage/wlroots in the test image starts advertising
-  ``ext-image-copy-capture-v1``, which xdpw master already prefers over
-  zwlr-screencopy and which may not carry the dmabuf requirement. The
-  cage in Debian 13 does not advertise it.
-* CI gains a DRM device — a ``vkms`` module on the runner plus
-  ``--device /dev/dri``, or a self-hosted runner with a GPU.
-* fastgrab accepts a GStreamer/PyGObject dependency behind the extra.
-
-Until one of those lands, the conclusion is the one this file already
-reached, for a better reason: a portal backend written today would be
-untestable in this project's CI, so it is not written.
-
-**This says nothing about GNOME/KDE.** The spike was driven entirely
-against xdg-desktop-portal-wlr. GNOME and KDE portal backends do show a
-consent dialog on ``Start``, and no config key turns that off — that
-part of the original docstring stands untouched, and a wlroots-only
-test would never have covered it.
-
-Reproducing the spike
----------------------
-
-Roughly, on a host with a Mesa-supported GPU (all of it inside a
-container built ``FROM fastgrab-dev`` with ``dbus pipewire wireplumber
-xdg-desktop-portal xdg-desktop-portal-wlr gstreamer1.0-pipewire
-gstreamer1.0-tools libgl1-mesa-dri libegl-mesa0 libgbm1`` added)::
-
-    export XDG_RUNTIME_DIR=/tmp/xdg-runtime XDG_CURRENT_DESKTOP=wlroots
-    export WLR_BACKENDS=headless WLR_RENDER_DRM_DEVICE=/dev/dri/renderD129
-    # config as above; then, under dbus-run-session:
-    cage -s -- python tests/wayland_painter.py &
-    pipewire & wireplumber &
-    /usr/libexec/xdg-desktop-portal-wlr -l TRACE &
-    /usr/libexec/xdg-desktop-portal -v &
-    # then CreateSession/SelectSources/Start/OpenPipeWireRemote over
-    # the session bus, and
-    #   gst-launch-1.0 pipewiresrc fd=$FD path=$NODE num-buffers=1 \
-    #     ! videoconvert ! video/x-raw,format=BGRA ! filesink location=f.bgra
-
-Drop ``--device /dev/dri`` and it fails at ``Start`` with response code
-2 and the xdpw log line quoted above. That is the whole finding.
-
-When it is implemented, the flow is:
-
-1. Connect to the D-Bus session bus.
-2. Proxy ``org.freedesktop.portal.Desktop`` at
-   ``/org/freedesktop/portal/desktop`` with interface
-   ``org.freedesktop.portal.ScreenCast`` — from hand-written
-   introspection XML, not ``bus.introspect()``, per the dbus-next note
-   above.
-3. ``CreateSession(handle_token, session_handle_token)`` → wait for the
-   ``Response`` signal on the returned ``org.freedesktop.portal.Request``
-   path, capture ``session_handle``.
-4. ``SelectSources(session_handle, types=1, multiple=False, cursor_mode=...)``.
-5. ``Start(session_handle, parent_window="", options={})`` —
-   **this is when GNOME/KDE pop the consent dialog**, and where the
-   wlroots backend fails without dmabuf. Response yields
-   ``streams: [(node_id, props), ...]``; ``props["size"]`` is the
-   device-pixel size of the source. Cache ``node_id``.
-6. ``OpenPipeWireRemote(session_handle, options)`` returns a unix fd for
-   a pre-authenticated PipeWire connection. It is single-use: each
-   consumer connection needs a fresh call.
-7. Per-capture: connect a PipeWire stream to ``node_id`` over that fd,
-   negotiate a format (do **not** assume BGRA — check what the node
-   actually offers and convert), pull one buffer, copy into the
-   caller's numpy ndarray, and keep the session alive across captures
-   rather than re-running the flow per frame.
-
-Probe the portal's ``interface_version`` after binding and degrade
-options it does not advertise. The spike saw version 5,
-``AvailableSourceTypes=1`` (monitor only) and
-``AvailableCursorModes=3`` from xdpw 0.7.1; Fedora's
-xdg-desktop-portal-gnome and Ubuntu's -gtk differ on ``cursor_mode`` /
-``persist_mode``.
+* ``OpenPipeWireRemote`` returns D-Bus type ``h``, which on the wire is
+  an *index into the message's FD list*, not a descriptor. Treating the
+  integer as an fd reads from whatever unrelated file holds that
+  number. It is also single-use per consumer connection.
+* The node id is only meaningful on the portal's own connection.
+  ``pipewiresrc`` defaults to ``autoconnect=true``, which makes a
+  wrong or stale node id succeed against some other source instead of
+  failing -- the silent wrong-screen bug. Both are pinned by tests.
+* Portal ``Request`` objects have a predictable path derived from the
+  handle token, so subscribe to the ``Response`` signal *before*
+  issuing the call, or lose the race.
+* Probe ``interface_version`` and degrade options it does not
+  advertise. The spike saw version 5, ``AvailableSourceTypes=1``
+  (monitor only) and ``AvailableCursorModes=3`` from xdpw 0.7.1;
+  xdg-desktop-portal-gnome and -gtk differ on ``cursor_mode`` and
+  ``persist_mode``.
 """
 import os
+import weakref
 
 from .base import BaseBackend
-
-
-_NOT_IMPLEMENTED_MSG = (
-    "PortalBackend is not implemented. The ScreenCast flow itself works "
-    "unattended against xdg-desktop-portal-wlr, but it cannot be tested "
-    "in this project's CI (xdg-desktop-portal-wlr needs a DMA-BUF capable "
-    "GPU, which the runners do not have; see the module docstring), and "
-    "the wayland-portal extra does not currently pull in a library that "
-    "can read raw video buffers from PipeWire. On GNOME/KDE Wayland "
-    "sessions, log in to an X11 session for now, or use a wlroots "
-    "compositor (Sway, Hyprland) so the wlr backend works without a "
-    "consent prompt."
-)
 
 
 #: How a session asks the desktop to remember consent. Selectable so a
@@ -249,6 +164,31 @@ def _persist_mode(explicit=None):
     return PERSIST_MODES[key]
 
 
+def _release_portal(state):
+    """Tear down a discarded backend's stream and session.
+
+    Takes the instance ``__dict__`` rather than the instance: a
+    finalizer that referenced the backend would keep it alive and never
+    run. Reading the dict also means it sees whatever the handles are
+    *now*, not what they were at construction.
+    """
+    try:
+        reader = state.get("_reader")
+        if reader is not None:
+            reader.close()
+    finally:
+        # In a finally: this is the descriptor the finalizer exists to
+        # reclaim, and a reader that threw on the way down must not
+        # take it with it.
+        fd = state.get("_fd")
+        if fd is not None:
+            os.close(fd)
+        session = state.get("_session")
+        if session is not None:
+            session.close()
+        state["_reader"] = state["_session"] = state["_fd"] = None
+
+
 class PortalBackend(BaseBackend):
     """Capture through xdg-desktop-portal ScreenCast and PipeWire.
 
@@ -275,49 +215,103 @@ class PortalBackend(BaseBackend):
         self._timeout = float(timeout)
         self._session = None
         self._reader = None
+        self._fd = None
         # Import here, not at module scope: the dependencies live behind
         # the [portal] extra and importing this module must stay cheap
         # and safe for a default install.
-        from ._portal_dbus import PortalUnavailable, ScreenCastSession
-        from ._pipewire import PipeWireVideoReader
+        from ._portal_dbus import ScreenCastSession, _require_gio
+        from ._pipewire import PipeWireVideoReader, _require_gst
         self._session_class = ScreenCastSession
         self._reader_class = PipeWireVideoReader
-        self._unavailable = PortalUnavailable
+        # Probe the optional dependencies now rather than at first
+        # capture. _autodetect() decides which backend to use by
+        # constructing one and catching the failure, so a constructor
+        # that succeeds without PyGObject and GStreamer claims every
+        # GNOME and KDE session for a backend that cannot work -- and
+        # the XWayland fallback that would have worked never runs. The
+        # error then surfaces from capture(), outside the handler that
+        # exists to catch exactly this.
+        #
+        # Neither probe talks to the portal, so neither prompts anyone;
+        # consent still waits for the first capture.
+        _require_gio()
+        _require_gst()
+        # Not __del__: the same reason as the wlr and windows backends.
+        # atexit=False because tearing a GStreamer pipeline down during
+        # interpreter shutdown is not worth the risk -- a leaked
+        # pipeline at exit costs nothing, a segfault costs the run.
+        self._finalizer = weakref.finalize(
+            self, _release_portal, self.__dict__)
+        self._finalizer.atexit = False
 
     # -------- session lifetime --------
+
+    def _open_reader(self):
+        """Build a reader bound to the portal's own PipeWire connection.
+
+        The node id is only meaningful on the connection the portal
+        hands back: OpenPipeWireRemote returns a pre-authenticated
+        socket, and the same number on the ambient socket is a
+        different node, or somebody else's. It happens to work when
+        both are the same daemon, which is exactly why leaving it out
+        survives testing and then captures the wrong screen.
+
+        The descriptor is single-use per consumer connection, so
+        refresh() comes back through here for a new one instead of
+        holding on to this one.
+        """
+        fd = self._session.open_pipewire_remote()
+        try:
+            reader = self._reader_class(self._session.node_id, fd=fd)
+            reader.start()
+        except BaseException:
+            os.close(fd)
+            raise
+        self._fd = fd
+        return reader
 
     def _ensure_stream(self):
         """Open the portal session and the reader, once."""
         if self._reader is not None:
             return self._reader
-        session = self._session_class(
-            app_id="fastgrab", persist_mode=self._persist,
-            timeout=self._timeout)
-        session.open()
-        reader = self._reader_class(session.node_id)
-        reader.start()
-        self._session, self._reader = session, reader
-        return reader
+        if self._session is None:
+            session = self._session_class(
+                app_id="fastgrab", persist_mode=self._persist,
+                timeout=self._timeout)
+            session.open()
+            # Stored before the stream is built, so a failure below
+            # leaves the session reachable by close() rather than open
+            # and orphaned. It is deliberately not closed here: consent
+            # is attached to it, and throwing it away would make a
+            # retry prompt the user a second time.
+            self._session = session
+        self._reader = self._open_reader()
+        return self._reader
 
-    def close(self):
+    def _close_stream(self):
         if self._reader is not None:
             self._reader.close()
             self._reader = None
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
+
+    def close(self):
+        self._close_stream()
         if self._session is not None:
             self._session.close()
             self._session = None
         self._closed = True
+        finalizer = getattr(self, "_finalizer", None)
+        if finalizer is not None:
+            finalizer.detach()
 
     def refresh(self):
         """Drop the stream so the next capture renegotiates.
 
         Not the session: re-opening that would ask for consent again.
         """
-        if self._reader is not None:
-            self._reader.close()
-            self._reader = None
-        if self._session is not None:
-            self._reader = self._reader_class(self._session.node_id)
+        self._close_stream()
 
     # -------- BaseBackend --------
 

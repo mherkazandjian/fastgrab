@@ -133,32 +133,48 @@ def test_reading_twice_reuses_one_pipeline(node_id):
     assert first.shape == second.shape
 
 
-def test_an_unknown_node_id_silently_captures_something_else(node_id):
-    """A known gap, recorded rather than papered over.
+def test_an_unknown_node_id_captures_the_wrong_source(node_id):
+    """A known gap, pinned rather than papered over.
 
-    `pipewiresrc path=<id>` does not fail when that id is not on the
-    graph: PipeWire autoconnects it to whatever source is available, so
-    reading node 99999 here returns the fixture's frames. For a
-    screen-capture backend that is the "captured the wrong screen" class
-    of bug, and it has to be closed before the portal handshake can be
-    trusted — the node id the portal hands back is the only thing
-    identifying the display the user actually approved.
+    ``pipewiresrc path=<id>`` does bind to the node it is asked for --
+    measured with two sources on one graph, a red one and a blue one,
+    and each id returned its own colour. What it does not do is fail
+    when the id is *absent*: PipeWire falls back to any other source on
+    the graph and hands back its frames instead. So reading node 99999
+    here returns the fixture's red, which for a screen-capture backend
+    is the silent wrong-screen bug.
 
-    Asserting a refusal that does not happen would be a false green, so
-    this pins the behaviour as it is and names what has to change.
+    Two cures were measured and both rejected. ``autoconnect=false``
+    stops the stream connecting to anything at all -- valid node ids
+    included -- and then deadlocks ``close()``, because pipewiresrc's
+    streaming task never finishes and ``set_state(NULL)`` waits on it
+    forever. ``node.dont-reconnect`` governs reconnection after a
+    target disappears, not the initial fallback, and changes nothing.
+
+    The gap is narrow in practice: the node id arrives from the portal
+    over the portal's own connection, where the only visible nodes are
+    the ones it shared. It is still real, so it is asserted rather than
+    hidden. If pipewiresrc ever starts refusing, this test fails loudly
+    -- at which point tighten it into that refusal and drop the caveat
+    from PipeWireVideoReader.start().
     """
-    reader = PipeWireVideoReader(99999, timeout=3.0)
+    assert node_id != 99999, "pick a bogus id the fixture cannot hold"
+    reader = PipeWireVideoReader(99999, timeout=5.0)
     try:
-        frame = reader.read()
-    except RuntimeError:
-        pytest.fail(
-            "an unknown node now raises — good; tighten this test into "
-            "the refusal it should be"
-        )
+        try:
+            frame = reader.read()
+        except RuntimeError as exc:
+            pytest.fail(
+                "an unknown node id now fails ({}) -- good, but this "
+                "test and the comment in start() both claim it does "
+                "not. Tighten both.".format(exc)
+            )
     finally:
         reader.close()
-    assert frame.shape[2] == 4, (
-        "it did not refuse, and it did not return a frame either"
+    assert frame[..., 2].mean() > 200, (
+        "node 99999 neither refused nor returned the fixture's red: "
+        "the fallback behaviour has changed and the comment in "
+        "PipeWireVideoReader.start() is now wrong"
     )
 
 

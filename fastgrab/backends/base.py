@@ -45,7 +45,10 @@ promise the code keeps:
   the desktop DC's origin is the primary monitor's top-left, and
   reaching a second monitor at its own scale is the future
   ``Screenshot(display=N)`` feature, not a DPI question.
-* ``portal`` is a placeholder that raises ``NotImplementedError``.
+* ``portal`` returns whatever the compositor hands the PipeWire
+  stream, which is device pixels; it has no logical-coordinate
+  concept of its own and no sub-region support, so the backend
+  crops locally.
 """
 from abc import ABC, abstractmethod
 
