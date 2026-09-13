@@ -349,6 +349,58 @@ def test_a_stream_that_ends_is_reported_rather_than_repeating_itself(node_id):
         reader.close()
 
 
+def test_a_stream_error_keeps_being_reported(node_id):
+    """pop_filtered() consumes the message; the verdict has to outlive it.
+
+    An ERROR posted without EOS is readable exactly once. Without
+    remembering it, the first capture raises and every capture after
+    that finds an empty bus, no EOS, and hands back the cached frame --
+    a dead stream reporting successes again, which is precisely what
+    the check exists to prevent.
+    """
+    import gi
+    gi.require_version("Gst", "1.0")
+    from gi.repository import GLib, Gst
+
+    reader = PipeWireVideoReader(node_id, timeout=1.0)
+    try:
+        reader.read()
+        reader._sink.try_pull_sample = lambda _ns: None
+        reader._sink.is_eos = lambda: False
+        error = GLib.Error.new_literal(
+            Gst.StreamError.quark(), "the source went away",
+            Gst.StreamError.FAILED)
+        reader._pipeline.get_bus().post(
+            Gst.Message.new_error(reader._pipeline, error, "debug"))
+
+        with pytest.raises(RuntimeError, match="stopped delivering"):
+            reader.read()
+        # The message is gone from the bus by now.
+        with pytest.raises(RuntimeError, match="stopped delivering"):
+            reader.read()
+    finally:
+        reader.close()
+
+
+def test_a_cached_read_does_not_clone_the_whole_display(node_id):
+    """read() documents the array as the reader's own, read-only.
+
+    Copying on the cached path contradicted that and cost a full-frame
+    allocation on every capture of an idle screen -- roughly 32 MiB per
+    call on a 4K monitor, before the caller copies out the region it
+    actually asked for.
+    """
+    reader = PipeWireVideoReader(node_id, timeout=1.0)
+    try:
+        fresh = reader.read()
+        assert fresh is reader._last
+        reader._sink.try_pull_sample = lambda _ns: None
+        cached = reader.read()
+    finally:
+        reader.close()
+    assert cached is fresh, "the cached read copied the whole frame"
+
+
 def test_close_is_idempotent(node_id):
     reader = PipeWireVideoReader(node_id)
     reader.read()

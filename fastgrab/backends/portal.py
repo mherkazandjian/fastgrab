@@ -133,6 +133,7 @@ Notes for anyone changing this
   ``persist_mode``.
 """
 import os
+import tempfile
 import weakref
 
 from .base import BaseBackend
@@ -203,25 +204,42 @@ def _write_token(token):
     chosen for. It is never written unless that mode was asked for.
     """
     path = _token_path()
+    temporary = None
     try:
-        directory = os.path.dirname(path)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
-        # 0600 from the moment it exists, rather than written and then
-        # chmodded, which leaves a window where it is world-readable.
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        directory = os.path.dirname(path) or "."
+        os.makedirs(directory, exist_ok=True)
+        # Written to a private temporary file and renamed over the top.
+        # Not os.open(..., O_CREAT, 0o600): that mode applies only when
+        # the file is *created*, so a token file that already exists
+        # group- or world-readable -- copied between machines, restored
+        # from a backup, left by an older version -- would silently keep
+        # those permissions and be handed the rotated capability
+        # anyway. Replacing the inode gives the new file's mode, every
+        # time, and never leaves a half-written token behind.
+        fd, temporary = tempfile.mkstemp(
+            dir=directory, prefix=".portal-restore-token-")
         try:
+            os.fchmod(fd, 0o600)
             os.write(fd, token.encode("utf-8"))
         finally:
             os.close(fd)
+        os.replace(temporary, path)
+        temporary = None
     except (IOError, OSError):
         # Not being able to remember is a lost convenience, never a
         # failed capture.
         pass
+    finally:
+        if temporary is not None:
+            try:
+                os.remove(temporary)
+            except (IOError, OSError):
+                pass
 
 
 def _forget_token():
     _PROCESS_TOKEN.pop("token", None)
+    _PROCESS_TOKEN.pop("connection", None)
     try:
         os.remove(_token_path())
     except (IOError, OSError):
@@ -334,10 +352,22 @@ class PortalBackend(BaseBackend):
             token = _read_token()
         return token
 
-    def _save_token(self, token):
+    def _save_token(self, token, session=None):
         if not token or self._persist == PERSIST_MODES["none"]:
             return
         _PROCESS_TOKEN["token"] = token
+        # The bus connection is kept with it, and deliberately not the
+        # session. A transient permission belongs to the D-Bus *client*,
+        # and Gio's shared session bus does not outlive its last
+        # reference: measured, dropping it and asking again returns a
+        # connection with a new unique name (:1.0 -> :1.1). In a script
+        # whose only Gio user is fastgrab, releasing the last Screenshot
+        # would therefore leave a remembered token that the desktop no
+        # longer recognises, and the next one would prompt after all.
+        # Holding the session instead would keep the *capture* alive,
+        # which is not wanted; the connection alone is enough.
+        if session is not None and session.connection is not None:
+            _PROCESS_TOKEN["connection"] = session.connection
         if self._persist == PERSIST_MODES["persistent"]:
             _write_token(token)
 
@@ -379,7 +409,7 @@ class PortalBackend(BaseBackend):
             # RecursionError. This bounds it at one retry whatever
             # happened on disk.
             return self._open_session(use_token=False)
-        self._save_token(session.restore_token)
+        self._save_token(session.restore_token, session)
         return session
 
     def _open_reader(self):

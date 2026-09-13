@@ -70,6 +70,7 @@ class PipeWireVideoReader:
         self._sink = None
         self._size = None
         self._last = None
+        self._failure = None
 
     def start(self):
         Gst = self._gst
@@ -175,7 +176,13 @@ class PipeWireVideoReader:
             # Only ever after a real one: with nothing cached this is a
             # stream that has never delivered, which is a failure.
             if self._last is not None:
-                return self._last.copy()
+                # Handed back directly, like the fresh-frame path: this
+                # is the reader's cache and read() documents it as
+                # read-only. Copying it here would allocate and clone a
+                # whole monitor on every capture of an idle screen --
+                # about 32 MiB per call at 4K, before the caller then
+                # copies out the region it actually wanted.
+                return self._last
             raise RuntimeError(
                 "no frame from PipeWire node {} within {}s".format(
                     self.node_id, self.timeout
@@ -232,15 +239,24 @@ class PipeWireVideoReader:
         None for "nothing queued", for end-of-stream, and for a pipeline
         that failed asynchronously after PLAYING was reached.
         """
+        # Remembered once seen. pop_filtered() *consumes* the message,
+        # so without this the first read after an ERROR raises and every
+        # read after that finds an empty bus, no EOS, and happily
+        # returns the cached frame -- a dead stream reporting successful
+        # captures again, which is the bug this method exists to stop.
+        if self._failure is not None:
+            return self._failure
         Gst = self._gst
         if self._sink is not None and self._sink.is_eos():
-            return "the stream ended"
+            self._failure = "the stream ended"
+            return self._failure
         if self._pipeline is not None:
             bus = self._pipeline.get_bus()
             if bus is not None:
                 message = bus.pop_filtered(Gst.MessageType.ERROR)
                 if message is not None:
-                    return message.parse_error()[0].message
+                    self._failure = message.parse_error()[0].message
+                    return self._failure
         return None
 
     def close(self):
@@ -249,8 +265,10 @@ class PipeWireVideoReader:
             self._pipeline = None
             self._sink = None
         # Dropped with the pipeline: a reopened reader must not answer
-        # with a frame from the stream it had before.
+        # with a frame from the stream it had before, nor refuse to
+        # start because the previous one had died.
         self._last = None
+        self._failure = None
 
     def __enter__(self):
         self.start()

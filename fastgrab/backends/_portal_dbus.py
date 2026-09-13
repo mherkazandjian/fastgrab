@@ -125,6 +125,16 @@ class ScreenCastSession:
                 ) from exc
         return self._conn
 
+    @property
+    def connection(self):
+        """The D-Bus connection this session is using, if it has one.
+
+        Exposed because a transient portal permission belongs to the
+        *bus client*, so whoever keeps the token has to keep the
+        connection alive with it.
+        """
+        return self._conn
+
     def _unique_token(self, prefix):
         # The request path is predictable from the token, which is what
         # lets a caller subscribe *before* issuing the call. Without

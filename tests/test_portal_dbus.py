@@ -395,6 +395,75 @@ def test_a_stale_token_is_offered_then_dropped_rather_than_wedging_capture(
     )
 
 
+def test_an_existing_permissive_token_file_is_made_private(
+    portal, tmp_path, clean_token_store
+):
+    """O_CREAT's mode only applies when the file is created.
+
+    A token file that already exists group- or world-readable -- copied
+    between machines, restored from a backup, written by an older
+    version -- would otherwise keep those permissions and be handed the
+    rotated capability anyway. It reopens the screen share without
+    asking, so it must not be readable by anyone else.
+    """
+    from fastgrab.backends.portal import PortalBackend
+
+    clean_token_store.write_text("stale")
+    os.chmod(str(clean_token_store), 0o644)
+    portal(extra_env={"FASTGRAB_FAKE_TOKEN": "tok-rotated"})
+
+    backend = PortalBackend(persist="persistent", timeout=30)
+    try:
+        backend.resolution()
+    finally:
+        backend.close()
+
+    mode = os.stat(str(clean_token_store)).st_mode & 0o777
+    assert mode == 0o600, (
+        "an already-permissive token file kept mode %s and was given "
+        "the rotated capability" % oct(mode)
+    )
+    assert clean_token_store.read_text() == "tok-rotated"
+
+
+def test_a_transient_token_keeps_its_bus_connection_alive(
+    portal, tmp_path, clean_token_store
+):
+    """A transient permission belongs to the D-Bus client.
+
+    Gio's shared session bus does not outlive its last reference:
+    measured, dropping it and asking again yields a connection with a
+    new unique name. In a script whose only Gio user is fastgrab,
+    releasing the last Screenshot would leave a remembered token the
+    desktop no longer recognises, so the next one prompts after all --
+    the opposite of what transient consent is for.
+    """
+    import gc
+
+    from gi.repository import Gio
+
+    from fastgrab.backends import portal as portal_module
+    from fastgrab.backends.portal import PortalBackend
+
+    portal(extra_env={"FASTGRAB_FAKE_TOKEN": "tok-transient"})
+    backend = PortalBackend(persist="transient", timeout=30)
+    backend.resolution()
+    during = backend._session.connection.get_unique_name()
+    backend.close()
+    del backend
+    gc.collect()
+
+    assert portal_module._PROCESS_TOKEN.get("token") == "tok-transient"
+    assert portal_module._PROCESS_TOKEN.get("connection") is not None, (
+        "the token was remembered without the connection it belongs to"
+    )
+    after = Gio.bus_get_sync(Gio.BusType.SESSION, None).get_unique_name()
+    assert after == during, (
+        "the bus client changed from %s to %s, so the remembered "
+        "transient token is no longer valid" % (during, after)
+    )
+
+
 def test_token_recovery_is_bounded_even_when_the_file_cannot_be_deleted(
     portal, tmp_path, clean_token_store, monkeypatch
 ):
