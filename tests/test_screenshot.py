@@ -426,3 +426,70 @@ def test_a_closed_screenshot_does_not_close_a_new_one():
     second = screenshot.Screenshot()
     assert second.capture((0, 0, 2, 2)).shape == (2, 2, 4)
     second.close()
+
+
+# -------- a declined screen-share must not become a fallback --------
+
+def test_autodetect_propagates_a_declined_portal_request(monkeypatch):
+    """Everything else there means "this backend is unusable".
+
+    A refusal does not. Falling through to XWayland after someone has
+    actively declined would capture the very screen they refused to
+    share, and it would look like success.
+
+    No portal dependencies needed: the guard keys on the exception's
+    name, so a stand-in with that name exercises the real branch.
+    """
+    import sys
+    import types
+
+    from fastgrab import backends
+
+    class PortalCancelled(RuntimeError):
+        pass
+
+    wlr = types.ModuleType("fastgrab.backends.wlr")
+
+    def _no_wlr(*_a, **_k):
+        raise OSError("no wlroots compositor here")
+
+    wlr.WlrBackend = _no_wlr
+
+    portal = types.ModuleType("fastgrab.backends.portal")
+
+    def _declined(*_a, **_k):
+        raise PortalCancelled("the user said no")
+
+    portal.PortalBackend = _declined
+
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-test")
+    monkeypatch.setitem(sys.modules, "fastgrab.backends.wlr", wlr)
+    monkeypatch.setitem(sys.modules, "fastgrab.backends.portal", portal)
+
+    with pytest.raises(PortalCancelled):
+        backends._autodetect()
+
+
+def test_autodetect_still_falls_back_when_the_portal_is_merely_absent(
+    monkeypatch
+):
+    """The fallback has to keep working for every other failure."""
+    import sys
+    import types
+
+    from fastgrab import backends
+
+    wlr = types.ModuleType("fastgrab.backends.wlr")
+    wlr.WlrBackend = lambda *a, **k: (_ for _ in ()).throw(OSError("no wlroots"))
+    portal = types.ModuleType("fastgrab.backends.portal")
+    portal.PortalBackend = lambda *a, **k: (_ for _ in ()).throw(
+        ImportError("portal extra not installed"))
+
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-test")
+    monkeypatch.setitem(sys.modules, "fastgrab.backends.wlr", wlr)
+    monkeypatch.setitem(sys.modules, "fastgrab.backends.portal", portal)
+
+    # Falls through to X11 rather than raising; on this container that is
+    # a working backend, which is the point.
+    backend = backends._autodetect()
+    assert type(backend).__name__ == "X11Backend"
