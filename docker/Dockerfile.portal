@@ -36,6 +36,8 @@ RUN apt-get update && apt-get install -y \
         wireplumber \
         libspa-0.2-modules \
         dbus-bin \
+        dbus-daemon \
+        xdg-desktop-portal \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir \
