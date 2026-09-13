@@ -10,6 +10,8 @@ chooser UI and the compositor's PipeWire node. The node id handed back
 points at the synthetic source the test started, so a client that
 completes the handshake really can read frames from it.
 """
+import os
+import socket
 import sys
 
 import gi
@@ -64,8 +66,29 @@ class FakeScreenCastImpl:
         # closing our end immediately still tears the connection down.
         self._sockets = []
 
+    def _record(self, line):
+        """Report to the test what this backend was handed.
+
+        The fake runs as a subprocess, so a file is the channel. Whether
+        a restore token arrived is invisible from the client side --
+        that is the whole point of the token -- so it has to be observed
+        from here.
+        """
+        state = os.environ.get("FASTGRAB_FAKE_STATE")
+        if not state:
+            return
+        with open(state, "a") as handle:
+            handle.write(line + "\n")
+
     def handle_call(self, _conn, _sender, _path, _iface, method, params, invocation):
-        if method in ("CreateSession", "SelectSources"):
+        if method == "CreateSession":
+            invocation.return_value(GLib.Variant("(ua{sv})", (0, {})))
+            return
+        if method == "SelectSources":
+            options = params.unpack()[3]
+            self._record("select %s %s" % (
+                options.get("restore_token") or "-",
+                options.get("persist_mode", "-")))
             invocation.return_value(GLib.Variant("(ua{sv})", (0, {})))
             return
         if method == "Start":
@@ -82,16 +105,27 @@ class FakeScreenCastImpl:
             streams = [(self.node_id,
                         {"size": GLib.Variant("(ii)", (320, 240))})]
             results = {"streams": GLib.Variant("a(ua{sv})", streams)}
+            # A real backend rotates this on every Start when the client
+            # asked to persist. Handing one back is what lets the next
+            # session skip the chooser.
+            token = os.environ.get("FASTGRAB_FAKE_TOKEN")
+            if token:
+                results["restore_token"] = GLib.Variant("s", token)
             invocation.return_value(GLib.Variant("(ua{sv})", (0, results)))
             return
         if method == "OpenPipeWireRemote":
             # A real backend hands back a connection to the compositor's
             # PipeWire instance. Here that is the same daemon the test
             # fixture started, reached through its socket.
-            import os
+            #
+            # Imported at module scope, not here: a function-local
+            # `import os` makes os a local for the *whole* function, so
+            # any earlier branch touching os.environ raises
+            # UnboundLocalError -- and an exception inside a D-Bus
+            # handler means the method simply never replies, which the
+            # client sees as "the portal never answered", 30s later.
             path = os.path.join(
                 os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "pipewire-0")
-            import socket
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             sock.connect(path)
             fd_list = Gio.UnixFDList.new()

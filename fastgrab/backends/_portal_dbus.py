@@ -46,6 +46,48 @@ class PortalUnavailable(RuntimeError):
     """No portal, or no ScreenCast implementation behind it."""
 
 
+def probe_screencast(timeout=5.0):
+    """Confirm a working ScreenCast portal is reachable, and nothing more.
+
+    Reads the interface's ``version`` property. That is enough to tell
+    the two cases apart, measured on a bare session bus: the frontend is
+    D-Bus-activatable and does start, but with no desktop
+    ``impl.portal.ScreenCast`` behind it it does not export the
+    interface at all, and the read comes back ``No such interface``.
+
+    This matters because auto-detection decides by construction. A
+    Wayland session with PyGObject and GStreamer installed but no portal
+    -- a wlroots desktop that never installed one, say -- would
+    otherwise be handed this backend while its XWayland worked fine, and
+    would only find out at capture time.
+
+    No session is created and no chooser is shown, so nobody is asked
+    anything. Activating the frontend is the one side effect, and that
+    is an ordinary session service that any screen-share would start.
+    """
+    Gio, GLib = _require_gio()
+    try:
+        conn = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    except Exception as exc:
+        raise PortalUnavailable(
+            "no session bus to reach the portal on: {}".format(exc)
+        ) from exc
+    try:
+        reply = conn.call_sync(
+            PORTAL_BUS, PORTAL_PATH, "org.freedesktop.DBus.Properties", "Get",
+            GLib.Variant("(ss)", (SCREENCAST_IFACE, "version")),
+            GLib.VariantType("(v)"), Gio.DBusCallFlags.NONE,
+            int(timeout * 1000), None)
+    except Exception as exc:
+        raise PortalUnavailable(
+            "no xdg-desktop-portal ScreenCast implementation on the "
+            "session bus ({}). On GNOME or KDE install "
+            "xdg-desktop-portal-gnome or -kde; on wlroots, "
+            "xdg-desktop-portal-wlr.".format(exc)
+        ) from exc
+    return reply.unpack()[0]
+
+
 class ScreenCastSession:
     """One portal session, held open across captures.
 

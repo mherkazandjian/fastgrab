@@ -164,6 +164,70 @@ def _persist_mode(explicit=None):
     return PERSIST_MODES[key]
 
 
+#: Tokens seen in this process, so a second Screenshot in one program
+#: does not re-prompt even when nothing is written to disk.
+_PROCESS_TOKEN = {}
+
+TOKEN_ENV = "FASTGRAB_PORTAL_TOKEN_FILE"
+
+
+def _token_path():
+    """Where a ``persistent`` restore token is kept.
+
+    Under ``$XDG_STATE_HOME`` (state, not config: it is regenerated on
+    demand and rotates on every use, and losing it costs one prompt).
+    """
+    override = os.environ.get(TOKEN_ENV)
+    if override:
+        return override
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, "fastgrab", "portal-restore-token")
+
+
+def _read_token():
+    try:
+        with open(_token_path()) as handle:
+            return handle.read().strip() or None
+    except (IOError, OSError):
+        # No token, an unreadable one, or no home directory. All of them
+        # mean the same thing to the caller: ask the user.
+        return None
+
+
+def _write_token(token):
+    """Store a token for a later process, readable only by its owner.
+
+    This is a capability: it lets fastgrab reopen the screen share
+    without asking again, which is exactly what ``persistent`` was
+    chosen for. It is never written unless that mode was asked for.
+    """
+    path = _token_path()
+    try:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        # 0600 from the moment it exists, rather than written and then
+        # chmodded, which leaves a window where it is world-readable.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, token.encode("utf-8"))
+        finally:
+            os.close(fd)
+    except (IOError, OSError):
+        # Not being able to remember is a lost convenience, never a
+        # failed capture.
+        pass
+
+
+def _forget_token():
+    _PROCESS_TOKEN.pop("token", None)
+    try:
+        os.remove(_token_path())
+    except (IOError, OSError):
+        pass
+
+
 def _release_portal(state):
     """Tear down a discarded backend's stream and session.
 
@@ -219,10 +283,13 @@ class PortalBackend(BaseBackend):
         # Import here, not at module scope: the dependencies live behind
         # the [portal] extra and importing this module must stay cheap
         # and safe for a default install.
-        from ._portal_dbus import ScreenCastSession, _require_gio
+        from ._portal_dbus import (
+            PortalCancelled, ScreenCastSession, _require_gio,
+            probe_screencast)
         from ._pipewire import PipeWireVideoReader, _require_gst
         self._session_class = ScreenCastSession
         self._reader_class = PipeWireVideoReader
+        self._cancelled = PortalCancelled
         # Probe the optional dependencies now rather than at first
         # capture. _autodetect() decides which backend to use by
         # constructing one and catching the failure, so a constructor
@@ -236,6 +303,11 @@ class PortalBackend(BaseBackend):
         # consent still waits for the first capture.
         _require_gio()
         _require_gst()
+        # And that a portal is actually there. Having the libraries says
+        # nothing about the desktop: a Wayland session with no ScreenCast
+        # implementation would otherwise take this backend instead of the
+        # XWayland fallback that works. A property read, no session.
+        probe_screencast()
         # Not __del__: the same reason as the wlr and windows backends.
         # atexit=False because tearing a GStreamer pipeline down during
         # interpreter shutdown is not worth the risk -- a leaked
@@ -245,6 +317,63 @@ class PortalBackend(BaseBackend):
         self._finalizer.atexit = False
 
     # -------- session lifetime --------
+
+    def _load_token(self):
+        """The restore token to offer, if any.
+
+        ``none`` never offers one -- that is what asking every time
+        means. ``transient`` remembers only for this process, so a
+        program that builds several Screenshots is asked once.
+        ``persistent`` also looks on disk, which is what survives a
+        reboot.
+        """
+        if self._persist == PERSIST_MODES["none"]:
+            return None
+        token = _PROCESS_TOKEN.get("token")
+        if token is None and self._persist == PERSIST_MODES["persistent"]:
+            token = _read_token()
+        return token
+
+    def _save_token(self, token):
+        if not token or self._persist == PERSIST_MODES["none"]:
+            return
+        _PROCESS_TOKEN["token"] = token
+        if self._persist == PERSIST_MODES["persistent"]:
+            _write_token(token)
+
+    def _open_session(self):
+        """Open one portal session, reusing consent where allowed.
+
+        The portal rotates the token on every Start, so the one that
+        comes back replaces the one that went in.
+        """
+        token = self._load_token()
+        session = self._session_class(
+            app_id="fastgrab", persist_mode=self._persist,
+            timeout=self._timeout, restore_token=token)
+        try:
+            session.open()
+        except BaseException as exc:
+            # CreateSession can succeed and Start still fail, time out or
+            # be interrupted. The session never reaches self._session in
+            # that case, so neither close() nor the finalizer could
+            # release it, and on a long-lived bus connection the
+            # half-open session and its pending chooser outlive the
+            # failed capture -- with every retry adding another.
+            session.close()
+            if token is None or not isinstance(exc, Exception):
+                raise
+            if isinstance(exc, self._cancelled):
+                # They said no. Asking again immediately is not a retry,
+                # it is nagging.
+                raise
+            # A stored token the desktop no longer honours would
+            # otherwise wedge capture until somebody found and deleted
+            # the file. Drop it and ask properly, once.
+            _forget_token()
+            return self._open_session()
+        self._save_token(session.restore_token)
+        return session
 
     def _open_reader(self):
         """Build a reader bound to the portal's own PipeWire connection.
@@ -275,16 +404,7 @@ class PortalBackend(BaseBackend):
         if self._reader is not None:
             return self._reader
         if self._session is None:
-            session = self._session_class(
-                app_id="fastgrab", persist_mode=self._persist,
-                timeout=self._timeout)
-            session.open()
-            # Stored before the stream is built, so a failure below
-            # leaves the session reachable by close() rather than open
-            # and orphaned. It is deliberately not closed here: consent
-            # is attached to it, and throwing it away would make a
-            # retry prompt the user a second time.
-            self._session = session
+            self._session = self._open_session()
         self._reader = self._open_reader()
         return self._reader
 

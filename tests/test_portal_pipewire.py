@@ -178,6 +178,65 @@ def test_an_unknown_node_id_captures_the_wrong_source(node_id):
     )
 
 
+def test_an_idle_stream_still_answers_with_the_last_frame(node_id):
+    """A screencast emits on *damage*, not on a clock.
+
+    Point one at a desktop where nothing moves and it delivers no
+    buffers at all. Requiring a fresh one per capture would make a
+    still screen indistinguishable from a dead stream, and would fail
+    the first capture too: resolution() consumes the opening frame
+    through size, leaving nothing for the screenshot that follows.
+
+    This fixture emits continuously at 10fps, which hides the case
+    entirely -- hence the stand-in sink that stops delivering.
+    """
+    reader = PipeWireVideoReader(node_id, timeout=2.0)
+    try:
+        first = reader.read()
+        reader._sink.try_pull_sample = lambda _ns: None
+        second = reader.read()
+    finally:
+        reader.close()
+    assert numpy.array_equal(first, second)
+
+
+def test_a_stream_that_has_never_delivered_still_fails(node_id):
+    """The control on the test above.
+
+    Serving the last frame is only right once there *is* one. A stream
+    that has produced nothing is a broken stream and has to say so,
+    rather than quietly handing back an empty array.
+    """
+    reader = PipeWireVideoReader(node_id, timeout=1.0)
+    reader.start()
+    reader._sink.try_pull_sample = lambda _ns: None
+    try:
+        with pytest.raises(RuntimeError, match="no frame"):
+            reader.read()
+    finally:
+        reader.close()
+
+
+def test_close_drops_the_cached_frame(node_id):
+    """A reopened reader must not answer with the old stream's frame.
+
+    The reopen itself cannot be exercised against this fixture -- its
+    provider is `pipewiresink mode=provide`, which exits as soon as its
+    consumer disconnects, so by the time a second start() runs the node
+    is off the graph. The invariant that carries the risk is testable
+    though: the cache goes away with the pipeline, so there is nothing
+    stale left to hand back.
+    """
+    reader = PipeWireVideoReader(node_id, timeout=1.0)
+    reader.read()
+    assert reader._last is not None
+    reader.close()
+    assert reader._last is None, (
+        "a closed reader kept the last frame, so reopening it would "
+        "answer with the previous stream's picture"
+    )
+
+
 def test_close_is_idempotent(node_id):
     reader = PipeWireVideoReader(node_id)
     reader.read()

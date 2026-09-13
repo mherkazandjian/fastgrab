@@ -67,6 +67,7 @@ class PipeWireVideoReader:
         self._pipeline = None
         self._sink = None
         self._size = None
+        self._last = None
 
     def start(self):
         Gst = self._gst
@@ -128,7 +129,12 @@ class PipeWireVideoReader:
         return self._size
 
     def read(self):
-        """Return the most recent frame as a ``(h, w, 4)`` BGRA array."""
+        """Return the most recent frame as a ``(h, w, 4)`` BGRA array.
+
+        The array is the reader's own cache, handed back directly rather
+        than copied again -- read it, or copy out of it, but do not
+        write to it.
+        """
         import numpy
 
         Gst = self._gst
@@ -136,6 +142,19 @@ class PipeWireVideoReader:
         deadline_ns = int(self.timeout * Gst.SECOND)
         sample = self._sink.try_pull_sample(deadline_ns)
         if sample is None:
+            # No new buffer is the normal state of an idle screen, not a
+            # failure. A screencast stream emits on *damage*: point it at
+            # a desktop where nothing moves and it delivers nothing at
+            # all, so insisting on a fresh buffer per capture would make
+            # a still desktop indistinguishable from a dead stream --
+            # and would fail the very first capture too, since
+            # resolution() consumes the opening frame through size.
+            # The last frame is still what is on screen.
+            #
+            # Only ever after a real one: with nothing cached this is a
+            # stream that has never delivered, which is a failure.
+            if self._last is not None:
+                return self._last.copy()
             raise RuntimeError(
                 "no frame from PipeWire node {} within {}s".format(
                     self.node_id, self.timeout
@@ -153,15 +172,20 @@ class PipeWireVideoReader:
             # Copied, not viewed: the mapping is borrowed and is unmapped
             # again below, so a view would dangle.
             flat = numpy.frombuffer(info.data, dtype=numpy.uint8)
-            return flat[: height * width * 4].reshape(height, width, 4).copy()
+            frame = flat[: height * width * 4].reshape(height, width, 4).copy()
         finally:
             buffer.unmap(info)
+        self._last = frame
+        return frame
 
     def close(self):
         if self._pipeline is not None:
             self._pipeline.set_state(self._gst.State.NULL)
             self._pipeline = None
             self._sink = None
+        # Dropped with the pipeline: a reopened reader must not answer
+        # with a frame from the stream it had before.
+        self._last = None
 
     def __enter__(self):
         self.start()

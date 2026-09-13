@@ -81,10 +81,11 @@ def portal(tmp_path, monkeypatch):
                XDG_CURRENT_DESKTOP="fastgrabtest")
     started = {"node": node}
 
-    def launch(response=0):
+    def launch(response=0, extra_env=None):
         fake = subprocess.Popen(
             ["python", FAKE, str(node), str(response)],
-            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            env=dict(env, **(extra_env or {})),
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         time.sleep(1.0)
         front = subprocess.Popen(
             ["/usr/libexec/xdg-desktop-portal", "-r"],
@@ -239,6 +240,139 @@ def test_one_backend_opens_one_session(portal):
         backend.close()
 
 
+# -------- remembering consent --------
+
+@pytest.fixture
+def clean_token_store(tmp_path, monkeypatch):
+    """An isolated token file, and no leftovers in the process cache.
+
+    The in-process cache is module state, so without this a token from
+    one test would satisfy the next and the assertions would pass for
+    the wrong reason.
+    """
+    from fastgrab.backends import portal as portal_module
+
+    portal_module._PROCESS_TOKEN.clear()
+    path = tmp_path / "portal-restore-token"
+    monkeypatch.setenv("FASTGRAB_PORTAL_TOKEN_FILE", str(path))
+    yield path
+    portal_module._PROCESS_TOKEN.clear()
+
+
+def _offered(state_file):
+    """What the desktop backend was handed on the first SelectSources."""
+    first = state_file.read_text().strip().splitlines()[0].split()
+    return {"token": first[1], "persist_mode": first[2]}
+
+
+def test_a_persistent_approval_is_kept_for_the_next_process(
+    portal, tmp_path, clean_token_store
+):
+    """Otherwise 'remember this' silently means 'ask me again'.
+
+    persist_mode was already being sent, but the token the portal hands
+    back in return was dropped on the floor -- and the token is the
+    whole mechanism. Nothing carried over, whichever mode was chosen.
+    """
+    from fastgrab.backends.portal import PortalBackend
+
+    state = tmp_path / "fake-state"
+    portal(extra_env={"FASTGRAB_FAKE_STATE": str(state),
+                      "FASTGRAB_FAKE_TOKEN": "tok-1"})
+    backend = PortalBackend(persist="persistent", timeout=30)
+    try:
+        backend.resolution()
+    finally:
+        backend.close()
+
+    assert _offered(state) == {"token": "-", "persist_mode": "2"}, (
+        "the first session should offer no token and ask to persist"
+    )
+    assert clean_token_store.read_text() == "tok-1"
+    mode = os.stat(str(clean_token_store)).st_mode & 0o777
+    assert mode == 0o600, (
+        "the token reopens the screen share without asking, so it must "
+        "not be readable by anyone else (found %s)" % oct(mode)
+    )
+
+
+def test_a_stale_token_is_offered_then_dropped_rather_than_wedging_capture(
+    portal, tmp_path, clean_token_store
+):
+    """A token the desktop no longer honours must not be fatal.
+
+    Asserted at the session boundary, because the token never reaches
+    the desktop backend: xdg-desktop-portal owns the token database, so
+    it resolves the client's token itself and hands the implementation
+    its own restore data. An entry the frontend does not recognise --
+    exactly what a token from a previous boot looks like here -- is
+    rejected outright.
+
+    Without the retry that is a permanent failure: every capture from
+    then on dies on a stored file the user has no reason to know about.
+    So the sequence is offer it, and on refusal forget it and ask
+    properly, once. The portal also rotates the token on success, so
+    the one that comes back has to replace the one that went in.
+    """
+    from fastgrab.backends.portal import PortalBackend
+
+    clean_token_store.write_text("tok-from-last-boot")
+    state = tmp_path / "fake-state"
+    portal(extra_env={"FASTGRAB_FAKE_STATE": str(state),
+                      "FASTGRAB_FAKE_TOKEN": "tok-2"})
+    backend = PortalBackend(persist="persistent", timeout=30)
+    calls = []
+    real = backend._session_class
+
+    def spy(**kwargs):
+        calls.append(kwargs)
+        return real(**kwargs)
+
+    backend._session_class = spy
+    try:
+        assert backend.resolution() == (320, 240), (
+            "a stale token left capture broken"
+        )
+    finally:
+        backend.close()
+
+    assert calls[0].get("restore_token") == "tok-from-last-boot", (
+        "the stored token was never offered, so persist='persistent' "
+        "would prompt every time regardless"
+    )
+    assert len(calls) == 2, (
+        "expected exactly one retry after the refusal, got %d session(s)"
+        % len(calls)
+    )
+    assert calls[1].get("restore_token") is None, (
+        "the retry offered the same rejected token again"
+    )
+    assert clean_token_store.read_text() == "tok-2", (
+        "the rotated token was not kept, so the next run would offer a "
+        "spent one"
+    )
+
+
+def test_asking_every_time_stores_nothing(portal, tmp_path, clean_token_store):
+    """persist='none' is a privacy choice and has to be honoured."""
+    from fastgrab.backends.portal import PortalBackend
+
+    state = tmp_path / "fake-state"
+    portal(extra_env={"FASTGRAB_FAKE_STATE": str(state),
+                      "FASTGRAB_FAKE_TOKEN": "tok-3"})
+    backend = PortalBackend(persist="none", timeout=30)
+    try:
+        backend.resolution()
+    finally:
+        backend.close()
+
+    assert _offered(state) == {"token": "-", "persist_mode": "0"}
+    assert not clean_token_store.exists(), (
+        "a token was written to disk even though the user asked to be "
+        "prompted every time"
+    )
+
+
 def test_the_reader_is_given_the_portals_own_pipewire_socket(portal):
     """The node id is only meaningful on the portal's connection.
 
@@ -372,6 +506,25 @@ def test_refresh_renegotiates_the_stream_without_re_asking(portal):
         assert asked, "the renegotiated stream reused the spent descriptor"
     finally:
         backend.close()
+
+
+def test_construction_refuses_when_no_screencast_portal_is_present(portal):
+    """Having the libraries says nothing about the desktop.
+
+    The fixture is requested but deliberately **not** launched, so the
+    session bus here is real and carries no ScreenCast implementation --
+    a Wayland session that installed the extra and has no portal. Its
+    XWayland works fine, and auto-detection must leave it alone rather
+    than claim it and fail later from capture().
+
+    The frontend is still D-Bus-activatable and does start; what it does
+    not do is export the interface, which is what the probe reads.
+    """
+    from fastgrab.backends._portal_dbus import PortalUnavailable
+    from fastgrab.backends.portal import PortalBackend
+
+    with pytest.raises(PortalUnavailable, match="ScreenCast"):
+        PortalBackend(timeout=5)
 
 
 def test_construction_probes_for_the_optional_dependencies(monkeypatch):
