@@ -341,13 +341,13 @@ class PortalBackend(BaseBackend):
         if self._persist == PERSIST_MODES["persistent"]:
             _write_token(token)
 
-    def _open_session(self):
+    def _open_session(self, use_token=True):
         """Open one portal session, reusing consent where allowed.
 
         The portal rotates the token on every Start, so the one that
         comes back replaces the one that went in.
         """
-        token = self._load_token()
+        token = self._load_token() if use_token else None
         session = self._session_class(
             app_id="fastgrab", persist_mode=self._persist,
             timeout=self._timeout, restore_token=token)
@@ -371,7 +371,14 @@ class PortalBackend(BaseBackend):
             # otherwise wedge capture until somebody found and deleted
             # the file. Drop it and ask properly, once.
             _forget_token()
-            return self._open_session()
+            # use_token=False rather than trusting the deletion.
+            # _forget_token() cannot guarantee the file is gone -- an
+            # unwritable directory makes the unlink fail and it
+            # deliberately swallows that -- and re-reading the same
+            # rejected token would open a session per attempt until
+            # RecursionError. This bounds it at one retry whatever
+            # happened on disk.
+            return self._open_session(use_token=False)
         self._save_token(session.restore_token)
         return session
 

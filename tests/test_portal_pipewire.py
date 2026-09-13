@@ -295,6 +295,48 @@ def test_a_padded_row_stride_is_honoured(node_id):
             )
 
 
+def test_an_idle_stream_answers_without_waiting_out_the_timeout(node_id):
+    """Returning the cached frame must be fast, not merely correct.
+
+    A damage-driven stream delivers nothing at all while nothing moves,
+    so blocking for the full timeout before falling back would make
+    every capture of a still desktop cost `timeout` seconds -- and the
+    default is five, in a library whose whole point is not taking five
+    seconds.
+    """
+    reader = PipeWireVideoReader(node_id, timeout=5.0)
+    try:
+        reader.read()
+        reader._sink.try_pull_sample = lambda _ns: None
+        started = time.monotonic()
+        reader.read()
+        elapsed = time.monotonic() - started
+    finally:
+        reader.close()
+    assert elapsed < 1.0, (
+        "a cached read waited %.2fs; it should not block at all once "
+        "there is a frame to fall back on" % elapsed
+    )
+
+
+def test_a_stream_that_ends_is_reported_rather_than_repeating_itself(node_id):
+    """EOS looks exactly like an idle screen from try_pull_sample().
+
+    Both return None. Answering the first with the last frame means a
+    share the user has revoked, or a source that has gone away, is
+    reported as a successful capture forever.
+    """
+    reader = PipeWireVideoReader(node_id, timeout=1.0)
+    try:
+        reader.read()
+        reader._sink.try_pull_sample = lambda _ns: None
+        reader._sink.is_eos = lambda: True
+        with pytest.raises(RuntimeError, match="stopped delivering"):
+            reader.read()
+    finally:
+        reader.close()
+
+
 def test_close_is_idempotent(node_id):
     reader = PipeWireVideoReader(node_id)
     reader.read()

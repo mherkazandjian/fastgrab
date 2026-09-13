@@ -395,6 +395,53 @@ def test_a_stale_token_is_offered_then_dropped_rather_than_wedging_capture(
     )
 
 
+def test_token_recovery_is_bounded_even_when_the_file_cannot_be_deleted(
+    portal, tmp_path, clean_token_store, monkeypatch
+):
+    """Forgetting a rejected token is not the same as deleting it.
+
+    _forget_token() swallows a failed unlink -- an unwritable state
+    directory, a read-only home -- so a retry that simply re-reads the
+    token file gets the same rejected token back and opens a portal
+    session per attempt until RecursionError. The retry has to stop
+    loading tokens explicitly, not trust the deletion.
+    """
+    from fastgrab.backends.portal import PortalBackend
+
+    clean_token_store.write_text("tok-that-will-be-rejected")
+    state = tmp_path / "fake-state"
+    portal(extra_env={"FASTGRAB_FAKE_STATE": str(state),
+                      "FASTGRAB_FAKE_TOKEN": "tok-fresh"})
+
+    def refuse(_path):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(os, "remove", refuse)
+
+    backend = PortalBackend(persist="persistent", timeout=30)
+    calls = []
+    real = backend._session_class
+
+    def spy(**kwargs):
+        calls.append(kwargs)
+        # Fails fast and says why, rather than letting an unbounded
+        # recovery loop run a real portal handshake a thousand times.
+        assert len(calls) <= 3, "token recovery is looping"
+        return real(**kwargs)
+
+    backend._session_class = spy
+    try:
+        assert backend.resolution() == (320, 240)
+    finally:
+        backend.close()
+
+    assert len(calls) == 2, (
+        "expected the stale token then exactly one retry without it, "
+        "got %d sessions" % len(calls)
+    )
+    assert calls[1].get("restore_token") is None
+
+
 def test_asking_every_time_stores_nothing(portal, tmp_path, clean_token_store):
     """persist='none' is a privacy choice and has to be honoured."""
     from fastgrab.backends.portal import PortalBackend

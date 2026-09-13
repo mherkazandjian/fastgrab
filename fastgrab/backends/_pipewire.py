@@ -141,17 +141,36 @@ class PipeWireVideoReader:
 
         Gst = self._gst
         self.start()
-        deadline_ns = int(self.timeout * Gst.SECOND)
+        # Wait only when there is nothing to fall back on. On a
+        # damage-driven stream an idle screen delivers no buffer *ever*,
+        # so blocking for the full timeout before returning the cached
+        # frame would make every capture of a still desktop take
+        # `timeout` seconds -- five, by default, for a screenshot
+        # library whose whole point is not taking five seconds.
+        #
+        # Zero means "whatever is already queued", which is the right
+        # question once a frame is cached: a buffer arrives because
+        # something changed, so nothing queued means nothing changed.
+        # The cost is that a capture loop faster than the compositor
+        # can repeat a frame, which is what screen recording does
+        # anyway.
+        deadline_ns = 0 if self._last is not None else int(
+            self.timeout * Gst.SECOND)
         sample = self._sink.try_pull_sample(deadline_ns)
         if sample is None:
+            # Before treating that as an idle screen: a stream that has
+            # ended or errored also returns nothing, and answering those
+            # with the last frame would report a share the user has
+            # revoked, or a source that has gone away, as a successful
+            # capture -- indefinitely.
+            failure = self._stream_failure()
+            if failure is not None:
+                raise RuntimeError(
+                    "PipeWire node {} stopped delivering: {}".format(
+                        self.node_id, failure)
+                )
             # No new buffer is the normal state of an idle screen, not a
-            # failure. A screencast stream emits on *damage*: point it at
-            # a desktop where nothing moves and it delivers nothing at
-            # all, so insisting on a fresh buffer per capture would make
-            # a still desktop indistinguishable from a dead stream --
-            # and would fail the very first capture too, since
-            # resolution() consumes the opening frame through size.
-            # The last frame is still what is on screen.
+            # failure. The last frame is still what is on screen.
             #
             # Only ever after a real one: with nothing cached this is a
             # stream that has never delivered, which is a failure.
@@ -205,6 +224,24 @@ class PipeWireVideoReader:
             buffer.unmap(info)
         self._last = frame
         return frame
+
+    def _stream_failure(self):
+        """Why the stream stopped delivering, or None if it is just idle.
+
+        Both cases look identical from try_pull_sample(): it returns
+        None for "nothing queued", for end-of-stream, and for a pipeline
+        that failed asynchronously after PLAYING was reached.
+        """
+        Gst = self._gst
+        if self._sink is not None and self._sink.is_eos():
+            return "the stream ended"
+        if self._pipeline is not None:
+            bus = self._pipeline.get_bus()
+            if bus is not None:
+                message = bus.pop_filtered(Gst.MessageType.ERROR)
+                if message is not None:
+                    return message.parse_error()[0].message
+        return None
 
     def close(self):
         if self._pipeline is not None:
