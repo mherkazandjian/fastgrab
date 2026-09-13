@@ -40,7 +40,7 @@ services:
       - pip-cache:/root/.cache/pip
     environment:
       DISPLAY: ":99"
-      SCREEN_GEOMETRY: "3840x2160x24"
+      SCREEN_GEOMETRY: "7680x4320x24"
     command: ["start-desktop", "python", "examples/benchmark.py"]
 
   test-wayland:
