@@ -380,8 +380,12 @@ def test_a_persisted_approval_actually_restores_without_asking(
     finally:
         first.close()
 
-    stored = clean_token_store.read_text().strip()
-    assert stored, "the frontend issued no restore token to store"
+    assert clean_token_store.exists(), (
+        "no token was stored: the frontend issues one only when the "
+        "desktop backend returns restore_data, so nothing here is "
+        "restorable"
+    )
+    assert clean_token_store.read_text().strip(), "the stored token is empty"
     # What a *later process* starts from: nothing cached, token on disk.
     portal_module._PROCESS_TOKEN.clear()
 
