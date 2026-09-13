@@ -58,6 +58,8 @@ def _extra_symbols(cg, cf):
     cg.CGImageCreate.restype = ctypes.c_void_p
     cg.CGImageRetain.argtypes = [ctypes.c_void_p]
     cg.CGImageRetain.restype = ctypes.c_void_p
+    cg.CGDataProviderRelease.argtypes = [ctypes.c_void_p]
+    cg.CGDataProviderRelease.restype = None
 
 
 def _pattern(width, height):
@@ -96,7 +98,13 @@ def _padded_image(cg, cf, width, height):
     image = cg.CGImageCreate(width, height, 8, 32, stride, space,
                              _BGRA_BITMAP_INFO, provider, None, False, 0)
     assert image, "CGImageCreate failed"
+    # Every Create/Copy above returned a +1 reference that belongs to us,
+    # and a raw pointer is not something Python can collect. The image
+    # retains the provider and the provider retains the data, so ours are
+    # done with here; the image itself is released by the fixture.
     cg.CGColorSpaceRelease(space)
+    cg.CGDataProviderRelease(provider)
+    cf.CFRelease(data)
     return image, needed
 
 
@@ -143,7 +151,12 @@ def backend_over_padded_provider():
     image, needed = _padded_image(cg, cf, width, height)
     swap = _ImageSwap(cg, image)
     backend._cg = swap
-    return backend, swap, width, height, needed
+    try:
+        yield backend, swap, width, height, needed
+    finally:
+        # A display-sized buffer apiece — ~95 MiB across these tests on a
+        # 4K screen — resident for the rest of the session otherwise.
+        cg.CGImageRelease(image)
 
 
 def test_the_padded_provider_is_seen_as_oversized(backend_over_padded_provider):
@@ -151,8 +164,12 @@ def test_the_padded_provider_is_seen_as_oversized(backend_over_padded_provider):
     backend, swap, width, height, needed = backend_over_padded_provider
     cg, cf = swap._cg, backend._cf
     image = swap._image
-    held = cf.CFDataGetLength(cg.CGDataProviderCopyData(
-        cg.CGImageGetDataProvider(image)))
+    # CGDataProviderCopyData returns a +1 reference like any other Copy.
+    copied = cg.CGDataProviderCopyData(cg.CGImageGetDataProvider(image))
+    try:
+        held = cf.CFDataGetLength(copied)
+    finally:
+        cf.CFRelease(copied)
     assert held == needed + PAD, (
         "the test's own image is not padded, so it proves nothing"
     )
