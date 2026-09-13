@@ -32,7 +32,7 @@ pytestmark = pytest.mark.skipif(
 
 if sys.platform == "darwin":  # keep the import off Linux collection
     from fastgrab.backends.macos import (  # noqa: E402
-        _BGRA_BITMAP_INFO, MacosBackend, _load_frameworks,
+        _BGRA_BITMAP_INFO, MacosBackend,
     )
 
 PAD = 16384  # one arm64 page, the excess issue #46 reported
@@ -120,9 +120,14 @@ class _ImageSwap:
 
 @pytest.fixture
 def backend_over_padded_provider():
-    cg, cf, _CGPoint, _CGSize, _CGRect = _load_frameworks()
-    _extra_symbols(cg, cf)
+    # The backend's *own* framework handles, not a second _load_frameworks()
+    # call. Each call builds fresh ctypes Structure classes, and a CGRect
+    # from one is not a CGRect to a function whose argtypes came from the
+    # other -- ctypes rejects it with "expected CGRect instance instead of
+    # CGRect", which is as confusing as it sounds.
     backend = MacosBackend()
+    cg, cf = backend._cg, backend._cf
+    _extra_symbols(cg, cf)
     width, height = backend.resolution()
     image, needed = _padded_image(cg, cf, width, height)
     swap = _ImageSwap(cg, image)
