@@ -12,7 +12,7 @@ class Screenshot(object):
     """
     Main object that captures screenshots and provides other utilities
     """
-    def __init__(self, backend=None):
+    def __init__(self, backend=None, **backend_options):
         """
         Constructor
 
@@ -20,8 +20,15 @@ class Screenshot(object):
             ``'x11'``, ``'wlr'``, ``'portal'``. When ``None`` (default)
             the backend is auto-detected from the environment:
             Wayland sessions try wlr → portal; X11 sessions use x11.
+        :param backend_options: keyword arguments handed to the
+            backend's own constructor — backend-specific, and only
+            accepted alongside an explicit ``backend`` name, since
+            auto-detection may land on one that does not take them.
+            The portal backend accepts ``persist`` (see
+            :data:`fastgrab.backends.portal.PERSIST_MODES`); with
+            auto-detection use ``$FASTGRAB_PORTAL_PERSIST`` instead.
         """
-        self._backend = _resolve_backend(backend)
+        self._backend = _resolve_backend(backend, **backend_options)
         """The capture backend (BaseBackend subclass instance)"""
 
         self._screensize = None

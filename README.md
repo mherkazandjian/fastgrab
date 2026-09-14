@@ -181,10 +181,11 @@ From Python:
 ## Getting Started
 
 ``Fastgrab`` was initially developed in 2016 as part of an aimbot (for quake
-live). It supports **Linux** (X11 via a libX11 C extension; Wayland via the
-``wlr-screencopy-v1`` protocol behind the ``[wayland]`` extra), **Windows
-10/11** (Win32 ``BitBlt`` via ``ctypes``), and **macOS** (CoreGraphics
-``CGDisplayCreateImage`` via ``ctypes``). The plain
+live). It supports **Linux** (X11 via a libX11 C extension; Wayland via
+``wlr-screencopy-v1`` behind the ``[wayland]`` extra, or
+``xdg-desktop-portal`` + PipeWire behind the ``[portal]`` extra for GNOME
+and KDE), **Windows 10/11** (Win32 ``BitBlt`` via ``ctypes``), and **macOS**
+(CoreGraphics ``CGDisplayCreateImage`` via ``ctypes``). The plain
 ``pip install fastgrab`` works on all three platforms; only Wayland needs
 an opt-in extra.
 
@@ -233,9 +234,62 @@ Per-platform extras:
    fastgrab refuses that layout with a message naming the masks it found
    rather than returning wrong colours. ``xdpyinfo | grep "depth of root"``
    says which you have.
- - **Linux/Wayland**: a wlroots-based compositor (Sway, Hyprland, river,
-   niri, cage) for the no-prompt path; the ``[wayland]`` extra (``pip
-   install fastgrab[wayland]``) pulls in ``pywayland``.
+ - **Linux/Wayland (wlroots)**: a wlroots-based compositor (Sway,
+   Hyprland, river, niri, cage) for the no-prompt path; the ``[wayland]``
+   extra (``pip install fastgrab[wayland]``) pulls in ``pywayland``.
+ - **Linux/Wayland (GNOME, KDE)**: those desktops do not implement
+   ``wlr-screencopy-v1``, so capture goes through ``xdg-desktop-portal``
+   and PipeWire instead — the same mechanism screen-sharing in a browser
+   uses. ``pip install fastgrab[portal]`` brings PyGObject; GStreamer and
+   its introspection data are system packages pip cannot install:
+
+   ````bash
+   sudo apt install gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 \
+                    gstreamer1.0-plugins-base gstreamer1.0-pipewire
+   ````
+
+   That is the Debian/Ubuntu set the ``test-portal`` image is built from,
+   so it is the one that is exercised. Other distributions ship the same
+   pieces under their own names (Fedora: ``gstreamer1-plugins-base``,
+   ``gstreamer1-plugin-pipewire``, ``python3-gobject``) — untested here.
+   If pip has to *build* PyGObject rather than reuse a distro
+   ``python3-gi``, it also needs ``libgirepository1.0-dev``,
+   ``libcairo2-dev``, ``pkg-config`` and a C toolchain. The extra pins
+   PyGObject below 3.51 for that reason: from 3.51 it wants
+   ``girepository-2.0``, which ``libgirepository1.0-dev`` does not
+   provide and which only reaches Debian in trixie.
+
+   **This path asks your permission.** The desktop shows its own
+   screen-share chooser the first time a ``Screenshot`` captures, and the
+   approval belongs to that object — so reuse one and you are asked once,
+   build a new one per frame and you are asked per frame:
+
+   ````python
+   grab = screenshot.Screenshot()      # nothing is asked here
+   while True:
+       img = grab.capture()            # asked once, on the first capture
+   ````
+
+   Whether the desktop may *remember* the approval is yours to choose,
+   with ``$FASTGRAB_PORTAL_PERSIST`` or the ``persist`` argument:
+
+   - ``none`` — ask every time a session starts
+   - ``transient`` — remember until you log out (**the default**)
+   - ``persistent`` — remember across reboots, via a token the desktop
+     stores
+
+   ````bash
+   FASTGRAB_PORTAL_PERSIST=persistent python yourscript.py
+   ````
+
+   ````python
+   screenshot.Screenshot(backend="portal", persist="none")
+   ````
+
+   ``persistent`` is the least clicking and the most trust: the desktop
+   keeps a token that lets fastgrab re-open the same share without asking
+   again. ``none`` is the opposite. The default sits between the two and
+   never survives a logout.
  - **Windows 10/11**: nothing beyond Python + numpy. Capture goes through
    GDI ``BitBlt`` via ``ctypes``.
  - **macOS**: nothing beyond Python + numpy. macOS 10.15+ requires
@@ -282,6 +336,18 @@ which is equivalent to
 docker compose run --rm test
 ````
 
+Two further suites cover the Wayland backends, and are separate because
+each needs a display stack of its own:
+
+````bash
+docker compose run --rm test-wayland   # wlr-screencopy, under headless cage
+docker compose run --rm test-portal    # xdg-desktop-portal + PipeWire
+````
+
+Neither needs a GPU. The portal suite runs the real portal frontend with
+a fake desktop chooser behind it, so the protocol is exercised for real
+without anyone clicking "Share".
+
 If you have ``pytest``, ``numpy``, ``python-xlib`` and an X server (or
 ``xvfb-run``) available on the host, the suite also runs directly:
 
@@ -303,8 +369,6 @@ dependency-light; additional backends or features ship as opt-in pip
 extras (``pip install fastgrab[<extra>]``) when they have non-trivial
 runtime deps. Open follow-ups include:
 
-   - ``xdg-desktop-portal`` + PipeWire fallback for GNOME/KDE Wayland
-     (currently stubbed behind the ``[wayland-portal]`` extra)
    - macOS ``ScreenCaptureKit`` backend for Apple-Silicon-era systems
    - Multi-monitor capture across all backends
 

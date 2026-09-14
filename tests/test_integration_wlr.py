@@ -16,8 +16,14 @@ import time
 import numpy
 import pytest
 
-from fastgrab import screenshot
-from fastgrab.backends.wlr import WlrBackend, _uniform_integer_scale
+pytest.importorskip(
+    "pywayland", reason="the wlr backend is behind the [wayland] extra"
+)
+
+from fastgrab import screenshot  # noqa: E402
+from fastgrab.backends.wlr import (  # noqa: E402
+    WlrBackend, _uniform_integer_scale,
+)
 
 pytestmark = pytest.mark.wayland
 

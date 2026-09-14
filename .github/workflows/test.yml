@@ -23,6 +23,18 @@ jobs:
       - name: Run wlr-screencopy integration tests
         run: docker compose run --rm test-wayland
 
+  portal:
+    name: linux portal (xdg-desktop-portal + PipeWire)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # No GPU needed, unlike the wlr portal path: the PipeWire source is
+      # synthetic and the desktop's chooser is faked, while the portal
+      # frontend itself is the real one.
+      - name: Run portal + PipeWire tests
+        run: docker compose run --rm test-portal
+
   windows:
     name: windows (BitBlt + DIBSection)
     runs-on: windows-latest

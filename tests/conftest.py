@@ -87,6 +87,12 @@ def require_some_display(request):
         return
     if request.node.get_closest_marker("no_display"):
         return
+    # The portal tests read frames from a PipeWire node, which needs no
+    # display server at all — their fixture is a synthetic video source
+    # on a private graph. Skipping them here made the whole test-portal
+    # service report success while running nothing.
+    if request.node.get_closest_marker("portal"):
+        return
     if not _some_display_available():
         pytest.skip("no usable display server (need DISPLAY or WAYLAND_DISPLAY)")
 
