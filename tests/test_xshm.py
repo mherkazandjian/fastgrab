@@ -24,7 +24,7 @@ pytestmark = pytest.mark.skipif(
     reason="fastgrab._linux_x11 is the libX11 C extension; Linux only",
 )
 
-from fastgrab import _linux_x11, screenshot  # noqa: E402
+from fastgrab import _linux_x11  # noqa: E402
 
 
 # Paint a deterministic full-screen window, capture it, print a digest.
@@ -99,13 +99,13 @@ import select
 
 from fastgrab import screenshot, _linux_x11
 
-THRESHOLD = 4 * 1024 * 1024
-
-width, height = _linux_x11.resolution()
-if width * height * 4 < THRESHOLD:
-    print("SETUP-FAILED: %dx%d is under the parallel-copy threshold"
-          % (width, height))
-    raise SystemExit(2)
+# The caller forces $FASTGRAB_OMP_MIN_BYTES to 1, so every capture here
+# takes the parallel branch whatever this display measures. Requiring a
+# large screen instead -- which is what this did first -- made the test
+# fail outright on an ordinary 1280x720 or 1024x768, 3.5 MB and 3.0 MB,
+# both under the 4 MiB default. That is a bug in the test, not in
+# capture, and it would have found its way onto any developer whose
+# desktop is smaller than the CI container's 1280x1024.
 
 grab = screenshot.Screenshot()
 grab.capture()
@@ -305,7 +305,18 @@ def test_openmp_survived_the_build_where_it_must_have():
     )
 
 
-def test_a_large_capture_really_copies_in_parallel():
+_PARALLEL_COPY_SCRIPT = r"""
+from fastgrab import screenshot, _linux_x11
+
+before = _linux_x11._display_cache_info()["omp_parallel_copies"]
+screenshot.Screenshot().capture()
+info = _linux_x11._display_cache_info()
+print("%s %d" % (info["omp_compiled"],
+                 info["omp_parallel_copies"] - before))
+"""
+
+
+def test_a_capture_really_copies_in_parallel():
     """And that the flag surviving actually reaches the copy.
 
     omp_compiled says the pragmas were compiled in; this says one of
@@ -313,19 +324,21 @@ def test_a_large_capture_really_copies_in_parallel():
     pragma precisely so that it cannot answer for a serial build -- it
     used to sit outside, and a build with no OpenMP runtime loaded at all
     reported 201 parallel copies on a single thread.
+
+    Run in a child with the threshold forced to one byte rather than
+    against whatever this display happens to measure: keying it on the
+    screen size would skip silently on a 1280x720 desktop, which is
+    where a vacuous pass comes from.
     """
     if os.environ.get("FASTGRAB_EXPECT_OPENMP") != "1":
         pytest.skip("OpenMP is not guaranteed for this build")
-    width, height = _linux_x11.resolution()
-    if width * height * 4 < 4 * 1024 * 1024:
-        pytest.skip("%dx%d is under the parallel-copy threshold"
-                    % (width, height))
-    before = _linux_x11._display_cache_info()["omp_parallel_copies"]
-    screenshot.Screenshot().capture()
-    after = _linux_x11._display_cache_info()["omp_parallel_copies"]
-    assert after > before, (
-        "a %dx%d capture took the serial copy despite OpenMP being "
-        "compiled in" % (width, height)
+    proc = _run(_PARALLEL_COPY_SCRIPT, {"FASTGRAB_OMP_MIN_BYTES": "1"})
+    assert proc.returncode == 0, proc.stderr.strip()[-400:]
+    compiled, parallel_copies = proc.stdout.strip().split()
+    assert compiled == "True", "the extension was built without OpenMP"
+    assert int(parallel_copies) >= 1, (
+        "the capture took the serial copy even with the threshold at one "
+        "byte and OpenMP compiled into the extension"
     )
 
 
@@ -351,7 +364,7 @@ def test_a_forked_child_does_not_deadlock_on_a_large_capture():
             "built without OpenMP, so there is no libgomp pool to inherit "
             "and the hazard this pins cannot arise"
         )
-    proc = _run(_FORK_SCRIPT)
+    proc = _run(_FORK_SCRIPT, {"FASTGRAB_OMP_MIN_BYTES": "1"})
     assert proc.returncode == 0, (
         "the forked child did not come back: %s %s"
         % (proc.stdout.strip(), proc.stderr.strip()[-400:])

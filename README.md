@@ -282,8 +282,15 @@ Per-platform extras:
    gives up roughly a quarter of the combined speed at 1080p.
 
    Processes that get a clean runtime are unaffected: the ``spawn`` start
-   method, a ``forkserver`` whose server process never captured, or
-   importing fastgrab inside the worker rather than preloading it.
+   method, or a ``forkserver`` whose server process never captured.
+
+   Importing fastgrab inside the worker instead of preloading it helps
+   only when nothing in the parent had already started an OpenMP pool.
+   The guard stamps its pid when the extension is imported, so a worker
+   that imports *after* the fork looks like an ordinary first import and
+   re-arms the parallel copy — which still deadlocks if some other
+   library warmed libgomp before the fork. ``spawn`` is the answer that
+   does not depend on knowing what else is in the process.
 
    If you know your children fork from a runtime that never started an
    OpenMP pool, ``FASTGRAB_UNSAFE_OMP_AFTER_FORK=1`` turns the guard off
