@@ -16,6 +16,8 @@ Public surface:
 * :class:`BlurStyle`     — how blurred/redacted regions are obscured
   (re-exported from :mod:`fastgrab.effects`, which is core, not
   recording-specific)
+* :data:`SUBTITLE_BACKENDS` — subtitle renderers (``drawtext``, ``ass``)
+* :func:`build_ass_document` — render subtitles as an ASS script
 
 The module imports cleanly without ``ffmpeg`` on PATH; the check is
 deferred to :meth:`FfmpegEncoder.start` so callers get a clear error
@@ -24,11 +26,12 @@ only when they actually try to encode.
 from fastgrab.effects import BlurStyle
 
 from .clicks import ClickStyle
-from .encoder import FfmpegEncoder, infer_codec
+from .encoder import SUBTITLE_BACKENDS, FfmpegEncoder, infer_codec
 from .recorder import Recorder
-from .subtitles import Subtitle, SubtitleStyle
+from .subtitles import Subtitle, SubtitleStyle, build_ass_document
 
 __all__ = [
     "Recorder", "FfmpegEncoder", "infer_codec",
     "ClickStyle", "Subtitle", "SubtitleStyle", "BlurStyle",
+    "SUBTITLE_BACKENDS", "build_ass_document",
 ]

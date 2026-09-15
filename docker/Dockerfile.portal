@@ -1,0 +1,57 @@
+# Test image for the xdg-desktop-portal / PipeWire backend.
+#
+# Deliberately a *second* image rather than packages added to the main one.
+# The stack below — GStreamer, PipeWire, WirePlumber, PyGObject and its build
+# dependencies — is far larger than everything else the project needs put
+# together, and the portal backend is opt-in (`pip install fastgrab[portal]`).
+# Putting it in the default test image would tax every unrelated test run.
+#
+# The base is the same python:3.11-slim the main image uses, on purpose:
+# a debian:bookworm-slim base with the identical package set could not carry
+# PipeWire video buffers at all — the known-good producer/consumer pair that
+# reads three frames here returned zero bytes there, for reasons not yet
+# understood. PyGObject is pip-installed against the system girepository so
+# `gi` lands in the same interpreter that runs fastgrab; Debian's python3-gi
+# installs for a python3 this image does not have.
+FROM python:3.11-slim
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y \
+        build-essential \
+        gcc \
+        pkg-config \
+        libgirepository1.0-dev \
+        libcairo2-dev \
+        libx11-dev \
+        gir1.2-gstreamer-1.0 \
+        gir1.2-gst-plugins-base-1.0 \
+        gstreamer1.0-plugins-base \
+        gstreamer1.0-plugins-good \
+        gstreamer1.0-pipewire \
+        gstreamer1.0-tools \
+        pipewire \
+        pipewire-bin \
+        wireplumber \
+        libspa-0.2-modules \
+        dbus-bin \
+        dbus-daemon \
+        xdg-desktop-portal \
+    && rm -rf /var/lib/apt/lists/*
+
+# The PyGObject bound mirrors pyproject.toml's [portal] extra, so this
+# image tests what `pip install fastgrab[portal]` actually resolves to.
+# 3.51+ needs girepository-2.0, which libgirepository1.0-dev above does
+# not provide; see the comment on the dependency for when to lift it.
+RUN pip install --no-cache-dir \
+        numpy \
+        pytest \
+        "PyGObject>=3.42,<3.51"
+
+WORKDIR /app
+
+COPY docker/start-portal-fixture.sh /usr/local/bin/start-portal-fixture
+RUN chmod +x /usr/local/bin/start-portal-fixture
+
+CMD ["bash"]

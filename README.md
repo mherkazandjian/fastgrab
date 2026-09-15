@@ -1,7 +1,7 @@
 # FastGrab
 
 ``Fastgrab`` is an opensouce high frame rate screen capture package. A typical
-capture frame rate at a resolution of 1080p on a modern machine is ~60 fps.
+capture frame rate at a resolution of 1080p on a modern machine is ~2600 fps.
 There are several other such packages in the wild that are opensource as well, 
 but none of them is as fast or provides a simple way of obtaining the captures
 image as a numpy array out of the box. The default behavior of ``fastgrab`` is
@@ -13,10 +13,33 @@ Typical capture frame rate on a modern machine
 
 resolution    | fps
 ------------- | -----
-360p          | > 800
-720p          | 260
-1080p         | 200
-4K            | 20
+360p          | 13900
+720p          | 5700
+1080p         | 2600
+4K            | 340
+8K            | 109
+
+Measured with [examples/benchmark.py](https://github.com/mherkazandjian/fastgrab/blob/main/examples/benchmark.py),
+800 frames per resolution, on:
+
+ - **CPU**: AMD EPYC 9555 (64-core Zen 5), **8 cores** used for the run
+   (``taskset -c 0-7``)
+ - **GPU**: NVIDIA RTX PRO 6000 Blackwell Server Edition, 96 GB, driver
+   580.178.04 — **not involved in these numbers**. Capture ran against an
+   ``Xvfb`` software framebuffer in system RAM, so no pixel goes near the
+   GPU. Capturing a real GPU-driven X screen is *slower*, not faster,
+   because the framebuffer then lives in VRAM and has to be read back
+   across PCIe.
+ - **OS**: Ubuntu 22.04.5 LTS, kernel 7.0.0, Python 3.10.12
+ - **Display**: ``Xvfb`` at 7680x4320x24 on the same machine, so the
+   MIT-SHM fast path is available and large frames get an OpenMP team to
+   copy them
+
+A **remote** display cannot use shared memory and falls back to
+``XGetImage``, which costs roughly an order of magnitude: on the same
+machine that is 221 fps at 1080p rather than 2601. Figures on other
+machines will differ — capture is bound by memory bandwidth and, below the
+parallel-copy threshold, by single-core clock.
 
 # Usage example
 
@@ -216,6 +239,51 @@ Click/cursor tracking and ``--gui`` need the ``[gui]`` extra
 polling and ``Pillow`` for the selector's preview); subtitles need a font
 file (``$FASTGRAB_FONT`` or the bundled DejaVu search paths).
 
+### ASS subtitles
+
+By default every subtitle becomes an ffmpeg ``drawtext`` filter.
+Two timing notes for the ASS backend: a cue's end time is exclusive, so
+it stops one frame earlier than the drawtext chain does, and ASS
+timestamps are centiseconds, so a cue shorter than 10 ms is refused
+rather than silently written as one that can never appear.
+
+``--subtitle-backend ass`` instead generates an Advanced SubStation Alpha
+script from the same ``--subtitle`` lines and burns it in with libass
+(needs an ffmpeg built ``--enable-libass``, which the Debian/Ubuntu one
+is). ``--subtitle-sidecar`` keeps that script as an editable file —
+named after the video when no path is given, so ``demo.mp4`` gets
+``demo.ass``, which mpv and VLC pick up on their own as a track the
+viewer can switch off. The two flags are independent: a sidecar can
+accompany drawtext burn-in just as well.
+
+````bash
+  fastgrab-record --fullscreen -o demo.mp4 \
+      --subtitle "0.5-3.0:Hello world" --subtitle "4.0-6.5:Second line" \
+      --subtitle-backend ass --subtitle-sidecar \
+      --subtitle-font-name "DejaVu Sans" --subtitle-color yellow
+````
+
+From Python the same options are ``Recorder(..., subtitle_backend="ass",
+subtitle_sidecar="demo.ass")``, and ``build_ass_document(subtitles,
+style)`` returns the script as a string when the file is all you want.
+
+Both backends read the same ``SubtitleStyle``, which the ASS one maps
+onto a ``[V4+ Styles]`` row: font size, colours (converted to
+``&HAABBGGRR``, where the alpha byte is inverted), ``border`` as the
+opaque box's padding, and ``position`` as the alignment plus vertical
+margin. Three differences are worth knowing about:
+
+- libass resolves fonts by *family name*, not by path, so the family is
+  guessed from ``--subtitle-font``'s filename — pass
+  ``--subtitle-font-name`` when that guess is wrong. Unlike drawtext,
+  the ASS backend still renders when no font file is found at all.
+- the colour converter understands ``0xRRGGBB[AA]``, ``#RRGGBB[AA]`` and
+  ~25 common colour names, not ffmpeg's full ~150-name table; anything
+  else is refused before the encode starts rather than silently
+  mis-coloured.
+- long lines wrap inside the margins instead of running off the edge the
+  way drawtext does.
+
 Interactive use: ``fastgrab-record --gui`` opens a drag-to-select region
 picker followed by a small settings dialog (needs ``tkinter``), and
 ``fastgrab-record --print-xbindkeys`` prints a snippet for binding that to
@@ -233,10 +301,11 @@ From Python:
 ## Getting Started
 
 ``Fastgrab`` was initially developed in 2016 as part of an aimbot (for quake
-live). It supports **Linux** (X11 via a libX11 C extension; Wayland via the
-``wlr-screencopy-v1`` protocol behind the ``[wayland]`` extra), **Windows
-10/11** (Win32 ``BitBlt`` via ``ctypes``), and **macOS** (CoreGraphics
-``CGDisplayCreateImage`` via ``ctypes``). The plain
+live). It supports **Linux** (X11 via a libX11 C extension; Wayland via
+``wlr-screencopy-v1`` behind the ``[wayland]`` extra, or
+``xdg-desktop-portal`` + PipeWire behind the ``[portal]`` extra for GNOME
+and KDE), **Windows 10/11** (Win32 ``BitBlt`` via ``ctypes``), and **macOS**
+(CoreGraphics ``CGDisplayCreateImage`` via ``ctypes``). The plain
 ``pip install fastgrab`` works on all three platforms; only Wayland needs
 an opt-in extra.
 
@@ -269,11 +338,18 @@ Per-platform extras:
  - **Linux/X11**: the C extension is compiled on install, so you need a C
    toolchain plus the Python and X11 headers:
 
-   - Debian/Ubuntu: ``sudo apt install build-essential python3-dev libx11-dev``
-   - Fedora: ``sudo dnf install gcc python3-devel libX11-devel``
+   - Debian/Ubuntu: ``sudo apt install build-essential python3-dev libx11-dev libxext-dev``
+   - Fedora: ``sudo dnf install gcc python3-devel libX11-devel libXext-devel``
 
-   Runtime needs only ``libX11`` and ``libgomp1`` (``libgomp`` on Fedora),
-   which are present on any desktop. ``Python.h: No such file`` means the
+   Runtime needs ``libX11``, ``libXext`` and whichever OpenMP runtime
+   the compiler used: ``libgomp1`` for a gcc build (``libgomp`` on
+   Fedora), ``libomp`` for a clang one. All are present on any desktop.
+   If the toolchain cannot provide OpenMP at build time the extension is
+   built without it and says so on stderr — capture still works and
+   still uses MIT-SHM, large frames are just copied on one core. That is
+   decided when the package is compiled, so installing an OpenMP runtime
+   afterwards does not switch it on; reinstall to pick it up.
+   ``Python.h: No such file`` means the
    Python headers are missing (``python3-dev``); ``stdio.h: No such file``
    means the toolchain headers are (``build-essential``). Tested on
    Debian-based Python images, Ubuntu 24.04 and Fedora 44, Python 3.10–3.14.
@@ -285,9 +361,101 @@ Per-platform extras:
    fastgrab refuses that layout with a message naming the masks it found
    rather than returning wrong colours. ``xdpyinfo | grep "depth of root"``
    says which you have.
- - **Linux/Wayland**: a wlroots-based compositor (Sway, Hyprland, river,
-   niri, cage) for the no-prompt path; the ``[wayland]`` extra (``pip
-   install fastgrab[wayland]``) pulls in ``pywayland``.
+
+   Capture uses the **MIT-SHM** X extension when it can: the server
+   writes the region straight into a shared memory segment instead of
+   pushing every pixel through the X socket, which is worth roughly
+   4-10x depending on resolution. It needs client and server on the same
+   machine, so a remote ``DISPLAY`` (or a server built without the
+   extension) falls back to ``XGetImage`` automatically — one failed
+   probe per connection, not per frame. Rows are copied out across an
+   OpenMP team once a frame is large enough to pay for it. Two
+   environment variables override the defaults, mostly for debugging:
+   ``FASTGRAB_NO_XSHM=1`` forces the plain path, and
+   ``FASTGRAB_OMP_MIN_BYTES`` sets the frame size in bytes above which
+   the copy is parallelised (``0`` keeps it serial always).
+
+   **After a fork, the copy goes back to being serial.** GNU libgomp is
+   not fork-safe: a process that has run a parallel region keeps its
+   thread pool, ``fork()`` copies the bookkeeping but not the threads,
+   and the child's next parallel region waits forever for workers that do
+   not exist. So a child that inherited fastgrab — a ``multiprocessing``
+   worker under the ``fork`` start method, say — copies serially. It
+   keeps the shared-memory path, which is the larger half of the win, and
+   gives up roughly a quarter of the combined speed at 1080p.
+
+   Processes that get a clean runtime are unaffected: the ``spawn`` start
+   method, or a ``forkserver`` whose server process never captured.
+
+   Importing fastgrab inside the worker instead of preloading it helps
+   only when nothing in the parent had already started an OpenMP pool.
+   The guard stamps its pid when the extension is imported, so a worker
+   that imports *after* the fork looks like an ordinary first import and
+   re-arms the parallel copy — which still deadlocks if some other
+   library warmed libgomp before the fork. ``spawn`` is the answer that
+   does not depend on knowing what else is in the process.
+
+   If you know your children fork from a runtime that never started an
+   OpenMP pool, ``FASTGRAB_UNSAFE_OMP_AFTER_FORK=1`` turns the guard off
+   and keeps the parallel copy everywhere. It is named that way on
+   purpose: fastgrab cannot verify the precondition, and getting it wrong
+   is a hang rather than an error.
+ - **Linux/Wayland (wlroots)**: a wlroots-based compositor (Sway,
+   Hyprland, river, niri, cage) for the no-prompt path; the ``[wayland]``
+   extra (``pip install fastgrab[wayland]``) pulls in ``pywayland``.
+ - **Linux/Wayland (GNOME, KDE)**: those desktops do not implement
+   ``wlr-screencopy-v1``, so capture goes through ``xdg-desktop-portal``
+   and PipeWire instead — the same mechanism screen-sharing in a browser
+   uses. ``pip install fastgrab[portal]`` brings PyGObject; GStreamer and
+   its introspection data are system packages pip cannot install:
+
+   ````bash
+   sudo apt install gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 \
+                    gstreamer1.0-plugins-base gstreamer1.0-pipewire
+   ````
+
+   That is the Debian/Ubuntu set the ``test-portal`` image is built from,
+   so it is the one that is exercised. Other distributions ship the same
+   pieces under their own names (Fedora: ``gstreamer1-plugins-base``,
+   ``gstreamer1-plugin-pipewire``, ``python3-gobject``) — untested here.
+   If pip has to *build* PyGObject rather than reuse a distro
+   ``python3-gi``, it also needs ``libgirepository1.0-dev``,
+   ``libcairo2-dev``, ``pkg-config`` and a C toolchain. The extra pins
+   PyGObject below 3.51 for that reason: from 3.51 it wants
+   ``girepository-2.0``, which ``libgirepository1.0-dev`` does not
+   provide and which only reaches Debian in trixie.
+
+   **This path asks your permission.** The desktop shows its own
+   screen-share chooser the first time a ``Screenshot`` captures, and the
+   approval belongs to that object — so reuse one and you are asked once,
+   build a new one per frame and you are asked per frame:
+
+   ````python
+   grab = screenshot.Screenshot()      # nothing is asked here
+   while True:
+       img = grab.capture()            # asked once, on the first capture
+   ````
+
+   Whether the desktop may *remember* the approval is yours to choose,
+   with ``$FASTGRAB_PORTAL_PERSIST`` or the ``persist`` argument:
+
+   - ``none`` — ask every time a session starts
+   - ``transient`` — remember until you log out (**the default**)
+   - ``persistent`` — remember across reboots, via a token the desktop
+     stores
+
+   ````bash
+   FASTGRAB_PORTAL_PERSIST=persistent python yourscript.py
+   ````
+
+   ````python
+   screenshot.Screenshot(backend="portal", persist="none")
+   ````
+
+   ``persistent`` is the least clicking and the most trust: the desktop
+   keeps a token that lets fastgrab re-open the same share without asking
+   again. ``none`` is the opposite. The default sits between the two and
+   never survives a logout.
  - **Windows 10/11**: nothing beyond Python + numpy. Capture goes through
    GDI ``BitBlt`` via ``ctypes``.
  - **macOS**: nothing beyond Python + numpy. macOS 10.15+ requires
@@ -334,6 +502,18 @@ which is equivalent to
 docker compose run --rm test
 ````
 
+Two further suites cover the Wayland backends, and are separate because
+each needs a display stack of its own:
+
+````bash
+docker compose run --rm test-wayland   # wlr-screencopy, under headless cage
+docker compose run --rm test-portal    # xdg-desktop-portal + PipeWire
+````
+
+Neither needs a GPU. The portal suite runs the real portal frontend with
+a fake desktop chooser behind it, so the protocol is exercised for real
+without anyone clicking "Share".
+
 If you have ``pytest``, ``numpy``, ``python-xlib`` and an X server (or
 ``xvfb-run``) available on the host, the suite also runs directly:
 
@@ -355,8 +535,6 @@ dependency-light; additional backends or features ship as opt-in pip
 extras (``pip install fastgrab[<extra>]``) when they have non-trivial
 runtime deps. Open follow-ups include:
 
-   - ``xdg-desktop-portal`` + PipeWire fallback for GNOME/KDE Wayland
-     (currently stubbed behind the ``[wayland-portal]`` extra)
    - macOS ``ScreenCaptureKit`` backend for Apple-Silicon-era systems
    - Multi-monitor capture across all backends
 

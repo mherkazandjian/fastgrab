@@ -23,7 +23,7 @@ BENCH_CMD := docker compose run --rm benchmark
 LOCK_CMD := $(DC) 'poetry lock'
 else
 BUILD_CMD := rm -f fastgrab/*.so && poetry build
-TEST_CMD := pytest -m 'not wayland' tests
+TEST_CMD := pytest -m 'not wayland and not portal' tests
 TEST_WAYLAND_CMD := pytest -m wayland tests
 INSTALL_CMD := poetry install --extras gui
 BENCH_CMD := python examples/benchmark.py

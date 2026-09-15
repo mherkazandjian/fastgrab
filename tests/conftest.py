@@ -22,6 +22,7 @@ if sys.platform != "linux":
     collect_ignore.extend([
         "test_integration_wlr.py",   # imports fastgrab.backends.wlr → pywayland
         "test_x11_lowlevel.py",      # imports fastgrab._linux_x11
+        "test_xshm.py",              # imports fastgrab._linux_x11
     ])
 
 
@@ -86,6 +87,12 @@ def require_some_display(request):
     if sys.platform != "linux":
         return
     if request.node.get_closest_marker("no_display"):
+        return
+    # The portal tests read frames from a PipeWire node, which needs no
+    # display server at all — their fixture is a synthetic video source
+    # on a private graph. Skipping them here made the whole test-portal
+    # service report success while running nothing.
+    if request.node.get_closest_marker("portal"):
         return
     if not _some_display_available():
         pytest.skip("no usable display server (need DISPLAY or WAYLAND_DISPLAY)")

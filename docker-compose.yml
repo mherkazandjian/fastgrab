@@ -27,7 +27,25 @@ services:
     volumes:
       - .:/app
       - pip-cache:/root/.cache/pip
-    command: ["xvfb-run", "-a", "-s", "-screen 0 1280x1024x24", "python", "tests/_run_pytest_clean_exit.py", "-v", "-m", "not wayland", "tests"]
+    environment:
+      # A local Xvfb in this image shares the IPC namespace, so MIT-SHM
+      # cannot legitimately fail here. Declaring that lets test_xshm
+      # assert the fast path actually engaged, rather than passing
+      # whichever path ran.
+      FASTGRAB_EXPECT_XSHM: "1"
+      # Likewise gcc and libgomp are both installed here, so build.py's
+      # OpenMP probe cannot legitimately fall back. Saying so lets a test
+      # catch the flag going missing -- which it already did once, for
+      # the whole life of the project, before PR #74 noticed.
+      FASTGRAB_EXPECT_OPENMP: "1"
+    # "not portal" as well as "not wayland": those tests need a PipeWire
+    # graph this image has none of. Today they never reach selection --
+    # both portal modules importorskip("gi"), which is what keeps
+    # *collection* safe here and on the Windows and macOS jobs. The
+    # marker covers the other case: the day PyGObject arrives in this
+    # image for some unrelated reason, they would collect fine and then
+    # fail against a graph that does not exist.
+    command: ["xvfb-run", "-a", "-s", "-screen 0 1280x1024x24", "python", "tests/_run_pytest_clean_exit.py", "-v", "-m", "not wayland and not portal", "tests"]
 
   benchmark:
     build:
@@ -40,7 +58,7 @@ services:
       - pip-cache:/root/.cache/pip
     environment:
       DISPLAY: ":99"
-      SCREEN_GEOMETRY: "3840x2160x24"
+      SCREEN_GEOMETRY: "7680x4320x24"
     command: ["start-desktop", "python", "examples/benchmark.py"]
 
   test-wayland:
@@ -59,6 +77,25 @@ services:
       WLR_LIBINPUT_NO_DEVICES: "1"
       FASTGRAB_TEST_BACKEND: "wlr"
     command: ["start-wayland-desktop", "python", "tests/_run_pytest_clean_exit.py", "-v", "-m", "wayland", "tests"]
+
+  test-portal:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.portal
+    image: fastgrab-portal
+    init: true
+    volumes:
+      - .:/app
+      - pip-cache:/root/.cache/pip
+    environment:
+      XDG_RUNTIME_DIR: "/tmp/xdg-runtime"
+    # Named files, not "tests": pytest imports every module it collects,
+    # and tests/test_x11_lowlevel.py imports fastgrab._linux_x11 at module
+    # scope. This image never builds the C extension, so collecting the
+    # whole directory is an error on a clean checkout -- it only appears
+    # to work in a tree that still has a gitignored .so lying around.
+    command: ["start-portal-fixture", "python", "-m", "pytest", "-v", "-m", "portal",
+              "tests/test_portal_pipewire.py", "tests/test_portal_dbus.py"]
 
 volumes:
   pip-cache:

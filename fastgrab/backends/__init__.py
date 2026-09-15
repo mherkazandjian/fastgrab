@@ -9,7 +9,9 @@ the actual capture work to a backend. Five backends ship in tree:
   ``pip install fastgrab[wayland]``. Works on wlroots compositors
   (Sway, Hyprland, river, niri, cage).
 * ``portal``  — ``xdg-desktop-portal`` + PipeWire. Linux. Opt-in via
-  ``pip install fastgrab[wayland-portal]``. Currently stubbed.
+  ``pip install fastgrab[portal]``, which also needs GStreamer system
+  packages. For GNOME and KDE, where the wlr backend does not work.
+  Asks the user's permission on first capture.
 * ``windows`` — Win32 ``BitBlt`` + ``CreateDIBSection``. Windows
   10/11. Pure ``ctypes``, no extras.
 * ``macos``   — CoreGraphics ``CGDisplayCreateImage``. macOS. Pure
@@ -24,23 +26,36 @@ import sys
 
 
 _WAYLAND_HINT = "pip install fastgrab[wayland]"
-_PORTAL_HINT = "pip install fastgrab[wayland-portal]"
+_PORTAL_HINT = "pip install fastgrab[portal]"
 
 
-def _resolve_backend(name=None):
+def _resolve_backend(name=None, **options):
     """Return a :class:`BaseBackend` instance for the requested name.
 
     With ``name=None`` the function auto-detects based on the platform
     and (on Linux) the display server. With an explicit name it imports
     just that backend and raises a :class:`RuntimeError` with an install
     hint if the optional deps are missing.
+
+    ``options`` are forwarded to the backend's constructor. They need an
+    explicit ``name``: auto-detection may pick a backend that does not
+    accept them, and silently dropping an option that governs something
+    like screen-share consent would be worse than refusing it.
     """
     if name is None:
+        if options:
+            raise TypeError(
+                "backend options ({}) need an explicit backend=, because "
+                "auto-detection may pick a backend that does not accept "
+                "them. The portal backend's persist mode is also settable "
+                "with $FASTGRAB_PORTAL_PERSIST, which works either way."
+                .format(", ".join(sorted(options)))
+            )
         return _autodetect()
 
     if name == "x11":
         from .x11 import X11Backend
-        return X11Backend()
+        return X11Backend(**options)
 
     if name == "wlr":
         try:
@@ -49,25 +64,24 @@ def _resolve_backend(name=None):
             raise RuntimeError(
                 "backend 'wlr' requires the wayland extra: " + _WAYLAND_HINT
             ) from exc
-        return WlrBackend()
+        return WlrBackend(**options)
 
     if name == "portal":
         try:
             from .portal import PortalBackend
         except ImportError as exc:
             raise RuntimeError(
-                "backend 'portal' requires the wayland-portal extra: "
-                + _PORTAL_HINT
+                "backend 'portal' requires the portal extra: " + _PORTAL_HINT
             ) from exc
-        return PortalBackend()
+        return PortalBackend(**options)
 
     if name == "windows":
         from .windows import WindowsBackend
-        return WindowsBackend()
+        return WindowsBackend(**options)
 
     if name == "macos":
         from .macos import MacosBackend
-        return MacosBackend()
+        return MacosBackend(**options)
 
     raise ValueError(
         "unknown backend {!r}; expected one of "
@@ -95,9 +109,34 @@ def _autodetect():
             pass
         try:
             from .portal import PortalBackend
+            # Constructing one probes for PyGObject and GStreamer, so a
+            # session without the extra raises here and falls through
+            # rather than claiming every GNOME and KDE desktop for a
+            # backend that cannot work.
             return PortalBackend()
-        except Exception:
-            pass
+        except Exception as exc:
+            # A declined screen-share must not become a silent fallback:
+            # XWayland would then capture the very screen the user just
+            # refused to share.
+            if type(exc).__name__ == "PortalCancelled":
+                raise
+            # Nor must a typo. $FASTGRAB_PORTAL_PERSIST is validated in
+            # the constructor, and "this value is not a persist mode" is
+            # a configuration error, not "this backend is unavailable" --
+            # swallowing it would answer a misspelt setting by quietly
+            # capturing through XWayland instead, losing native Wayland
+            # windows, with nothing said.
+            #
+            # By name, not isinstance(exc, ValueError):
+            # gi.require_version() raises a bare ValueError for a
+            # missing typelib, so catching the base class here would
+            # turn "GStreamer introspection is not installed" -- an
+            # ordinary partial install -- into a hard failure of
+            # Screenshot() instead of the XWayland fallback that works.
+            if type(exc).__name__ == "PortalConfigError":
+                raise
+            # Everything else here does mean the backend is unusable,
+            # which is what the fallback is for.
         # Wayland session but no working Wayland backend — fall through to
         # X11/XWayland, which still works for X11 clients in a Wayland session.
 
