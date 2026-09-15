@@ -278,7 +278,13 @@ def build_parser():
         help="obscure the whole captured frame",
     )
     p.add_argument(
-        "--blur-method", default="box", choices=list(BLUR_METHODS),
+        # default=None, not "box", so that an explicitly typed
+        # --blur-method box is still distinguishable from not passing the
+        # option at all. Every other --blur-* option already works this
+        # way; leaving this one with a real default meant "box" -- and
+        # only "box" -- slipped past the missing-target check below and
+        # recorded in the clear.
+        "--blur-method", default=None, choices=list(BLUR_METHODS),
         help="how blurred regions are obscured (default: box). fill and "
              "pixelate-random destroy the pixels outright; "
              "pixelate-random-shuffle keeps the real tile colours but "
@@ -554,7 +560,7 @@ def _main(argv=None):
     blur = True if args.blur_all else args.blur
     blur_style = None
     blur_tuned = (
-        args.blur_method != "box" or args.blur_radius is not None
+        args.blur_method is not None or args.blur_radius is not None
         or args.blur_block is not None or args.blur_color is not None
         or args.blur_seed is not None or args.blur_image is not None
         or args.blur_image_fit is not None
@@ -566,6 +572,9 @@ def _main(argv=None):
             "--blur-method/--blur-radius/--blur-block/--blur-color need a "
             "target: pass --blur X,Y,W,H or --blur-all"
         )
+    # The method actually used, once "not supplied" has been told apart
+    # from "supplied as the default".
+    blur_method = args.blur_method or BlurStyle().method
     if blur_tuned:
         # Each tuning flag belongs to specific methods. Accepting
         # --blur-color with a box blur would leave the user believing
@@ -593,7 +602,7 @@ def _main(argv=None):
         ]
         ignored = [
             name for name in given
-            if args.blur_method not in applies_to[name]
+            if blur_method not in applies_to[name]
         ]
         if ignored:
             parser.error(
@@ -602,7 +611,7 @@ def _main(argv=None):
                 "an error".format(
                     " and ".join(ignored),
                     "does" if len(ignored) == 1 else "do",
-                    args.blur_method,
+                    blur_method,
                     ", ".join(
                         sorted({m for n in ignored for m in applies_to[n]})
                     ),
@@ -614,7 +623,7 @@ def _main(argv=None):
             cover = _load_cover_image(parser, args.blur_image)
         try:
             blur_style = BlurStyle(
-                method=args.blur_method,
+                method=blur_method,
                 radius=(args.blur_radius if args.blur_radius is not None
                         else BlurStyle().radius),
                 block=(args.blur_block if args.blur_block is not None

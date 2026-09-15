@@ -18,6 +18,7 @@ import time
 import numpy
 import pytest
 
+from fastgrab.effects import BLUR_METHODS
 from fastgrab.recording import (
     BlurStyle,
     SUBTITLE_BACKENDS,
@@ -997,10 +998,20 @@ def test_cli_blur_and_blur_all_are_mutually_exclusive():
         ])
 
 
-def test_cli_blur_tuning_without_a_target_is_an_error(capsys):
+@pytest.mark.parametrize("method", list(BLUR_METHODS))
+def test_cli_blur_tuning_without_a_target_is_an_error(capsys, method):
+    """Every method, not just an interesting one.
+
+    This checked "fill" alone, and "box" was the one value that got
+    through: it was also the parser's default, so an explicitly typed
+    --blur-method box was indistinguishable from not passing the option,
+    the missing-target check stayed quiet, and the recording came out
+    unredacted with no error at all. Exactly the failure the error
+    message below exists to prevent, for one method out of seven.
+    """
     with pytest.raises(SystemExit):
         recording_cli.main(["--fullscreen", "-o", "x.mp4",
-                            "--blur-method", "fill"])
+                            "--blur-method", method])
     assert "--blur" in capsys.readouterr().err
 
 

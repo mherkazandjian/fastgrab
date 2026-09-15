@@ -6,7 +6,14 @@ module only ever touches a numpy array handed to it.
 import numpy
 import pytest
 
-from fastgrab.effects import (
+# Pure numpy: no display, no backend, no C extension. Without this the
+# autouse require_some_display fixture in conftest skips the whole module
+# on a headless Linux box -- all of it, silently -- because that fixture
+# only stands aside for suites that say so. The other display-independent
+# suites (macos, wlr, windows backends) carry the same marker.
+pytestmark = pytest.mark.no_display
+
+from fastgrab.effects import (  # noqa: E402
     BLUR_METHODS,
     IMAGE_FITS,
     BlurStyle,
