@@ -27,6 +27,12 @@ services:
     volumes:
       - .:/app
       - pip-cache:/root/.cache/pip
+    environment:
+      # A local Xvfb in this image shares the IPC namespace, so MIT-SHM
+      # cannot legitimately fail here. Declaring that lets test_xshm
+      # assert the fast path actually engaged, rather than passing
+      # whichever path ran.
+      FASTGRAB_EXPECT_XSHM: "1"
     # "not portal" as well as "not wayland": those tests need a PipeWire
     # graph this image has none of. Today they never reach selection --
     # both portal modules importorskip("gi"), which is what keeps

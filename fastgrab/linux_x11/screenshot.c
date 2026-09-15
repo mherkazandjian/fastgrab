@@ -552,6 +552,16 @@ static int fg_shm_ensure(Display *dpy, int width, int height)
         fg_shm_state = FG_SHM_OFF;
         return 0;
     }
+    /* Marked for destruction the moment it is attached, rather than
+     * after the handshake below: the segment then lives until the last
+     * detach and goes away by itself. Marking it afterwards left a
+     * window two server round trips wide in which a server death
+     * longjmps out through fg_shm_release() -- which does not mark --
+     * or a SIGKILL lands, and the segment survives in ipcs until the
+     * machine is rebooted. That is 33 MB at 4K, every time it happens.
+     * Linux permits attaching a segment that is already marked, and
+     * build.py compiles this extension on Linux only. */
+    shmctl(fg_shm_info.shmid, IPC_RMID, NULL);
     fg_shm_img->data = fg_shm_info.shmaddr;
 
     /* A refused attach comes back as an asynchronous protocol error, so
@@ -561,7 +571,6 @@ static int fg_shm_ensure(Display *dpy, int width, int height)
     if (fg_xerr_code != 0) {
         fg_xerr_code = 0;
         shmdt(fg_shm_info.shmaddr);
-        shmctl(fg_shm_info.shmid, IPC_RMID, NULL);
         fg_shm_info.shmaddr = NULL;
         fg_shm_img->data = NULL;
         XDestroyImage(fg_shm_img);
@@ -569,11 +578,6 @@ static int fg_shm_ensure(Display *dpy, int width, int height)
         fg_shm_state = FG_SHM_OFF;
         return 0;
     }
-
-    /* Marked for destruction while still attached: the segment lives
-     * until the last detach and then goes away by itself, so a process
-     * that dies mid-capture does not leave anything behind in ipcs. */
-    shmctl(fg_shm_info.shmid, IPC_RMID, NULL);
 
     fg_shm_width = width;
     fg_shm_height = height;
@@ -677,10 +681,26 @@ static void fg_copy_image(uint8_t *dst, const uint8_t *src,
 static void fg_drop_display(int close_connection)
 {
     if (fg_display != NULL) {
-        /* Before the connection goes: the segment is attached to *this*
-         * server, and the detach has to ride the socket that is about to
-         * be closed. */
-        fg_shm_release(fg_display, close_connection);
+        /* Never talks to the server, not even when the connection is
+         * being closed properly. XShmDetach + XSync is real X I/O, and
+         * this runs *outside* any armed region: fg_close_display_guarded
+         * arms only around its own XCloseDisplay, and both callers that
+         * reach here with close_connection=1 -- the DISPLAY-switch
+         * branch of fg_acquire_display, which runs before fg_try_once
+         * arms, and _close_display, which never arms -- have nothing
+         * installed. On a connection that has already died that sync
+         * reaches Xlib's default IO handler, which exits the
+         * interpreter: exactly the failure
+         * test_switching_away_from_a_dead_display_does_not_exit exists
+         * to prevent.
+         *
+         * Nothing is lost by staying quiet. The caller either closes the
+         * connection immediately below, and the server releases its
+         * attach when the client disconnects, or abandons the socket
+         * after a fork, where a detach must not be written anyway. The
+         * segment is already marked IPC_RMID, so the local shmdt() in
+         * fg_shm_release is what actually frees it. */
+        fg_shm_release(fg_display, 0);
         if (close_connection)
             fg_close_display_guarded(fg_display);
         else

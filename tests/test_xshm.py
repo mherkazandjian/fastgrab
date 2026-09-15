@@ -70,8 +70,14 @@ def _child(env_overrides):
     proc = subprocess.run([sys.executable, "-c", _CAPTURE_AND_DIGEST],
                           capture_output=True, text=True, env=env, timeout=120)
     if proc.returncode != 0:
-        pytest.skip("capture child failed (no usable DISPLAY?): %s"
-                    % proc.stderr.strip()[-300:])
+        # Not skip(). Any death here -- a crash in the extension, a
+        # segfault in the parallel copy, a missing python-xlib -- used
+        # to report as "skipped", which reads as green. conftest's
+        # require_some_display owns the no-display case, and this module
+        # only runs where the C extension imported, so a child that
+        # cannot finish is a failure.
+        pytest.fail("capture child exited %d: %s"
+                    % (proc.returncode, proc.stderr.strip()[-500:]))
     digest, shm, count = proc.stdout.strip().split()
     return digest, shm == "True", int(count)
 
@@ -100,11 +106,59 @@ def test_shm_and_fallback_capture_identical_pixels():
         "shm and XGetImage disagree on the same screen: %s vs %s"
         % (shm_digest, plain_digest)
     )
-    # Not asserted: that shm_used is True. A build without the extension,
-    # or a remote DISPLAY, legitimately falls back — and the digests
-    # matching is the guarantee that actually matters.
+    # Not asserted here: that shm_used is True. A build without the
+    # extension, or a remote DISPLAY, legitimately falls back — and the
+    # digests matching is the guarantee that actually matters. Where the
+    # fast path *is* guaranteed, the next test says so and asserts it.
     if shm_used:
         assert shm_count >= 1
+
+
+def test_the_shm_path_really_runs_where_it_is_guaranteed():
+    """A fallback nobody notices is the whole risk of this change.
+
+    Every other test in this file passes identically on either path —
+    which is the point, and also why none of them would notice the shm
+    path disappearing altogether. A typo in the XShmQueryExtension
+    check, or issue #72's stale .so being imported instead of the
+    freshly built one, would put every capture back on XGetImage while
+    CI stayed green and the README went on advertising an order of
+    magnitude it no longer delivered.
+
+    So where shm cannot legitimately fail — a local Xvfb inside this
+    project's own image, sharing the IPC namespace — the compose service
+    says so with FASTGRAB_EXPECT_XSHM=1, and this asserts it engaged.
+    """
+    if os.environ.get("FASTGRAB_EXPECT_XSHM") != "1":
+        pytest.skip(
+            "shm is not guaranteed on this display; the docker compose "
+            "'test' service sets FASTGRAB_EXPECT_XSHM=1 where it is"
+        )
+    _, shm_used, shm_count = _child({})
+    assert shm_used is True, (
+        "the shm path did not engage on a display where it must: the "
+        "extension probe, the attach, or the build has regressed, and "
+        "every capture is silently taking the slow XGetImage path"
+    )
+    assert shm_count >= 1
+
+
+def test_the_shipped_hot_path_matches_the_serial_copy():
+    """shm *and* the parallel copy — what every >=1080p capture runs.
+
+    The threshold test below forces FASTGRAB_NO_XSHM=1 on both children,
+    and the default child captures 640x480, which is under the 4 MiB
+    threshold and so copies serially. That left the one combination
+    users actually get with no coverage at all: a chunking bug that only
+    appears when the OpenMP loop reads out of the shm segment would pass
+    the entire suite.
+    """
+    serial, _, _ = _child({"FASTGRAB_OMP_MIN_BYTES": "0"})
+    parallel, _, _ = _child({"FASTGRAB_OMP_MIN_BYTES": "1"})
+    assert serial == parallel, (
+        "the parallel copy out of the shm segment disagrees with the "
+        "serial one: %s vs %s" % (serial, parallel)
+    )
 
 
 @pytest.mark.parametrize("threshold", ["0", "1"])
