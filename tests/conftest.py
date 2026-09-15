@@ -22,6 +22,7 @@ if sys.platform != "linux":
     collect_ignore.extend([
         "test_integration_wlr.py",   # imports fastgrab.backends.wlr → pywayland
         "test_x11_lowlevel.py",      # imports fastgrab._linux_x11
+        "test_xshm.py",              # imports fastgrab._linux_x11
     ])
 
 

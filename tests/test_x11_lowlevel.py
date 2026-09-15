@@ -669,6 +669,14 @@ try:
     if cached["display"] != dead_display or not cached["connected"]:
         finish(2, "SETUP-FAILED: cache holds %r" % cached)
 
+    # A real capture, not just resolution(): the shm segment is only
+    # attached by a screenshot, and it is the shm teardown -- XShmDetach
+    # plus XSync -- that makes dropping a dead connection fatal. Without
+    # a frame here fg_shm_release() early-returns on a NULL image and
+    # this script sails past the bug it exists to catch.
+    import numpy
+    _linux_x11.screenshot(0, 0, numpy.zeros((16, 16, 4), dtype=numpy.uint8))
+
     stop(dead)
     time.sleep(0.2)
 
@@ -695,6 +703,13 @@ def test_switching_away_from_a_dead_display_does_not_exit():
     delegation branch, and Xlib's fatal default exited the interpreter --
     even though the display the caller had just switched *to* was
     healthy and the call was about to succeed.
+
+    The script captures a frame before killing the server, so a segment
+    is attached when the drop happens. That matters because the shm
+    teardown is a second piece of X I/O on the same path, running even
+    further outside the armed region than XCloseDisplay did: with no
+    frame captured the release early-returns and the whole hazard is
+    invisible.
     """
     result, report = _run_x_fault_script(_SWITCHED_DISPLAY_SCRIPT, displays=2)
     assert result.returncode == 0, report

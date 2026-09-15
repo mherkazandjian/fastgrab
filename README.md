@@ -1,7 +1,7 @@
 # FastGrab
 
 ``Fastgrab`` is an opensouce high frame rate screen capture package. A typical
-capture frame rate at a resolution of 1080p on a modern machine is ~200 fps.
+capture frame rate at a resolution of 1080p on a modern machine is ~2600 fps.
 There are several other such packages in the wild that are opensource as well, 
 but none of them is as fast or provides a simple way of obtaining the captures
 image as a numpy array out of the box. The default behavior of ``fastgrab`` is
@@ -13,16 +13,33 @@ Typical capture frame rate on a modern machine
 
 resolution    | fps
 ------------- | -----
-360p          | 3000
-720p          | 500
-1080p         | 208
-4K            | 44
-8K            | 11
+360p          | 13900
+720p          | 5700
+1080p         | 2600
+4K            | 340
+8K            | 109
 
-Measured with [examples/benchmark.py](https://github.com/mherkazandjian/fastgrab/blob/main/examples/benchmark.py)
-on a single core of an AMD EPYC 9555 under Linux/X11, 800 frames per
-resolution. Capture is single threaded, so the frame rate tracks single-core
-clock and memory bandwidth; figures on other machines will differ.
+Measured with [examples/benchmark.py](https://github.com/mherkazandjian/fastgrab/blob/main/examples/benchmark.py),
+800 frames per resolution, on:
+
+ - **CPU**: AMD EPYC 9555 (64-core Zen 5), **8 cores** used for the run
+   (``taskset -c 0-7``)
+ - **GPU**: NVIDIA RTX PRO 6000 Blackwell Server Edition, 96 GB, driver
+   580.178.04 — **not involved in these numbers**. Capture ran against an
+   ``Xvfb`` software framebuffer in system RAM, so no pixel goes near the
+   GPU. Capturing a real GPU-driven X screen is *slower*, not faster,
+   because the framebuffer then lives in VRAM and has to be read back
+   across PCIe.
+ - **OS**: Ubuntu 22.04.5 LTS, kernel 7.0.0, Python 3.10.12
+ - **Display**: ``Xvfb`` at 7680x4320x24 on the same machine, so the
+   MIT-SHM fast path is available and large frames get an OpenMP team to
+   copy them
+
+A **remote** display cannot use shared memory and falls back to
+``XGetImage``, which costs roughly an order of magnitude: on the same
+machine that is 221 fps at 1080p rather than 2601. Figures on other
+machines will differ — capture is bound by memory bandwidth and, below the
+parallel-copy threshold, by single-core clock.
 
 # Usage example
 
@@ -218,11 +235,18 @@ Per-platform extras:
  - **Linux/X11**: the C extension is compiled on install, so you need a C
    toolchain plus the Python and X11 headers:
 
-   - Debian/Ubuntu: ``sudo apt install build-essential python3-dev libx11-dev``
-   - Fedora: ``sudo dnf install gcc python3-devel libX11-devel``
+   - Debian/Ubuntu: ``sudo apt install build-essential python3-dev libx11-dev libxext-dev``
+   - Fedora: ``sudo dnf install gcc python3-devel libX11-devel libXext-devel``
 
-   Runtime needs only ``libX11`` and ``libgomp1`` (``libgomp`` on Fedora),
-   which are present on any desktop. ``Python.h: No such file`` means the
+   Runtime needs ``libX11``, ``libXext`` and whichever OpenMP runtime
+   the compiler used: ``libgomp1`` for a gcc build (``libgomp`` on
+   Fedora), ``libomp`` for a clang one. All are present on any desktop.
+   If the toolchain cannot provide OpenMP at build time the extension is
+   built without it and says so on stderr — capture still works and
+   still uses MIT-SHM, large frames are just copied on one core. That is
+   decided when the package is compiled, so installing an OpenMP runtime
+   afterwards does not switch it on; reinstall to pick it up.
+   ``Python.h: No such file`` means the
    Python headers are missing (``python3-dev``); ``stdio.h: No such file``
    means the toolchain headers are (``build-essential``). Tested on
    Debian-based Python images, Ubuntu 24.04 and Fedora 44, Python 3.10–3.14.
@@ -234,6 +258,45 @@ Per-platform extras:
    fastgrab refuses that layout with a message naming the masks it found
    rather than returning wrong colours. ``xdpyinfo | grep "depth of root"``
    says which you have.
+
+   Capture uses the **MIT-SHM** X extension when it can: the server
+   writes the region straight into a shared memory segment instead of
+   pushing every pixel through the X socket, which is worth roughly
+   4-10x depending on resolution. It needs client and server on the same
+   machine, so a remote ``DISPLAY`` (or a server built without the
+   extension) falls back to ``XGetImage`` automatically — one failed
+   probe per connection, not per frame. Rows are copied out across an
+   OpenMP team once a frame is large enough to pay for it. Two
+   environment variables override the defaults, mostly for debugging:
+   ``FASTGRAB_NO_XSHM=1`` forces the plain path, and
+   ``FASTGRAB_OMP_MIN_BYTES`` sets the frame size in bytes above which
+   the copy is parallelised (``0`` keeps it serial always).
+
+   **After a fork, the copy goes back to being serial.** GNU libgomp is
+   not fork-safe: a process that has run a parallel region keeps its
+   thread pool, ``fork()`` copies the bookkeeping but not the threads,
+   and the child's next parallel region waits forever for workers that do
+   not exist. So a child that inherited fastgrab — a ``multiprocessing``
+   worker under the ``fork`` start method, say — copies serially. It
+   keeps the shared-memory path, which is the larger half of the win, and
+   gives up roughly a quarter of the combined speed at 1080p.
+
+   Processes that get a clean runtime are unaffected: the ``spawn`` start
+   method, or a ``forkserver`` whose server process never captured.
+
+   Importing fastgrab inside the worker instead of preloading it helps
+   only when nothing in the parent had already started an OpenMP pool.
+   The guard stamps its pid when the extension is imported, so a worker
+   that imports *after* the fork looks like an ordinary first import and
+   re-arms the parallel copy — which still deadlocks if some other
+   library warmed libgomp before the fork. ``spawn`` is the answer that
+   does not depend on knowing what else is in the process.
+
+   If you know your children fork from a runtime that never started an
+   OpenMP pool, ``FASTGRAB_UNSAFE_OMP_AFTER_FORK=1`` turns the guard off
+   and keeps the parallel copy everywhere. It is named that way on
+   purpose: fastgrab cannot verify the precondition, and getting it wrong
+   is a hang rather than an error.
  - **Linux/Wayland (wlroots)**: a wlroots-based compositor (Sway,
    Hyprland, river, niri, cage) for the no-prompt path; the ``[wayland]``
    extra (``pip install fastgrab[wayland]``) pulls in ``pywayland``.
