@@ -18,7 +18,9 @@ import time
 import numpy
 import pytest
 
+from fastgrab.effects import BLUR_METHODS
 from fastgrab.recording import (
+    BlurStyle,
     SUBTITLE_BACKENDS,
     ClickStyle,
     FfmpegEncoder,
@@ -927,6 +929,230 @@ def test_recorder_smoke_mp4(tmp_path):
         assert "h264" in result.stdout.strip().lower()
 
 
+# --------------------------------------------------------------------
+# Blur / redaction wiring
+# --------------------------------------------------------------------
+
+class _BlurStubRecorder:
+    """Captures the kwargs main() builds for the blur flags.
+
+    Named apart from the _StubRecorder further down, which upstream added
+    for the output-claim tests and which takes a stats dict positionally.
+    """
+
+    last = None
+
+    def __init__(self, **kwargs):
+        _BlurStubRecorder.last = kwargs
+
+    def record(self, **_kwargs):
+        # encoder_started=False because this stub genuinely writes
+        # nothing. Claiming frames for a file that does not exist is what
+        # the output-claim check upstream now (correctly) rejects, and
+        # these tests are about the kwargs main() builds, not the encode.
+        return {
+            "frames": 0, "written_frames": 0, "elapsed_seconds": 0.0,
+            "achieved_fps": 0.0, "output": "stub.mp4",
+            "encoder_started": False,
+        }
+
+
+def _run_cli(monkeypatch, argv):
+    monkeypatch.setattr(recording_cli, "Recorder", _BlurStubRecorder)
+    _BlurStubRecorder.last = None
+    # main() installs its own SIGINT/SIGTERM handlers so ffmpeg can
+    # finalise the container on Ctrl-C. Put the originals back, or the
+    # rest of the pytest session runs with Ctrl-C disarmed.
+    saved = {sig: signal.getsignal(sig)
+             for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        assert recording_cli.main(argv) == 0
+    finally:
+        for sig, handler in saved.items():
+            signal.signal(sig, handler)
+    return _BlurStubRecorder.last
+
+
+def test_cli_parse_blur_region_allows_single_pixel_sizes():
+    assert recording_cli._parse_blur_region("1,2,3,4") == (1, 2, 3, 4)
+    assert recording_cli._parse_blur_region("0,0,1,1") == (0, 0, 1, 1)
+    for bad in ("1,2,3", "a,b,c,d", "-1,0,10,10", "0,0,0,4"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            recording_cli._parse_blur_region(bad)
+
+
+def test_cli_blur_is_repeatable():
+    parser = recording_cli.build_parser()
+    args = parser.parse_args([
+        "--fullscreen", "-o", "x.mp4",
+        "--blur", "0,0,10,10", "--blur", "20,20,5,5",
+    ])
+    assert args.blur == [(0, 0, 10, 10), (20, 20, 5, 5)]
+
+
+def test_cli_blur_and_blur_all_are_mutually_exclusive():
+    parser = recording_cli.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args([
+            "--fullscreen", "-o", "x.mp4", "--blur", "0,0,10,10", "--blur-all",
+        ])
+
+
+@pytest.mark.parametrize("method", list(BLUR_METHODS))
+def test_cli_blur_tuning_without_a_target_is_an_error(capsys, method):
+    """Every method, not just an interesting one.
+
+    This checked "fill" alone, and "box" was the one value that got
+    through: it was also the parser's default, so an explicitly typed
+    --blur-method box was indistinguishable from not passing the option,
+    the missing-target check stayed quiet, and the recording came out
+    unredacted with no error at all. Exactly the failure the error
+    message below exists to prevent, for one method out of seven.
+    """
+    with pytest.raises(SystemExit):
+        recording_cli.main(["--fullscreen", "-o", "x.mp4",
+                            "--blur-method", method])
+    assert "--blur" in capsys.readouterr().err
+
+
+def test_cli_blur_regions_reach_the_recorder(monkeypatch):
+    kwargs = _run_cli(monkeypatch, [
+        "--fullscreen", "-o", "x.mp4", "--blur", "10,20,30,40",
+    ])
+    assert kwargs["blur"] == [(10, 20, 30, 40)]
+    # No tuning flags → default style, built by BlurStyle itself.
+    assert kwargs["blur_style"] is None
+
+
+def test_cli_blur_all_becomes_true(monkeypatch):
+    kwargs = _run_cli(monkeypatch, ["--fullscreen", "-o", "x.mp4", "--blur-all"])
+    assert kwargs["blur"] is True
+
+
+def test_cli_without_blur_passes_nothing(monkeypatch):
+    kwargs = _run_cli(monkeypatch, ["--fullscreen", "-o", "x.mp4"])
+    assert kwargs["blur"] is None
+    assert kwargs["blur_style"] is None
+
+
+def test_cli_blur_style_built_from_flags(monkeypatch):
+    style = _run_cli(monkeypatch, [
+        "--fullscreen", "-o", "x.mp4", "--blur-all",
+        "--blur-method", "fill", "--blur-color", "1,2,3",
+    ])["blur_style"]
+    assert style.method == "fill"
+    assert style.color == (1, 2, 3)
+
+    style = _run_cli(monkeypatch, [
+        "--fullscreen", "-o", "x.mp4", "--blur", "0,0,80,40",
+        "--blur-method", "gaussian", "--blur-radius", "7",
+    ])["blur_style"]
+    assert style.method == "gaussian"
+    assert style.radius == 7
+
+    style = _run_cli(monkeypatch, [
+        "--fullscreen", "-o", "x.mp4", "--blur", "0,0,80,40",
+        "--blur-method", "pixelate", "--blur-block", "9",
+    ])["blur_style"]
+    assert style.method == "pixelate"
+    assert style.block == 9
+
+
+@pytest.mark.parametrize("flags,ignored", [
+    (["--blur-color", "0,0,0"], "--blur-color"),
+    (["--blur-method", "box", "--blur-block", "8"], "--blur-block"),
+    (["--blur-method", "fill", "--blur-radius", "4"], "--blur-radius"),
+    (["--blur-method", "pixelate", "--blur-radius", "4"], "--blur-radius"),
+])
+def test_cli_rejects_options_the_method_would_ignore(flags, ignored, capsys):
+    """--blur-color with a box blur must not quietly leave a blur behind."""
+    with pytest.raises(SystemExit):
+        recording_cli.main(["--fullscreen", "-o", "x.mp4", "--blur-all"]
+                           + flags)
+    err = capsys.readouterr().err
+    assert ignored in err
+    assert "silently ignored" in err
+
+
+def test_cli_rejects_a_pixelate_block_that_changes_nothing(capsys):
+    with pytest.raises(SystemExit):
+        recording_cli.main([
+            "--fullscreen", "-o", "x.mp4", "--blur-all",
+            "--blur-method", "pixelate", "--blur-block", "1",
+        ])
+    assert "leaves the region unchanged" in capsys.readouterr().err
+
+
+def test_cli_rejects_unknown_blur_method():
+    parser = recording_cli.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--fullscreen", "-o", "x.mp4",
+                           "--blur-all", "--blur-method", "swirl"])
+
+
+@pytest.mark.skipif(not _x11_available(), reason="needs X11 DISPLAY")
+def test_recorder_forwards_blur_to_its_screenshot():
+    style = BlurStyle(method="fill", color=(1, 2, 3))
+    rec = Recorder(
+        output_path="/tmp/unused.mp4", bbox=(0, 0, 64, 48), backend="x11",
+        blur=[(0, 0, 10, 10)], blur_style=style,
+    )
+    assert rec._grab.blur == ((0, 0, 10, 10),)
+    assert rec._grab.blur_style is style
+
+
+@pytest.mark.skipif(not _x11_available(), reason="needs X11 DISPLAY")
+def test_recorder_blur_can_be_changed_after_construction():
+    """Regression: rec.blur was a copy, so updates never reached recording."""
+    rec = Recorder(
+        output_path="/tmp/unused.mp4", bbox=(0, 0, 64, 48), backend="x11",
+    )
+    assert rec.blur is None
+
+    rec.blur = [(0, 0, 16, 16)]
+    rec.blur_style = BlurStyle(method="fill", color=(7, 11, 13))
+    assert rec._grab.blur == ((0, 0, 16, 16),)
+    assert rec._grab.blur_style is rec.blur_style
+
+    frame = rec._grab.capture(bbox=(0, 0, 64, 48))
+    assert (frame[0:16, 0:16, 0] == 7).all()
+
+    # And both setters validate, like the constructor does.
+    with pytest.raises(ValueError):
+        rec.blur = [(0, 0, 0, 16)]
+    with pytest.raises(TypeError):
+        rec.blur_style = "fill"
+
+
+@pytest.mark.skipif(not _x11_available(), reason="needs X11 DISPLAY")
+def test_recorder_frames_are_redacted_before_overlays():
+    """The frame handed to the encoder must already be blurred."""
+    rec = Recorder(
+        output_path="/tmp/unused.mp4", bbox=(0, 0, 64, 48), backend="x11",
+        blur=[(0, 0, 16, 16)],
+        blur_style=BlurStyle(method="fill", color=(7, 11, 13)),
+    )
+    frame = rec._grab.capture(bbox=(0, 0, 64, 48))
+    assert (frame[0:16, 0:16, 0] == 7).all()
+    assert (frame[0:16, 0:16, 1] == 11).all()
+    assert (frame[0:16, 0:16, 2] == 13).all()
+
+
+def test_cli_blur_all_warns_about_the_cost(monkeypatch, capsys):
+    _run_cli(monkeypatch, ["--fullscreen", "-o", "x.mp4", "--blur-all"])
+    assert "below the target fps" in capsys.readouterr().err
+
+
+def test_cli_blur_all_with_fill_is_quiet(monkeypatch, capsys):
+    _run_cli(monkeypatch, ["--fullscreen", "-o", "x.mp4", "--blur-all",
+                           "--blur-method", "fill"])
+    assert "below the target fps" not in capsys.readouterr().err
+
+
+def test_cli_blur_regions_do_not_warn(monkeypatch, capsys):
+    _run_cli(monkeypatch, ["--fullscreen", "-o", "x.mp4",
+                           "--blur", "0,0,100,100"])
+    assert "below the target fps" not in capsys.readouterr().err
 # -------- ffmpeg's stderr must never be able to block it --------
 #
 # stderr used to be a subprocess.PIPE that nothing read until close().
@@ -1256,6 +1482,127 @@ def test_a_subtitle_renders_its_apostrophe(tmp_path):
     assert not numpy.array_equal(got, bare), "the apostrophe was dropped"
 
 
+def test_cli_accepts_the_randomised_pixelate_methods(monkeypatch):
+    for method in ("pixelate-random", "pixelate-random-shuffle"):
+        style = _run_cli(monkeypatch, [
+            "--fullscreen", "-o", "x.mp4", "--blur", "0,0,80,40",
+            "--blur-method", method, "--blur-block", "12", "--blur-seed", "7",
+        ])["blur_style"]
+        assert style.method == method
+        assert style.block == 12
+        assert style.seed == 7
+
+
+def test_cli_blur_seed_needs_a_random_method(capsys):
+    """--blur-seed does nothing for plain pixelate, so it must not be taken."""
+    with pytest.raises(SystemExit):
+        recording_cli.main(["--fullscreen", "-o", "x.mp4", "--blur-all",
+                            "--blur-method", "pixelate", "--blur-seed", "3"])
+    err = capsys.readouterr().err
+    assert "--blur-seed" in err and "silently ignored" in err
+
+
+def test_cli_blur_block_applies_to_every_pixelate_method(monkeypatch):
+    """--blur-block used to be accepted only for plain pixelate."""
+    for method in ("pixelate", "pixelate-random", "pixelate-random-shuffle"):
+        style = _run_cli(monkeypatch, [
+            "--fullscreen", "-o", "x.mp4", "--blur-all",
+            "--blur-method", method, "--blur-block", "6",
+        ])["blur_style"]
+        assert style.block == 6
+
+
+def test_cli_rejects_a_negative_blur_seed():
+    parser = recording_cli.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--fullscreen", "-o", "x.mp4",
+                           "--blur-method", "pixelate-random",
+                           "--blur-seed", "-1"])
+
+
+def _pillow_available():
+    try:
+        import PIL  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def test_cli_blur_image_needs_the_image_method(capsys):
+    with pytest.raises(SystemExit):
+        recording_cli.main(["--fullscreen", "-o", "x.mp4", "--blur-all",
+                            "--blur-method", "fill",
+                            "--blur-image", "/tmp/nope.png"])
+    err = capsys.readouterr().err
+    assert "--blur-image" in err and "silently ignored" in err
+
+
+@pytest.mark.skipif(_pillow_available(), reason="Pillow is installed")
+def test_cli_blur_image_without_pillow_says_how_to_get_it(capsys):
+    """The decoder is optional; the error has to name the extra."""
+    with pytest.raises(SystemExit):
+        recording_cli.main(["--fullscreen", "-o", "x.mp4", "--blur-all",
+                            "--blur-method", "image",
+                            "--blur-image", "/tmp/nope.png"])
+    assert "fastgrab[gui]" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(not _pillow_available(), reason="needs Pillow")
+def test_cli_blur_image_loads_and_converts_to_bgr(monkeypatch, tmp_path):
+    from PIL import Image
+
+    path = tmp_path / "cover.png"
+    Image.new("RGB", (4, 3), (255, 0, 0)).save(path)   # pure red, RGB
+    style = _run_cli(monkeypatch, [
+        "--fullscreen", "-o", "x.mp4", "--blur", "0,0,80,40",
+        "--blur-method", "image", "--blur-image", str(path),
+    ])["blur_style"]
+    assert style.image.shape == (3, 4, 3)
+    # red arrives in the blue-last order the frames use
+    assert tuple(style.image[0, 0]) == (0, 0, 255)
+
+
+@pytest.mark.skipif(not _pillow_available(), reason="needs Pillow")
+def test_cli_blur_image_reports_an_unreadable_file(capsys, tmp_path):
+    bad = tmp_path / "not-an-image.png"
+    bad.write_text("definitely not a png")
+    with pytest.raises(SystemExit):
+        recording_cli.main(["--fullscreen", "-o", "x.mp4", "--blur-all",
+                            "--blur-method", "image", "--blur-image", str(bad)])
+    assert "could not read" in capsys.readouterr().err
+
+
+def test_cli_blur_image_fit_defaults_and_choices(monkeypatch, tmp_path):
+    parser = recording_cli.build_parser()
+    args = parser.parse_args(["--fullscreen", "-o", "x.mp4"])
+    assert args.blur_image_fit is None          # unset means BlurStyle default
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--fullscreen", "-o", "x.mp4",
+                           "--blur-image-fit", "squish"])
+
+
+def test_cli_blur_image_fit_needs_the_image_method(capsys):
+    with pytest.raises(SystemExit):
+        recording_cli.main(["--fullscreen", "-o", "x.mp4", "--blur-all",
+                            "--blur-method", "fill",
+                            "--blur-image-fit", "crop"])
+    err = capsys.readouterr().err
+    assert "--blur-image-fit" in err and "silently ignored" in err
+
+
+@pytest.mark.skipif(not _pillow_available(), reason="needs Pillow")
+def test_cli_blur_image_fit_reaches_the_style(monkeypatch, tmp_path):
+    from PIL import Image
+
+    path = tmp_path / "cover.png"
+    Image.new("RGB", (8, 8), (0, 128, 255)).save(path)
+    for fit in ("crop", "fit", "stretch", "tile"):
+        style = _run_cli(monkeypatch, [
+            "--fullscreen", "-o", "x.mp4", "--blur", "0,0,80,40",
+            "--blur-method", "image", "--blur-image", str(path),
+            "--blur-image-fit", fit,
+        ])["blur_style"]
+        assert style.image_fit == fit
 # -------- what the CLI claims it wrote --------
 #
 # Ctrl-C during the countdown stops the recorder before ffmpeg is ever

@@ -83,3 +83,52 @@ def test_capture_subregion_with_offset_within_solid_field(paint_root):
     assert (img[:, :, R] == 0x12).all()
     assert (img[:, :, G] == 0x34).all()
     assert (img[:, :, B] == 0x56).all()
+
+
+def test_capture_with_fill_blur_redacts_the_region_only(paint_root):
+    """End-to-end: a real X11 capture, redacted before it reaches the caller."""
+    from fastgrab.effects import BlurStyle
+
+    paint_root("#0A141E")  # R=10, G=20, B=30
+    grab = screenshot.Screenshot(
+        blur_style=BlurStyle(method="fill", color=(1, 2, 3))
+    )
+    w, h = grab.screensize
+    bw, bh = min(64, w), min(48, h)
+    img = grab.capture(blur=[(0, 0, bw, bh)])
+
+    assert (img[0:bh, 0:bw, B] == 1).all()
+    assert (img[0:bh, 0:bw, G] == 2).all()
+    assert (img[0:bh, 0:bw, R] == 3).all()
+    # Outside the rectangle the painted colour is untouched.
+    assert (img[bh:, bw:, B] == 30).all()
+    assert (img[bh:, bw:, G] == 20).all()
+    assert (img[bh:, bw:, R] == 10).all()
+
+
+def test_capture_blur_regions_are_screen_absolute(paint_root):
+    """Regions are given in screen coordinates, then clipped to the bbox."""
+    from fastgrab.effects import BlurStyle
+
+    paint_root("#0A141E")
+    grab = screenshot.Screenshot(
+        blur_style=BlurStyle(method="fill", color=(9, 9, 9))
+    )
+    img = grab.capture(bbox=(100, 80, 64, 48), blur=[(110, 90, 16, 12)])
+    # Screen (110, 90) lands at frame (10, 10) after the bbox origin.
+    assert (img[10:22, 10:26, B] == 9).all()
+    assert (img[0:10, :, B] == 30).all()
+
+
+def test_box_blur_of_a_solid_field_is_still_that_field(paint_root):
+    """Averaging a uniform capture must not shift the BGRA values."""
+    from fastgrab.effects import BlurStyle
+
+    paint_root("#0A141E")
+    grab = screenshot.Screenshot(
+        blur=True, blur_style=BlurStyle(method="box", radius=6)
+    )
+    img = grab.capture(bbox=(0, 0, 128, 96))
+    assert (img[:, :, B] == 30).all()
+    assert (img[:, :, G] == 20).all()
+    assert (img[:, :, R] == 10).all()

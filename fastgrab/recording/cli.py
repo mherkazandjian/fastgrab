@@ -7,6 +7,16 @@ import signal
 import sys
 import threading
 
+from fastgrab.effects import (
+    BLUR_METHODS,
+    DEFAULT_BLOCK,
+    DEFAULT_IMAGE_FIT,
+    DEFAULT_RADIUS,
+    IMAGE_FITS,
+    PIXELATE_METHODS,
+    BlurStyle,
+)
+
 from .clicks import CLICK_PATTERNS, ClickStyle
 from .encoder import _local_output_path
 from .encoder import SUBTITLE_BACKENDS
@@ -26,7 +36,7 @@ XBINDKEYS_SNIPPET = """\
 """
 
 
-def _parse_region(value: str):
+def _parse_xywh(value: str, min_size: int):
     parts = value.split(",")
     if len(parts) != 4:
         raise argparse.ArgumentTypeError(
@@ -42,13 +52,25 @@ def _parse_region(value: str):
         raise argparse.ArgumentTypeError(
             "region origin must be non-negative, got {},{}".format(x, y)
         )
-    # Codecs aligned to yuv420p drop one odd pixel per dimension, so
-    # anything below 2 px rounds down to zero at encode time.
-    if w < 2 or h < 2:
+    if w < min_size or h < min_size:
         raise argparse.ArgumentTypeError(
-            "region width and height must be at least 2, got {}x{}".format(w, h)
+            "region width and height must be at least {}, got {}x{}".format(
+                min_size, w, h
+            )
         )
     return (x, y, w, h)
+
+
+def _parse_region(value: str):
+    # Codecs aligned to yuv420p drop one odd pixel per dimension, so a
+    # capture region below 2 px rounds down to zero at encode time.
+    return _parse_xywh(value, 2)
+
+
+def _parse_blur_region(value: str):
+    # Blur regions are clipped to the frame rather than encoded, so a
+    # single-pixel rectangle is meaningless but harmless.
+    return _parse_xywh(value, 1)
 
 
 def _positive_int(value: str):
@@ -61,6 +83,45 @@ def _positive_int(value: str):
     if iv <= 0:
         raise argparse.ArgumentTypeError(
             "value must be positive, got {}".format(iv)
+        )
+    return iv
+
+
+def _load_cover_image(parser, path):
+    """Decode --blur-image into a BGR numpy array.
+
+    Pillow is lazy and optional, exactly as python-xlib is for the click
+    overlays: the core blur takes an array and needs no decoder at all,
+    so only this convenience pays for one.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        parser.error(
+            "--blur-image needs Pillow to decode {}: "
+            "pip install fastgrab[gui]".format(path)
+        )
+    import numpy
+
+    try:
+        with Image.open(path) as handle:
+            rgb = numpy.asarray(handle.convert("RGB"), dtype=numpy.uint8)
+    except OSError as exc:
+        parser.error("--blur-image could not read {}: {}".format(path, exc))
+    # PIL gives RGB; frames are BGR.
+    return numpy.ascontiguousarray(rgb[..., ::-1])
+
+
+def _nonnegative_int(value: str):
+    try:
+        iv = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "expected an integer, got {!r}".format(value)
+        )
+    if iv < 0:
+        raise argparse.ArgumentTypeError(
+            "value must not be negative, got {}".format(iv)
         )
     return iv
 
@@ -205,6 +266,68 @@ def build_parser():
         help="stamp an emulated arrow pointer at the mouse position — the "
              "X11 capture path never includes the real cursor sprite "
              "(needs the [gui] extra: python-xlib)",
+    )
+    blur = p.add_mutually_exclusive_group()
+    blur.add_argument(
+        "--blur", type=_parse_blur_region, action="append", default=None,
+        metavar="X,Y,W,H",
+        help="obscure this screen region in every frame; repeatable",
+    )
+    blur.add_argument(
+        "--blur-all", action="store_true",
+        help="obscure the whole captured frame",
+    )
+    p.add_argument(
+        # default=None, not "box", so that an explicitly typed
+        # --blur-method box is still distinguishable from not passing the
+        # option at all. Every other --blur-* option already works this
+        # way; leaving this one with a real default meant "box" -- and
+        # only "box" -- slipped past the missing-target check below and
+        # recorded in the clear.
+        "--blur-method", default=None, choices=list(BLUR_METHODS),
+        help="how blurred regions are obscured (default: box). fill and "
+             "pixelate-random destroy the pixels outright; "
+             "pixelate-random-shuffle keeps the real tile colours but "
+             "scrambles their positions; box, gaussian and pixelate are "
+             "cosmetic. Use fill or pixelate-random for secrets.",
+    )
+    p.add_argument(
+        "--blur-radius", type=_positive_int, default=None, metavar="N",
+        help="blur kernel radius in pixels for box/gaussian "
+             "(default: {})".format(DEFAULT_RADIUS),
+    )
+    p.add_argument(
+        "--blur-block", type=_positive_int, default=None, metavar="N",
+        help="mosaic tile size in pixels for the pixelate methods "
+             "(default: {})".format(DEFAULT_BLOCK),
+    )
+    p.add_argument(
+        "--blur-seed", type=_nonnegative_int, default=None, metavar="N",
+        help="seed for the pixelate-random methods (default: 0). Fixed "
+             "rather than per-frame on purpose: re-rolling every frame "
+             "would let a recording be averaged back towards what is "
+             "underneath.",
+    )
+    p.add_argument(
+        "--blur-image", default=None, metavar="PATH",
+        help="image to stamp over the region for --blur-method image. "
+             "Stretched to fit. Decoding needs Pillow "
+             "(pip install fastgrab[gui]); the Python API takes a numpy "
+             "array and needs nothing extra.",
+    )
+    p.add_argument(
+        "--blur-image-fit", default=None, choices=list(IMAGE_FITS),
+        help="how the cover image is mapped onto the region (default: {}). "
+             "crop scales it to cover and trims the overflow, fit scales it "
+             "to sit inside and pads with --blur-color, stretch distorts it "
+             "to the exact shape, tile repeats it at its own size. Only "
+             "stretch changes the picture's proportions.".format(
+                 DEFAULT_IMAGE_FIT),
+    )
+    p.add_argument(
+        "--blur-color", type=_parse_bgr, default=None, metavar="B,G,R",
+        help="colour for --blur-method fill, e.g. 255,255,255 "
+             "(default: 0,0,0, a black box)",
     )
     p.add_argument(
         "--subtitle", type=_parse_subtitle, action="append", default=None,
@@ -434,6 +557,106 @@ def _main(argv=None):
                       if args.click_lifetime is not None
                       else ClickStyle().lifetime),
         )
+    blur = True if args.blur_all else args.blur
+    blur_style = None
+    blur_tuned = (
+        args.blur_method is not None or args.blur_radius is not None
+        or args.blur_block is not None or args.blur_color is not None
+        or args.blur_seed is not None or args.blur_image is not None
+        or args.blur_image_fit is not None
+    )
+    if blur_tuned and not blur:
+        # Silently ignoring a --blur-method the user typed would hide a
+        # failed redaction, which is the one mistake that actually leaks.
+        parser.error(
+            "--blur-method/--blur-radius/--blur-block/--blur-color need a "
+            "target: pass --blur X,Y,W,H or --blur-all"
+        )
+    # The method actually used, once "not supplied" has been told apart
+    # from "supplied as the default".
+    blur_method = args.blur_method or BlurStyle().method
+    if blur_tuned:
+        # Each tuning flag belongs to specific methods. Accepting
+        # --blur-color with a box blur would leave the user believing
+        # they had painted a solid box over a secret when they had only
+        # softened it, so refuse rather than ignore.
+        applies_to = {
+            "--blur-radius": ("box", "gaussian"),
+            "--blur-block": PIXELATE_METHODS,
+            # padding colour for --blur-image-fit fit, as well as the
+            # block colour for fill
+            "--blur-color": ("fill", "image"),
+            "--blur-seed": ("pixelate-random", "pixelate-random-shuffle"),
+            "--blur-image": ("image",),
+            "--blur-image-fit": ("image",),
+        }
+        given = [
+            name for name, value in (
+                ("--blur-radius", args.blur_radius),
+                ("--blur-block", args.blur_block),
+                ("--blur-color", args.blur_color),
+                ("--blur-seed", args.blur_seed),
+                ("--blur-image", args.blur_image),
+                ("--blur-image-fit", args.blur_image_fit),
+            ) if value is not None
+        ]
+        ignored = [
+            name for name in given
+            if blur_method not in applies_to[name]
+        ]
+        if ignored:
+            parser.error(
+                "{} {} nothing for --blur-method {} (it applies to {}); "
+                "a redaction option that is silently ignored is worse than "
+                "an error".format(
+                    " and ".join(ignored),
+                    "does" if len(ignored) == 1 else "do",
+                    blur_method,
+                    ", ".join(
+                        sorted({m for n in ignored for m in applies_to[n]})
+                    ),
+                )
+            )
+    if blur_tuned:
+        cover = None
+        if args.blur_image is not None:
+            cover = _load_cover_image(parser, args.blur_image)
+        try:
+            blur_style = BlurStyle(
+                method=blur_method,
+                radius=(args.blur_radius if args.blur_radius is not None
+                        else BlurStyle().radius),
+                block=(args.blur_block if args.blur_block is not None
+                       else BlurStyle().block),
+                seed=(args.blur_seed if args.blur_seed is not None
+                      else BlurStyle().seed),
+                color=args.blur_color or BlurStyle().color,
+                image=cover,
+                image_fit=(args.blur_image_fit if args.blur_image_fit
+                           is not None else BlurStyle().image_fit),
+            )
+        except ValueError as exc:
+            # BlurStyle rejects identity settings such as
+            # --blur-method pixelate --blur-block 1; surface that as a
+            # usage error instead of a traceback.
+            parser.error(str(exc))
+
+    if blur is True and (blur_style is None
+                         or blur_style.method in ("box", "gaussian")):
+        # Measured in the dev container: a full 1080p frame costs ~64 ms
+        # (box) / ~180 ms (gaussian) per frame, so capture cannot hold
+        # 30 fps. The recorder duplicates frames to keep the clip's
+        # duration honest, so the output is still correct — just choppy.
+        # Say so rather than letting the fps quietly collapse.
+        print(
+            "note: --blur-all with --blur-method {} costs tens of "
+            "milliseconds per frame at 1080p and will hold capture below "
+            "the target fps; pixelate and fill are much cheaper".format(
+                "box" if blur_style is None else blur_style.method
+            ),
+            file=sys.stderr,
+        )
+
     subtitle_style = SubtitleStyle(
         font_path=args.subtitle_font,
         font_size=args.subtitle_fontsize,
@@ -444,8 +667,8 @@ def _main(argv=None):
     )
     # Both of these validate what the user typed, and both can refuse.
     # They sit outside the recording try/except below, so without this a
-    # bad --subtitle-backend or an underivable sidecar ended the command
-    # with a traceback instead of a message.
+    # bad --subtitle-backend, an underivable sidecar or an unusable blur
+    # setting ended the command with a traceback instead of a message.
     try:
         sidecar = _resolve_sidecar(args.subtitle_sidecar, args.output)
         recorder = Recorder(
@@ -462,6 +685,8 @@ def _main(argv=None):
             subtitle_style=subtitle_style,
             subtitle_backend=args.subtitle_backend,
             subtitle_sidecar=sidecar,
+            blur=blur,
+            blur_style=blur_style,
         )
     except (RuntimeError, ValueError) as exc:
         print("error: {}".format(exc), file=sys.stderr)
