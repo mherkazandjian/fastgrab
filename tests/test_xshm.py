@@ -24,7 +24,7 @@ pytestmark = pytest.mark.skipif(
     reason="fastgrab._linux_x11 is the libX11 C extension; Linux only",
 )
 
-from fastgrab import _linux_x11  # noqa: E402
+from fastgrab import _linux_x11, screenshot  # noqa: E402
 
 
 # Paint a deterministic full-screen window, capture it, print a digest.
@@ -278,6 +278,57 @@ def test_openmp_threshold_selects_a_path_without_changing_the_pixels(threshold):
     assert baseline == other
 
 
+def _omp_compiled():
+    return bool(_linux_x11._display_cache_info()["omp_compiled"])
+
+
+def test_openmp_survived_the_build_where_it_must_have():
+    """build.py probes for OpenMP now, and a probe can fall back silently.
+
+    -fopenmp went missing once already: build.py linked gomp from the
+    day the extension was written but never asked the compiler to honour
+    the pragmas, so every parallel region was quietly ignored for the
+    life of the project and nothing noticed. Falling back to a serial
+    build rather than failing the install is the right call for a package
+    compiled on the user's machine -- and it recreates that exact trap
+    unless somebody asserts the flag survived where it had no excuse not
+    to.
+    """
+    if os.environ.get("FASTGRAB_EXPECT_OPENMP") != "1":
+        pytest.skip(
+            "OpenMP is not guaranteed for this build; the docker compose "
+            "'test' service sets FASTGRAB_EXPECT_OPENMP=1 where it is"
+        )
+    assert _omp_compiled() is True, (
+        "the extension was built without OpenMP: build.py's probe fell "
+        "back, so every large frame is copied on one core"
+    )
+
+
+def test_a_large_capture_really_copies_in_parallel():
+    """And that the flag surviving actually reaches the copy.
+
+    omp_compiled says the pragmas were compiled in; this says one of
+    them ran. The counter is incremented inside the same #ifdef as the
+    pragma precisely so that it cannot answer for a serial build -- it
+    used to sit outside, and a build with no OpenMP runtime loaded at all
+    reported 201 parallel copies on a single thread.
+    """
+    if os.environ.get("FASTGRAB_EXPECT_OPENMP") != "1":
+        pytest.skip("OpenMP is not guaranteed for this build")
+    width, height = _linux_x11.resolution()
+    if width * height * 4 < 4 * 1024 * 1024:
+        pytest.skip("%dx%d is under the parallel-copy threshold"
+                    % (width, height))
+    before = _linux_x11._display_cache_info()["omp_parallel_copies"]
+    screenshot.Screenshot().capture()
+    after = _linux_x11._display_cache_info()["omp_parallel_copies"]
+    assert after > before, (
+        "a %dx%d capture took the serial copy despite OpenMP being "
+        "compiled in" % (width, height)
+    )
+
+
 def test_a_forked_child_does_not_deadlock_on_a_large_capture():
     """libgomp is not fork-safe, and this project supports fork-and-capture.
 
@@ -295,6 +346,11 @@ def test_a_forked_child_does_not_deadlock_on_a_large_capture():
     reproduce, so the child has to show it went serial: forked, OpenMP
     disarmed, and no copy took the parallel branch.
     """
+    if not _omp_compiled():
+        pytest.skip(
+            "built without OpenMP, so there is no libgomp pool to inherit "
+            "and the hazard this pins cannot arise"
+        )
     proc = _run(_FORK_SCRIPT)
     assert proc.returncode == 0, (
         "the forked child did not come back: %s %s"

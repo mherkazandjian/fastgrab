@@ -610,6 +610,20 @@ static int fg_shm_ensure(Display *dpy, int width, int height)
  * through OMP_NUM_THREADS. */
 #define FG_OMP_MAX_THREADS 8
 
+/* Whether the pragmas below survived the build at all.
+ *
+ * build.py probes for OpenMP and, when the toolchain cannot provide it,
+ * builds without -fopenmp rather than failing the install -- right for a
+ * package shipped as an sdist and compiled on the user's machine, but it
+ * means "fastgrab is installed" no longer implies "the parallel copy
+ * exists". Reported through _display_cache_info() so a build that
+ * quietly lost it can be caught by a test instead of by a benchmark. */
+#ifdef _OPENMP
+#define FG_OMP_COMPILED 1
+#else
+#define FG_OMP_COMPILED 0
+#endif
+
 static int fg_omp_threads(void)
 {
 #ifdef _OPENMP
@@ -720,8 +734,15 @@ static void fg_copy_image(uint8_t *dst, const uint8_t *src,
     int row;
 
     if (total >= fg_omp_min_bytes() && fg_omp_allowed()) {
-        fg_omp_parallel_copies++;
 #ifdef _OPENMP
+        /* Counted inside the guard, not above it. Without _OPENMP the
+         * pragma is compiled out and the loop below runs serially, so
+         * incrementing here regardless would report a serial build as
+         * taking the fast path: measured, a build with no OpenMP runtime
+         * loaded at all claimed 201 parallel copies on one thread, and
+         * the entire suite passed. A test hook that lies is worse than
+         * no test hook -- this one has to mean "copied in parallel". */
+        fg_omp_parallel_copies++;
 #pragma omp parallel for schedule(static) num_threads(fg_omp_threads())
 #endif
         for (row = 0; row < height; row++)
@@ -1265,7 +1286,7 @@ static PyObject *linux_x11_display_cache_info(PyObject *self, PyObject *args)
     }
     /* QueuedAlready is a queue-length read, not a socket read: it does
      * no I/O, so it needs no armed region and cannot fault. */
-    return Py_BuildValue("{s:O,s:N,s:k,s:l,s:l,s:k,s:O,s:k,s:O,s:O,s:k}",
+    return Py_BuildValue("{s:O,s:N,s:k,s:l,s:l,s:k,s:O,s:k,s:O,s:O,s:O,s:k}",
                          "connected", fg_display != NULL ? Py_True : Py_False,
                          "display", name,
                          "opens", fg_display_opens,
@@ -1291,6 +1312,13 @@ static PyObject *linux_x11_display_cache_info(PyObject *self, PyObject *args)
                          "forked",
                          (fg_omp_pid != 0 && fg_omp_pid != getpid())
                              ? Py_True : Py_False,
+                         /* Distinct from omp_allowed on purpose:
+                          * "compiled" is about the build, "allowed" is
+                          * the fork policy, and a serial build reports
+                          * allowed=True in the importing process while
+                          * having no parallel copy to allow. */
+                         "omp_compiled",
+                         FG_OMP_COMPILED ? Py_True : Py_False,
                          "omp_allowed",
                          fg_omp_allowed() ? Py_True : Py_False,
                          "omp_parallel_copies", fg_omp_parallel_copies);

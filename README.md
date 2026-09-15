@@ -238,8 +238,15 @@ Per-platform extras:
    - Debian/Ubuntu: ``sudo apt install build-essential python3-dev libx11-dev libxext-dev``
    - Fedora: ``sudo dnf install gcc python3-devel libX11-devel libXext-devel``
 
-   Runtime needs only ``libX11``, ``libXext`` and ``libgomp1``
-   (``libgomp`` on Fedora), which are present on any desktop. ``Python.h: No such file`` means the
+   Runtime needs ``libX11``, ``libXext`` and whichever OpenMP runtime
+   the compiler used: ``libgomp1`` for a gcc build (``libgomp`` on
+   Fedora), ``libomp`` for a clang one. All are present on any desktop.
+   If the toolchain cannot provide OpenMP at build time the extension is
+   built without it and says so on stderr — capture still works and
+   still uses MIT-SHM, large frames are just copied on one core. That is
+   decided when the package is compiled, so installing an OpenMP runtime
+   afterwards does not switch it on; reinstall to pick it up.
+   ``Python.h: No such file`` means the
    Python headers are missing (``python3-dev``); ``stdio.h: No such file``
    means the toolchain headers are (``build-essential``). Tested on
    Debian-based Python images, Ubuntu 24.04 and Fedora 44, Python 3.10–3.14.

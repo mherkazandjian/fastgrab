@@ -33,6 +33,11 @@ services:
       # assert the fast path actually engaged, rather than passing
       # whichever path ran.
       FASTGRAB_EXPECT_XSHM: "1"
+      # Likewise gcc and libgomp are both installed here, so build.py's
+      # OpenMP probe cannot legitimately fall back. Saying so lets a test
+      # catch the flag going missing -- which it already did once, for
+      # the whole life of the project, before PR #74 noticed.
+      FASTGRAB_EXPECT_OPENMP: "1"
     # "not portal" as well as "not wayland": those tests need a PipeWire
     # graph this image has none of. Today they never reach selection --
     # both portal modules importorskip("gi"), which is what keeps
