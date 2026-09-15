@@ -264,6 +264,25 @@ Per-platform extras:
    ``FASTGRAB_NO_XSHM=1`` forces the plain path, and
    ``FASTGRAB_OMP_MIN_BYTES`` sets the frame size in bytes above which
    the copy is parallelised (``0`` keeps it serial always).
+
+   **After a fork, the copy goes back to being serial.** GNU libgomp is
+   not fork-safe: a process that has run a parallel region keeps its
+   thread pool, ``fork()`` copies the bookkeeping but not the threads,
+   and the child's next parallel region waits forever for workers that do
+   not exist. So a child that inherited fastgrab — a ``multiprocessing``
+   worker under the ``fork`` start method, say — copies serially. It
+   keeps the shared-memory path, which is the larger half of the win, and
+   gives up roughly a quarter of the combined speed at 1080p.
+
+   Processes that get a clean runtime are unaffected: the ``spawn`` start
+   method, a ``forkserver`` whose server process never captured, or
+   importing fastgrab inside the worker rather than preloading it.
+
+   If you know your children fork from a runtime that never started an
+   OpenMP pool, ``FASTGRAB_UNSAFE_OMP_AFTER_FORK=1`` turns the guard off
+   and keeps the parallel copy everywhere. It is named that way on
+   purpose: fastgrab cannot verify the precondition, and getting it wrong
+   is a hang rather than an error.
  - **Linux/Wayland (wlroots)**: a wlroots-based compositor (Sway,
    Hyprland, river, niri, cage) for the no-prompt path; the ``[wayland]``
    extra (``pip install fastgrab[wayland]``) pulls in ``pywayland``.

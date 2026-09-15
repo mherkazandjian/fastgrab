@@ -82,6 +82,109 @@ def _child(env_overrides):
     return digest, shm == "True", int(count)
 
 
+def _run(script, env_overrides=None):
+    """Run a snippet in a fresh interpreter and hand back the result."""
+    env = dict(os.environ)
+    env.update(env_overrides or {})
+    env.setdefault("PYTHONPATH", os.pathsep.join(sys.path))
+    return subprocess.run([sys.executable, "-c", script],
+                          capture_output=True, text=True, env=env, timeout=180)
+
+
+# Warm the parent with a parallel region, fork, and have the child copy
+# several large frames. Before the guard this child blocked every time.
+_FORK_SCRIPT = r"""
+import os
+import select
+
+from fastgrab import screenshot, _linux_x11
+
+THRESHOLD = 4 * 1024 * 1024
+
+width, height = _linux_x11.resolution()
+if width * height * 4 < THRESHOLD:
+    print("SETUP-FAILED: %dx%d is under the parallel-copy threshold"
+          % (width, height))
+    raise SystemExit(2)
+
+grab = screenshot.Screenshot()
+grab.capture()
+parent = _linux_x11._display_cache_info()
+if parent["forked"] or not parent["omp_allowed"]:
+    print("SETUP-FAILED: the parent is not the importing process: %r" % parent)
+    raise SystemExit(2)
+if parent["omp_parallel_copies"] < 1:
+    print("SETUP-FAILED: the parent never took the parallel copy, so the "
+          "libgomp pool was never warmed and the child proves nothing: %r"
+          % parent)
+    raise SystemExit(2)
+
+read_fd, write_fd = os.pipe()
+pid = os.fork()
+if pid == 0:
+    os.close(read_fd)
+    try:
+        before = _linux_x11._display_cache_info()
+        child = screenshot.Screenshot()
+        for _ in range(3):
+            child.capture()
+        after = _linux_x11._display_cache_info()
+        os.write(write_fd, ("OK %s %s %d" % (
+            after["forked"], after["omp_allowed"],
+            after["omp_parallel_copies"] - before["omp_parallel_copies"]
+        )).encode())
+    except BaseException as exc:
+        os.write(write_fd, ("ERR %r" % (exc,)).encode())
+    finally:
+        os._exit(0)
+
+os.close(write_fd)
+ready, _w, _x = select.select([read_fd], [], [], 30)
+if not ready:
+    os.kill(pid, 9)
+    os.waitpid(pid, 0)
+    print("CHILD-HUNG: the forked child never finished its captures")
+    raise SystemExit(3)
+message = os.read(read_fd, 4096).decode()
+os.waitpid(pid, 0)
+
+# The parent has to outlive its child, not merely start it.
+grab.capture()
+print(message)
+"""
+
+
+# The override only has to flip the decision. Deliberately no large
+# capture here: it re-arms a path measured to deadlock, and a test must
+# never depend on a deadlock failing to happen.
+_FORK_OVERRIDE_SCRIPT = r"""
+import os
+
+from fastgrab import screenshot, _linux_x11
+
+grab = screenshot.Screenshot()
+grab.capture()
+
+read_fd, write_fd = os.pipe()
+pid = os.fork()
+if pid == 0:
+    os.close(read_fd)
+    try:
+        info = _linux_x11._display_cache_info()
+        os.write(write_fd, ("%s %s" % (info["forked"],
+                                       info["omp_allowed"])).encode())
+    except BaseException as exc:
+        os.write(write_fd, ("ERR %r" % (exc,)).encode())
+    finally:
+        os._exit(0)
+
+os.close(write_fd)
+message = os.read(read_fd, 4096).decode()
+os.waitpid(pid, 0)
+print(message)
+"""
+
+
 def test_cache_info_reports_the_shared_memory_state():
     """The private cache dict is how tests tell the two paths apart."""
     info = _linux_x11._display_cache_info()
@@ -173,3 +276,61 @@ def test_openmp_threshold_selects_a_path_without_changing_the_pixels(threshold):
     other, _, _ = _child({"FASTGRAB_NO_XSHM": "1",
                           "FASTGRAB_OMP_MIN_BYTES": threshold})
     assert baseline == other
+
+
+def test_a_forked_child_does_not_deadlock_on_a_large_capture():
+    """libgomp is not fork-safe, and this project supports fork-and-capture.
+
+    Once a process has run a parallel region its libgomp pool is kept for
+    reuse; fork() copies the calling thread's bookkeeping into the child
+    without the pool's threads, and the child's next region waits at a
+    barrier for workers that no longer exist. Measured against this code
+    before the guard: the child blocked every run, in futex_wait inside
+    gomp_team_barrier_wait_end under fg_copy_image. The existing
+    test_a_forked_child_connects_for_itself cannot see it -- that child
+    only calls resolution(), so it never enters a region.
+
+    Finishing is not enough to assert. A guard that quietly stopped
+    working would also pass on any run where the deadlock happened not to
+    reproduce, so the child has to show it went serial: forked, OpenMP
+    disarmed, and no copy took the parallel branch.
+    """
+    proc = _run(_FORK_SCRIPT)
+    assert proc.returncode == 0, (
+        "the forked child did not come back: %s %s"
+        % (proc.stdout.strip(), proc.stderr.strip()[-400:])
+    )
+    status, forked, allowed, parallel_copies = proc.stdout.strip().split()
+    assert status == "OK", proc.stdout.strip()
+    assert forked == "True", "the child did not recognise itself as forked"
+    assert allowed == "False", "the guard left OpenMP armed in the child"
+    assert int(parallel_copies) == 0, (
+        "the child took the parallel copy %s times despite the guard"
+        % parallel_copies
+    )
+
+
+@pytest.mark.parametrize("value,allowed", [
+    ("1", "True"), ("yes", "True"), ("0", "False"), ("", "False"),
+])
+def test_the_fork_guard_can_be_turned_off(value, allowed):
+    """$FASTGRAB_UNSAFE_OMP_AFTER_FORK, for callers who accept the risk.
+
+    The guard is conservative by construction: it disarms OpenMP in every
+    inherited process, including the ones that forked from a runtime
+    which never warmed a pool and would have been perfectly safe. This is
+    the way out for someone who knows that about their own program.
+
+    Only the decision is asserted, never a capture -- the override
+    re-arms a path measured to deadlock, and a test that took a large
+    frame with it on would be betting on a hang not happening.
+    """
+    proc = _run(_FORK_OVERRIDE_SCRIPT,
+                {"FASTGRAB_UNSAFE_OMP_AFTER_FORK": value})
+    assert proc.returncode == 0, proc.stderr.strip()[-400:]
+    forked, is_allowed = proc.stdout.strip().split()
+    assert forked == "True"
+    assert is_allowed == allowed, (
+        "%r should have left the guard %s"
+        % (value, "off" if allowed == "True" else "on")
+    )

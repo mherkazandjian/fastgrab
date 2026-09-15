@@ -643,13 +643,84 @@ static size_t fg_omp_min_bytes(void)
     return cached;
 }
 
+/* The libgomp fork guard.
+ *
+ * GNU libgomp is not fork-safe and ships no pthread_atfork repair (the
+ * patches proposing it were never merged): once a process has run a
+ * parallel region the thread pool is retained, fork() copies the calling
+ * thread's bookkeeping into the child without the pool's threads, and the
+ * child's next region waits at a barrier for workers that do not exist.
+ * Measured against this file in the project's own image -- parent
+ * captures 1080p, forks, child captures 1080p -- the child blocked 5 runs
+ * out of 5, in gdb at futex_wait inside gomp_team_barrier_wait_end under
+ * fg_copy_image. A child capture *below* the threshold is unaffected,
+ * because it never enters a region at all.
+ *
+ * So a process that is not the one this extension was imported into
+ * copies serially. The pid is stamped at import rather than before the
+ * first parallel region on purpose: "fastgrab has not used OpenMP yet"
+ * does not mean libgomp is clean, since any other library in the process
+ * may have warmed the same pool -- measured, and the narrower guard let
+ * exactly that child through to hang 10 times out of 10.
+ *
+ * Not fg_display_pid, which looks like it would serve: that is cleared by
+ * display teardown and replaced on reconnect, so it records connection
+ * history, not fork history. Closing the display before forking still
+ * hung 5 out of 5.
+ *
+ * The cost falls on forked children only, and only on the OpenMP share of
+ * the speedup -- about a quarter at 1080p. Shared memory is untouched, so
+ * such a child still captures several times faster than it would have
+ * before any of this existed.
+ *
+ * Re-enabling it in the child is not a recovery: a one-thread region
+ * succeeded and the eight-thread region after it still hung. Nor is
+ * omp_pause_resource_all(), which joins the very workers that are gone
+ * and hangs inside the repair. The only clean runtimes are a fresh
+ * interpreter (spawn), a forkserver whose server never captured, or a
+ * parent that released its pool before forking.
+ */
+#define FG_OMP_AFTER_FORK_ENV "FASTGRAB_UNSAFE_OMP_AFTER_FORK"
+
+static pid_t fg_omp_pid = 0;
+static pid_t fg_omp_override_pid = 0;
+static int fg_omp_override = 0;
+static unsigned long fg_omp_parallel_copies = 0;
+
+static int fg_omp_allowed(void)
+{
+    pid_t self = getpid();
+
+    if (fg_omp_pid != 0 && fg_omp_pid == self)
+        return 1;
+
+    /* Read once per *process*, not once per process tree: the override
+     * exists for the forked child, and a child that sets it in its own
+     * environment before capturing would otherwise be answered out of
+     * the parent's cache. Keyed on the pid, so it still costs one
+     * getenv per process rather than one per frame.
+     *
+     * "UNSAFE" is in the name because it is: it re-enables a path
+     * measured to deadlock. It is for callers who know their children
+     * forked from a runtime that never warmed a pool and who would
+     * rather have the throughput than the guarantee. */
+    if (fg_omp_override_pid != self) {
+        const char *env = getenv(FG_OMP_AFTER_FORK_ENV);
+        fg_omp_override = (env != NULL && *env != '\0'
+                           && strcmp(env, "0") != 0);
+        fg_omp_override_pid = self;
+    }
+    return fg_omp_override;
+}
+
 static void fg_copy_image(uint8_t *dst, const uint8_t *src,
                           size_t row_bytes, size_t src_stride, int height)
 {
     const size_t total = row_bytes * (size_t)height;
     int row;
 
-    if (total >= fg_omp_min_bytes()) {
+    if (total >= fg_omp_min_bytes() && fg_omp_allowed()) {
+        fg_omp_parallel_copies++;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) num_threads(fg_omp_threads())
 #endif
@@ -1194,7 +1265,7 @@ static PyObject *linux_x11_display_cache_info(PyObject *self, PyObject *args)
     }
     /* QueuedAlready is a queue-length read, not a socket read: it does
      * no I/O, so it needs no armed region and cannot fault. */
-    return Py_BuildValue("{s:O,s:N,s:k,s:l,s:l,s:k,s:O,s:k}",
+    return Py_BuildValue("{s:O,s:N,s:k,s:l,s:l,s:k,s:O,s:k,s:O,s:O,s:k}",
                          "connected", fg_display != NULL ? Py_True : Py_False,
                          "display", name,
                          "opens", fg_display_opens,
@@ -1209,7 +1280,20 @@ static PyObject *linux_x11_display_cache_info(PyObject *self, PyObject *args)
                           * test that wants the plain path asserts on these
                           * rather than on a stopwatch. */
                          "shm", fg_shm_img != NULL ? Py_True : Py_False,
-                         "shm_captures", fg_shm_captures);
+                         "shm_captures", fg_shm_captures,
+                         /* The libgomp fork guard: whether this process
+                          * inherited the module across a fork, whether a
+                          * large frame may use the parallel copy here,
+                          * and how many copies actually took it. A test
+                          * that wants to prove a child went serial
+                          * compares the counter across its own capture,
+                          * because the count itself is inherited. */
+                         "forked",
+                         (fg_omp_pid != 0 && fg_omp_pid != getpid())
+                             ? Py_True : Py_False,
+                         "omp_allowed",
+                         fg_omp_allowed() ? Py_True : Py_False,
+                         "omp_parallel_copies", fg_omp_parallel_copies);
 }
 
 static PyObject *linux_x11_close_display(PyObject *self, PyObject *args)
@@ -1273,6 +1357,10 @@ PyInit__linux_x11(void)
 {
     PyObject *module;
     import_array();
+    /* Stamped here rather than before the first parallel region: see
+     * fg_omp_allowed(). Any process that inherits this module across a
+     * fork reads a different getpid() and copies serially. */
+    fg_omp_pid = getpid();
     module = PyModule_Create(&_linux_x11);
     return module;
 }
