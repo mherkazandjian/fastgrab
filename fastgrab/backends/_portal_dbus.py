@@ -10,7 +10,7 @@ which returns immediately and delivers its real answer later on a
 ``Response`` signal against a Request object. Start is where a desktop
 environment shows its chooser, so it is also where the user can say no.
 """
-import os
+import uuid
 
 
 def _require_gio():
@@ -140,7 +140,19 @@ class ScreenCastSession:
         # lets a caller subscribe *before* issuing the call. Without
         # that, a portal that answers quickly can emit Response before
         # the subscription exists and the call waits forever.
-        return "fastgrab_{}_{}".format(prefix, os.getpid() and id(self) & 0xffffff)
+        #
+        # Predictable to us, and to nobody else: the portal asks for
+        # tokens that are unique and unguessable, and a repeat collides
+        # with a live request. Not a counter, which is guessable, and
+        # not id(self), which was the bug -- CPython reuses addresses,
+        # so a session allocated after a failed one can be handed the
+        # token of the request that just failed, and truncating to 24
+        # bits collides between live sessions besides. (The pid that
+        # used to appear here never did anything: `and` returns its
+        # right operand, so it was discarded before the format call.)
+        # .hex because an object-path element is [A-Za-z0-9_] and a
+        # UUID's hyphens are not.
+        return "fastgrab_{}_{}".format(prefix, uuid.uuid4().hex)
 
     def _request_path(self, token):
         sender = self._connect().get_unique_name()[1:].replace(".", "_")
@@ -219,6 +231,27 @@ class ScreenCastSession:
                     timer.destroy()
                 heartbeat.destroy()
                 conn.signal_unsubscribe(subscription)
+                # GIO queues the subscription's teardown as an idle on
+                # the context that created it -- this private one, which
+                # nothing iterates again once loop.run() has returned.
+                # Without draining it here the Response callback and the
+                # context itself are retained for the life of the
+                # process, one per request and so three per handshake.
+                # Measured: three successful calls kept three callbacks
+                # alive across a gc.collect(), and a single dispatching
+                # iteration released them.
+                #
+                # Cleanup only: GIO will not invoke a callback after
+                # signal_unsubscribe() has returned on the subscribing
+                # thread, so this cannot deliver a late Response and
+                # cannot change what `result` already holds.
+                #
+                # Bounded, rather than `while context.pending()`: this
+                # runs in a finally, the KeyboardInterrupt path
+                # included, where hanging would be worse than leaking.
+                for _ in range(100):
+                    if not context.iteration(False):
+                        break
                 if "response" not in result:
                     # Leaving without an answer -- timed out, or
                     # interrupted. The portal keeps the Request object
@@ -241,7 +274,17 @@ class ScreenCastSession:
         finally:
             context.pop_thread_default()
 
-        if result.get("timeout"):
+        # "response" before "timeout", because both can be recorded.
+        # loop.quit() does not cut the dispatch phase short: GLib
+        # dispatches every source that was ready at the check, so a
+        # Response that became ready in the same iteration as the expiry
+        # timer runs alongside it. Reading the timeout first then throws
+        # a real answer away -- calling an approval "never answered"
+        # after the portal has already started the cast and rotated the
+        # restore token, so the replacement is never saved and the user
+        # is prompted again immediately; and calling a decline
+        # unavailability rather than the refusal it is.
+        if "response" not in result and result.get("timeout"):
             raise PortalUnavailable(
                 "the portal never answered {} within {}s".format(
                     method, self.timeout)

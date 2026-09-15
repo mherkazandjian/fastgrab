@@ -7,6 +7,7 @@ file-descriptor handoff.
 """
 import json
 import os
+import stat
 import subprocess
 import time
 
@@ -23,6 +24,13 @@ from fastgrab.backends._portal_dbus import (  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FAKE = os.path.join(HERE, "portal", "fake_impl_screencast.py")
+
+# What the fixture's synthetic source paints. Solid red by default, so a
+# consumer that mixes up the channel order is obvious -- BGRx means byte
+# 2 carries red. A test about *geometry* has to ask for the checkerboard
+# instead: on a uniform frame every crop looks like every other one.
+SOLID_RED = ("pattern=solid-color", "foreground-color=0xffff0000")
+CHECKERS = ("pattern=checkers-8",)
 
 
 def _wait_for_video_source(timeout=20.0):
@@ -42,20 +50,21 @@ def _wait_for_video_source(timeout=20.0):
 
 
 @pytest.fixture
-def portal(tmp_path, monkeypatch):
+def portal(request, tmp_path, monkeypatch):
     """A private session bus, a fake impl backend, and the real frontend.
 
     Per test: the frontend caches its backend choice and a session's
     lifetime is the thing under test, so sharing one across tests would
     hide exactly the bugs this is here to find.
     """
+    pattern = getattr(request, "param", SOLID_RED)
     source = subprocess.Popen(
-        ["gst-launch-1.0", "-q", "videotestsrc", "pattern=solid-color",
-         "foreground-color=0xffff0000", "is-live=true",
-         "!", "video/x-raw,format=BGRx,width=320,height=240,framerate=10/1",
-         "!", "pipewiresink", "mode=provide",
-         "stream-properties=props,node.name=fastgrab-fixture,"
-         "media.class=Video/Source"],
+        ["gst-launch-1.0", "-q", "videotestsrc"] + list(pattern)
+        + ["is-live=true",
+           "!", "video/x-raw,format=BGRx,width=320,height=240,framerate=10/1",
+           "!", "pipewiresink", "mode=provide",
+           "stream-properties=props,node.name=fastgrab-fixture,"
+           "media.class=Video/Source"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     node = _wait_for_video_source()
     if node is None:
@@ -152,8 +161,14 @@ def test_the_pipewire_fd_is_taken_from_the_message_fd_list(portal):
         session.open()
         fd = session.open_pipewire_remote()
         assert isinstance(fd, int) and fd >= 0
-        # A real descriptor this process owns, not the index 0 the wire carried.
-        assert os.fstat(fd) is not None
+        # A *socket*, which is what OpenPipeWireRemote returns and what
+        # pw_context_connect_fd requires. fstat() alone proved nothing:
+        # the wire index is 0, fd 0 is open, so returning the index
+        # rather than looking it up in the message's descriptor list
+        # passed this test -- and closed stdin on the way out.
+        assert stat.S_ISSOCK(os.fstat(fd).st_mode), (
+            "not a socket, so this is not the portal's PipeWire remote"
+        )
         os.close(fd)
     finally:
         session.close()
@@ -187,16 +202,40 @@ def test_the_backend_captures_through_the_portal(portal):
         backend.close()
 
 
+@pytest.mark.parametrize(
+    "portal", [pytest.param(CHECKERS, id="checkers")], indirect=True)
 def test_the_backend_crops_locally(portal):
-    """The portal hands back a whole monitor; sub-regions are ours to cut."""
+    """The portal hands back a whole monitor; sub-regions are ours to cut.
+
+    Against a checkerboard, not the solid red the rest of this file
+    streams. On a uniform frame every crop looks like every other one,
+    and this test asserted only "40x60" -- the shape of a buffer it
+    allocated itself, which cannot change -- and "is red". It passed
+    with x and y swapped, and passed with the offsets ignored
+    altogether, which left the backend's most visible operation
+    unverified.
+
+    Compared against the same region of a full capture, which pins the
+    offsets, their order, and that they are applied at all.
+    """
     from fastgrab.backends.portal import PortalBackend
     portal()
     backend = PortalBackend(timeout=30)
     try:
-        frame = numpy.zeros((40, 60, 4), numpy.uint8)
-        backend.screenshot(10, 20, frame)
-        assert frame.shape == (40, 60, 4)
-        assert frame[..., 2].mean() > 200
+        width, height = backend.resolution()
+        full = numpy.zeros((height, width, 4), numpy.uint8)
+        backend.screenshot(0, 0, full)
+        crop = numpy.zeros((40, 60, 4), numpy.uint8)
+        backend.screenshot(10, 20, crop)
+        assert numpy.array_equal(crop, full[20:60, 10:70]), (
+            "the crop is not the region that was asked for: (10, 20) "
+            "should be the top-left corner of it"
+        )
+        assert not numpy.array_equal(crop, full[0:40, 0:60]), (
+            "the crop is also the origin, so either the offsets were "
+            "ignored or the pattern is uniform and this test is back "
+            "to proving nothing"
+        )
     finally:
         backend.close()
 
@@ -473,6 +512,147 @@ def test_an_abandoned_request_is_closed():
         "the abandoned request was never closed; it stays live at the "
         "portal and can still create a session. Calls seen: %s"
         % (connection.calls,)
+    )
+
+
+def test_each_request_gets_a_fresh_unguessable_token():
+    """A handle token names a Request object; a repeat aims at a live one.
+
+    It used to be a 24-bit truncation of id(self), which is not unique
+    even within one process: identical on every call for a given
+    session, recycled onto the session allocated after a failed one, and
+    colliding between two live sessions whose addresses differ by a
+    multiple of 16 MiB. The portal also asks for tokens that are
+    unguessable, which a counter would not be.
+    """
+    import re
+
+    session = ScreenCastSession(app_id="fastgrab-test")
+    other = ScreenCastSession(app_id="fastgrab-test")
+    tokens = [session._unique_token("create") for _ in range(64)]
+    tokens.append(other._unique_token("create"))
+    assert len(set(tokens)) == len(tokens), (
+        "handle tokens repeat, so one request can name another's Request"
+    )
+    for token in tokens:
+        assert re.match(r"\A[A-Za-z0-9_]+\Z", token), (
+            "{!r} is not a valid D-Bus object-path element".format(token)
+        )
+
+
+def test_an_answer_arriving_with_the_timeout_is_still_the_answer():
+    """loop.quit() does not cut the dispatch phase short.
+
+    GLib dispatches every source that was ready at the check, so a
+    Response becoming ready in the same iteration as the expiry timer
+    runs alongside it and both land in `result`. Reading the timeout
+    first threw the answer away: an approval came back as "never
+    answered" -- after the cast had started and the restore token had
+    rotated, so the replacement was never saved and the user was asked
+    again at once -- and a decline came back as unavailability rather
+    than the refusal it was.
+
+    Both sources are given a zero delay so they are ready together on
+    every run, rather than once in a while at the real 60s boundary.
+    """
+    from gi.repository import GLib
+
+    class RacingConnection(object):
+        def __init__(self, code):
+            self.code = code
+            self.callback = None
+
+        def get_unique_name(self):
+            return ":1.99"
+
+        def signal_subscribe(self, _bus, _iface, _signal, _path, _arg0,
+                             _flags, callback):
+            self.callback = callback
+            return 1
+
+        def signal_unsubscribe(self, _subscription):
+            pass
+
+        def call_sync(self, *_args, **_kwargs):
+            callback, code = self.callback, self.code
+            if callback is None:
+                return None
+
+            def answer(*_unused):
+                callback(None, None, None, None, None,
+                         GLib.Variant("(ua{sv})", (code, {})))
+                return False
+
+            source = GLib.timeout_source_new(0)
+            source.set_callback(answer)
+            source.attach(GLib.MainContext.get_thread_default())
+            return None
+
+    approved = ScreenCastSession(app_id="fastgrab-test", timeout=0)
+    approved._conn = RacingConnection(0)
+    assert approved._call_with_response(
+        "Start", lambda _token: None, "start") == {}
+
+    declined = ScreenCastSession(app_id="fastgrab-test", timeout=0)
+    declined._conn = RacingConnection(1)
+    with pytest.raises(PortalCancelled):
+        declined._call_with_response("Start", lambda _token: None, "start")
+
+
+def test_the_subscription_does_not_outlive_the_request():
+    """GIO tears a subscription down on the context that created it.
+
+    That is this call's private context, and nothing iterates it once
+    loop.run() has returned -- so without draining it the Response
+    callback, and the context with it, are retained for the life of the
+    process: one per request, three per handshake.
+
+    Driven against a real GDBusConnection because the leak is inside
+    GIO's own teardown: a stand-in signal_unsubscribe() frees the
+    callback by itself and would pass either way. The connection is
+    built over memory streams, so it needs no bus.
+    """
+    import gc
+    import weakref
+
+    from gi.repository import Gio
+
+    stream = Gio.SimpleIOStream.new(
+        Gio.MemoryInputStream.new(), Gio.MemoryOutputStream.new_resizable())
+    native = Gio.DBusConnection.new_sync(
+        stream, None, Gio.DBusConnectionFlags.DELAY_MESSAGE_PROCESSING,
+        None, None)
+    callbacks = []
+
+    class RealSubscriptionConnection(object):
+        def get_unique_name(self):
+            return ":1.99"
+
+        def signal_subscribe(self, _bus, iface, signal, path, arg0, flags,
+                             callback):
+            callbacks.append(weakref.ref(callback))
+            return native.signal_subscribe(
+                None, iface, signal, path, arg0, flags, callback)
+
+        def signal_unsubscribe(self, subscription):
+            native.signal_unsubscribe(subscription)
+
+        def call_sync(self, *_args, **_kwargs):
+            return None
+
+    session = ScreenCastSession(app_id="fastgrab-test", timeout=0)
+    session._conn = RealSubscriptionConnection()
+    for _ in range(3):
+        with pytest.raises(PortalUnavailable):
+            session._call_with_response(
+                "CreateSession", lambda _token: None, "create")
+
+    gc.collect()
+    alive = sum(1 for reference in callbacks if reference() is not None)
+    assert alive == 0, (
+        "{} of {} Response callbacks are still alive after their requests "
+        "ended: the subscription's teardown is queued on a context nobody "
+        "iterates, so it leaks once per request".format(alive, len(callbacks))
     )
 
 
